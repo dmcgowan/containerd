@@ -463,7 +463,8 @@ func (c *context) Apply(resource Resource) error {
 		}
 
 		if target != r.Target() {
-			if err := c.driver.Remove(fp); err != nil { // RemoveAll?
+			log.Printf("Removing %s, %s != %s\n", fp, target, r.Target())
+			if err := c.driver.Remove(fp); err != nil && !os.IsNotExist(err) { // RemoveAll?
 				return err
 			}
 
