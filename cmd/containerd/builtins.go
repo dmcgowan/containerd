@@ -11,5 +11,6 @@ import (
 	_ "github.com/containerd/containerd/services/metrics"
 	_ "github.com/containerd/containerd/services/rootfs"
 	_ "github.com/containerd/containerd/snapshot/btrfs"
+	_ "github.com/containerd/containerd/snapshot/continuity"
 	_ "github.com/containerd/containerd/snapshot/overlay"
 )
