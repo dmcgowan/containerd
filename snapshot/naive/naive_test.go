@@ -22,3 +22,8 @@ func TestNaive(t *testing.T) {
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "Naive", newSnapshotter)
 }
+
+func TestFSNaive(t *testing.T) {
+	testutil.RequiresRoot(t)
+	testsuite.FSSuite(t, newSnapshotter, true)
+}

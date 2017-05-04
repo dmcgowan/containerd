@@ -47,7 +47,7 @@ func TestBaseDiff(t *testing.T) {
 }
 
 func TestDiffApply(t *testing.T) {
-	fstest.FSSuite(t, diffApplier{})
+	fstest.FSSuite(t, diffApplier{}, true)
 }
 
 func testApply(a fstest.Applier) error {

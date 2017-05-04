@@ -15,6 +15,7 @@ import (
 	"github.com/containerd/containerd/snapshot"
 	"github.com/containerd/containerd/snapshot/testsuite"
 	"github.com/containerd/containerd/testutil"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -23,10 +24,14 @@ const (
 
 func boltSnapshotter(t *testing.T) func(context.Context, string) (snapshot.Snapshotter, func(), error) {
 	return func(ctx context.Context, root string) (snapshot.Snapshotter, func(), error) {
-		device := setupBtrfsLoopbackDevice(t, root)
+		device, err := setupBtrfsLoopbackDevice(t, root)
+		if err != nil {
+			return nil, nil, err
+		}
 		snapshotter, err := NewSnapshotter(device.deviceName, root)
 		if err != nil {
-			t.Fatal(err)
+			device.remove(t)
+			return nil, nil, err
 		}
 
 		return snapshotter, func() {
@@ -38,6 +43,11 @@ func boltSnapshotter(t *testing.T) func(context.Context, string) (snapshot.Snaps
 func TestBtrfs(t *testing.T) {
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "Btrfs", boltSnapshotter(t))
+}
+
+func TestFSBtrfs(t *testing.T) {
+	testutil.RequiresRoot(t)
+	testsuite.FSSuite(t, boltSnapshotter(t), true)
 }
 
 func TestBtrfsMounts(t *testing.T) {
@@ -139,37 +149,45 @@ type testDevice struct {
 // setupBtrfsLoopbackDevice creates a file, mounts it as a loopback device, and
 // formats it as btrfs.  The device should be cleaned up by calling
 // removeBtrfsLoopbackDevice.
-func setupBtrfsLoopbackDevice(t *testing.T, mountPoint string) *testDevice {
+func setupBtrfsLoopbackDevice(t *testing.T, mountPoint string) (*testDevice, error) {
 
 	// create temporary file for the disk image
 	file, err := ioutil.TempFile("", "containerd-btrfs-test")
 	if err != nil {
-		t.Fatal("Could not create temporary file for btrfs test", err)
+		return nil, errors.Wrap(err, "failed to create temp file")
 	}
 	t.Log("Temporary file created", file.Name())
 
 	// initialize file with 100 MiB
-	if err := file.Truncate(100 << 20); err != nil {
-		t.Fatal(err)
-	}
+	err = file.Truncate(100 << 20)
 	file.Close()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to truncate file to 100MB")
+	}
 
 	// create device
 	losetup := exec.Command("losetup", "--find", "--show", file.Name())
 	p, err := losetup.Output()
 	if err != nil {
-		t.Fatal(err)
+		return nil, errors.Wrap(err, "failed to setup loopback")
 	}
 
 	deviceName := strings.TrimSpace(string(p))
 	t.Log("Created loop device", deviceName)
+
+	remove := func() {
+		if err := exec.Command("losetup", "--detach", deviceName).Run(); err != nil {
+			t.Logf("Loopback detach failed for %s: %v", deviceName, err)
+		}
+	}
 
 	// format
 	t.Log("Creating btrfs filesystem")
 	mkfs := exec.Command("mkfs.btrfs", deviceName)
 	err = mkfs.Run()
 	if err != nil {
-		t.Fatal("Could not run mkfs.btrfs", err)
+		remove()
+		return nil, errors.Wrap(err, "could not run mkfs.btrfs")
 	}
 
 	// mount
@@ -177,14 +195,15 @@ func setupBtrfsLoopbackDevice(t *testing.T, mountPoint string) *testDevice {
 	mount := exec.Command("mount", deviceName, mountPoint)
 	err = mount.Run()
 	if err != nil {
-		t.Fatal("Could not mount", err)
+		remove()
+		return nil, errors.Wrap(err, "could not mount")
 	}
 
 	return &testDevice{
 		mountPoint: mountPoint,
 		fileName:   file.Name(),
 		deviceName: deviceName,
-	}
+	}, nil
 }
 
 // remove cleans up the test device, unmounting the loopback and disk image

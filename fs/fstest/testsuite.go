@@ -12,14 +12,20 @@ type TestApplier interface {
 	Apply(context.Context, Applier) (string, func(), error)
 }
 
-func FSSuite(t *testing.T, a TestApplier) {
+func FSSuite(t *testing.T, a TestApplier, all bool) {
 	t.Run("Basic", makeTest(t, a, basicTest))
 	t.Run("Deletion", makeTest(t, a, deletionTest))
-	// TODO: Add hard section, run if command line arg or function arg set to true
-	// Hard tests
 	t.Run("HardlinkUnmodified", makeTest(t, a, hardlinkUnmodified))
 	t.Run("HardlinkBeforeUnmodified", makeTest(t, a, hardlinkBeforeUnmodified))
 	t.Run("HardlinkBeforeModified", makeTest(t, a, hardlinkBeforeModified))
+
+	// These tests are known to fail with Overlay's "non-standard" behavior, allow
+	// switching them off for unit testing. Passage may be kernel dependent, allowing
+	// these tests to be used to test for specific issues in an environment.
+	if all {
+		t.Run("HardlinkUpdate", makeTest(t, a, hardlinkUpdate))
+		t.Run("RenameUnmodified", makeTest(t, a, renameUnmodified))
+	}
 }
 
 func makeTest(t *testing.T, ta TestApplier, as []Applier) func(t *testing.T) {
@@ -65,12 +71,13 @@ var (
 	baseApplier = Apply(
 		CreateDir("/etc/", 0755),
 		CreateFile("/etc/hosts", []byte("127.0.0.1 localhost"), 0644),
-		Link("/etc/hosts", "/etc/hosts.allow"),
+		Symlink("/etc/hosts", "/etc/hosts.allow"),
 		CreateDir("/usr/local/lib", 0755),
 		CreateFile("/usr/local/lib/libnothing.so", []byte{0x00, 0x00}, 0755),
 		Symlink("libnothing.so", "/usr/local/lib/libnothing.so.2"),
 		CreateDir("/home", 0755),
 		CreateDir("/home/derek", 0700),
+		CreateFile("/home/derek/.bashrc", []byte("#!/bin/sh"), 0644),
 	)
 
 	// basicTest covers basic operations
@@ -84,7 +91,6 @@ var (
 		),
 		Apply(
 			Remove("/etc/badfile"),
-			Rename("/home/derek", "/home/notderek"),
 		),
 		Apply(
 			RemoveAll("/usr"),
@@ -123,6 +129,26 @@ var (
 		),
 	}
 
+	hardlinkUpdate = []Applier{
+		baseApplier,
+		Apply(
+			Link("/etc/hosts", "/etc/hosts.deny"),
+		),
+		Apply(
+			CreateFile("/etc/hosts", []byte("127.0.0.1 localhost.localdomain"), 0644),
+		),
+	}
+
+	renameUnmodified = []Applier{
+		baseApplier,
+		Apply(
+			Rename("/home/derek", "/home/notderek"),
+			CreateFile("/etc/hosts.allow-new", []byte("127.0.0.1 localhost.localdomain"), 0644),
+			Rename("/etc/hosts.allow-new", "/etc/hosts.allow"),
+			Rename("/etc/hosts", "/etc/hosts-bak"),
+		),
+	}
+
 	hardlinkUnmodified = []Applier{
 		baseApplier,
 		Apply(
@@ -153,8 +179,6 @@ var (
 			CreateFile("/etc/hosts", []byte("127.0.0.1 localhost.localdomain"), 0644),
 		),
 		Apply(
-			Remove("/etc/hosts"),
-			CreateFile("/etc/hosts", []byte("127.0.0.1 localhost"), 0644),
 			Link("/etc/hosts", "/etc/before-hosts"),
 		),
 	}

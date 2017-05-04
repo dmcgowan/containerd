@@ -3,6 +3,7 @@ package fstest
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	"github.com/stevvooe/continuity"
 )
@@ -12,11 +13,98 @@ type resourceUpdate struct {
 	Updated  continuity.Resource
 }
 
+func typeString(r continuity.Resource) string {
+	switch r.(type) {
+	case continuity.RegularFile:
+		return "file"
+	case continuity.Directory:
+		return "directory"
+	case continuity.SymLink:
+		return "symlink"
+	case continuity.NamedPipe:
+		return "namedpipe"
+	case continuity.Device:
+		return "device"
+	default:
+		return "unknown"
+	}
+}
+
+func combineMap(m map[string]string) (r string) {
+	p := make([]string, 0, len(m))
+	for k, v := range m {
+		p = append(p, fmt.Sprintf("%s: %s", k, v))
+	}
+
+	if len(p) > 0 {
+		r = "(" + strings.Join(p, ", ") + ")"
+	}
+	return
+}
+
 func (u resourceUpdate) String() string {
-	return fmt.Sprintf("%s(mode: %o, uid: %s, gid: %s) -> %s(mode: %o, uid: %s, gid: %s)",
-		u.Original.Path(), u.Original.Mode(), u.Original.UID(), u.Original.GID(),
-		u.Updated.Path(), u.Updated.Mode(), u.Updated.UID(), u.Updated.GID(),
-	)
+	old := map[string]string{}
+	new := map[string]string{}
+	if u.Original.Mode() != u.Updated.Mode() {
+		old["mode"] = fmt.Sprintf("%s", u.Original.Mode())
+		new["mode"] = fmt.Sprintf("%s", u.Updated.Mode())
+	}
+	if u.Original.UID() != u.Updated.UID() {
+		old["uid"] = fmt.Sprintf("%s", u.Original.UID())
+		new["uid"] = fmt.Sprintf("%s", u.Updated.UID())
+
+	}
+	if u.Original.GID() != u.Updated.GID() {
+		old["gid"] = fmt.Sprintf("%s", u.Original.GID())
+		new["gid"] = fmt.Sprintf("%s", u.Updated.GID())
+	}
+	if ot, ut := typeString(u.Original), typeString(u.Updated); ot != ut {
+		old["type"] = ot
+		new["type"] = ut
+	} else if orf, ok := u.Original.(continuity.RegularFile); ok {
+		urf := u.Updated.(continuity.RegularFile)
+		if orf.Size() != urf.Size() {
+			old["size"] = fmt.Sprintf("%s", orf.Size())
+			new["size"] = fmt.Sprintf("%s", urf.Size())
+		}
+		p1 := orf.Paths()
+		p2 := urf.Paths()
+		if len(p1) != len(p2) {
+			old["npaths"] = fmt.Sprintf("%d(%s)", len(p1), strings.Join(p1, ","))
+			new["npaths"] = fmt.Sprintf("%d(%s)", len(p2), strings.Join(p2, ","))
+		} else if len(p1) > 0 {
+			for i := range p1 {
+				if p1[i] != p2[i] {
+					key := fmt.Sprintf("path[%d]", i)
+					old[key] = p1[i]
+					new[key] = p2[i]
+				}
+			}
+		}
+
+		d1 := orf.Digests()
+		d2 := urf.Digests()
+		if len(d1) != len(d2) {
+			old["ndigests"] = fmt.Sprintf("%d", len(d1))
+			new["ndigests"] = fmt.Sprintf("%d", len(d2))
+		} else if len(d1) > 0 {
+			for i := range d1 {
+				if d1[i] != d2[i] {
+					key := fmt.Sprintf("digest[%d]", i)
+					old[key] = d1[i].String()
+					new[key] = d2[i].String()
+				}
+			}
+		}
+	} else if osl, ok := u.Original.(continuity.SymLink); ok {
+		usl := u.Updated.(continuity.SymLink)
+		if osl.Target() != usl.Target() {
+			old["target"] = osl.Target()
+			new["target"] = usl.Target()
+		}
+	}
+
+	return fmt.Sprintf("%s%s -> %s%s", u.Original.Path(), combineMap(old), u.Updated.Path(), combineMap(new))
 }
 
 type resourceListDifference struct {

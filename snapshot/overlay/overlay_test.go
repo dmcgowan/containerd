@@ -4,6 +4,7 @@ package overlay
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -18,6 +19,12 @@ import (
 	"github.com/containerd/containerd/testutil"
 )
 
+var allFSTests bool
+
+func init() {
+	flag.BoolVar(&allFSTests, "all-fs-tests", false, "run all filesystem tests")
+}
+
 func newSnapshotter(ctx context.Context, root string) (snapshot.Snapshotter, func(), error) {
 	snapshotter, err := NewSnapshotter(root)
 	if err != nil {
@@ -30,6 +37,11 @@ func newSnapshotter(ctx context.Context, root string) (snapshot.Snapshotter, fun
 func TestOverlay(t *testing.T) {
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "Overlay", newSnapshotter)
+}
+
+func TestFSOverlay(t *testing.T) {
+	testutil.RequiresRoot(t)
+	testsuite.FSSuite(t, newSnapshotter, allFSTests)
 }
 
 func TestOverlayMounts(t *testing.T) {
