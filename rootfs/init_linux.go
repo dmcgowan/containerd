@@ -101,7 +101,7 @@ func initFS(root string) error {
 		touchFile("/etc/resolv.conf", uid, gid),
 		touchFile("/etc/hosts", uid, gid),
 		touchFile("/etc/hostname", uid, gid),
-		symlink("/proc/mounts", "/etc/mtab"),
+		symlink("../proc/self/mounts", "/etc/mtab"),
 	}
 
 	for _, fn := range initFuncs {
