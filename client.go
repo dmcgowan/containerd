@@ -150,6 +150,7 @@ func WithNewRootFS(id string, i Image) NewContainerOpts {
 		if err != nil {
 			return err
 		}
+		id = fmt.Sprintf("client-tmp-%s", id)
 		if _, err := client.SnapshotService().Prepare(ctx, id, identity.ChainID(diffIDs).String()); err != nil {
 			return err
 		}
@@ -166,6 +167,7 @@ func WithNewReadonlyRootFS(id string, i Image) NewContainerOpts {
 		if err != nil {
 			return err
 		}
+		id = fmt.Sprintf("client-tmp-%s", id)
 		if _, err := client.SnapshotService().View(ctx, id, identity.ChainID(diffIDs).String()); err != nil {
 			return err
 		}
