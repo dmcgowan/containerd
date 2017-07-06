@@ -25,6 +25,7 @@ import (
 	metrics "github.com/docker/go-metrics"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"golang.org/x/net/context"
+	"golang.org/x/net/trace"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -136,12 +137,24 @@ func (s *Server) ServeDebug(l net.Listener) error {
 	// that we don't want to expose via containerd
 	m := http.NewServeMux()
 	m.Handle("/debug/vars", expvar.Handler())
+	m.Handle("/debug/requests", http.HandlerFunc(debugTraces))
+	m.Handle("/debug/events", http.HandlerFunc(debugEvents))
 	m.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
 	m.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
 	m.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
 	m.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
 	m.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 	return http.Serve(l, m)
+}
+
+func debugTraces(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	trace.Render(w, req, true)
+}
+
+func debugEvents(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	trace.RenderEvents(w, req, true)
 }
 
 // Stop gracefully stops the containerd server
