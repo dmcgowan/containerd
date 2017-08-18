@@ -36,6 +36,7 @@ const (
 	DiffPlugin        PluginType = "io.containerd.differ.v1"
 	MetadataPlugin    PluginType = "io.containerd.metadata.v1"
 	ContentPlugin     PluginType = "io.containerd.content.v1"
+	GCPlugin          PluginType = "io.containerd.gc.v1"
 )
 
 type Registration struct {
