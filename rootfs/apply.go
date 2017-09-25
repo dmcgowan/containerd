@@ -51,7 +51,7 @@ func ApplyLayers(ctx context.Context, layers []Layer, sn snapshot.Snapshotter, a
 // ApplyLayer applies a single layer on top of the given provided layer chain,
 // using the provided snapshotter and applier. If the layer was unpacked true
 // is returned, if the layer already exists false is returned.
-func ApplyLayer(ctx context.Context, layer Layer, chain []digest.Digest, sn snapshot.Snapshotter, a Applier) (bool, error) {
+func ApplyLayer(ctx context.Context, layer Layer, chain []digest.Digest, sn snapshot.Snapshotter, a Applier, opts ...snapshot.Opt) (bool, error) {
 	var (
 		parent  = identity.ChainID(chain)
 		chainID = identity.ChainID(append(chain, layer.Diff.Digest))
@@ -68,8 +68,8 @@ func ApplyLayer(ctx context.Context, layer Layer, chain []digest.Digest, sn snap
 
 	key := fmt.Sprintf("extract-%s %s", uniquePart(), chainID)
 
-	// Prepare snapshot with from parent
-	mounts, err := sn.Prepare(ctx, key, parent.String())
+	// Prepare snapshot with from parent, label as root
+	mounts, err := sn.Prepare(ctx, key, parent.String(), opts...)
 	if err != nil {
 		//TODO: If is snapshot exists error, retry
 		return false, errors.Wrap(err, "failed to prepare extraction layer")
@@ -92,7 +92,7 @@ func ApplyLayer(ctx context.Context, layer Layer, chain []digest.Digest, sn snap
 		return false, err
 	}
 
-	if err = sn.Commit(ctx, chainID.String(), key); err != nil {
+	if err = sn.Commit(ctx, chainID.String(), key, opts...); err != nil {
 		if !errdefs.IsAlreadyExists(err) {
 			return false, errors.Wrapf(err, "failed to commit snapshot %s", parent)
 		}
