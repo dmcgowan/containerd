@@ -10,6 +10,7 @@ import (
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/log"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -157,16 +158,8 @@ func references(ctx context.Context, tx *bolt.Tx, node gc.Node, fn func(gc.Node)
 
 		bkt := getBucket(tx, bucketKeyVersion, []byte(node.Namespace), bucketKeyObjectSnapshots, []byte(ss), []byte(name))
 		if bkt == nil {
-			getBucket(tx, bucketKeyVersion, []byte(node.Namespace), bucketKeyObjectSnapshots).ForEach(func(k, v []byte) error {
-				return nil
-			})
-
 			// Node may be created from dead edge
 			return nil
-		}
-
-		if pv := bkt.Get(bucketKeyParent); len(pv) > 0 {
-			fn(gcnode(ResourceSnapshot, node.Namespace, fmt.Sprintf("%s/%s", ss, pv)))
 		}
 
 		return sendSnapshotRefs(node.Namespace, bkt, fn)
@@ -211,6 +204,14 @@ func scanAll(ctx context.Context, tx *bolt.Tx, nc chan<- gc.Node) error {
 					if v != nil {
 						return nil
 					}
+					cbkt := snbkt.Bucket(k).Bucket(bucketKeyChildren)
+					if cbkt != nil {
+						if ck, _ := cbkt.Cursor().First(); ck != nil {
+							// Only emit entries with no children
+							return nil
+						}
+					}
+
 					select {
 					case nc <- gcnode(ResourceSnapshot, ns, fmt.Sprintf("%s/%s", sk, k)):
 					case <-ctx.Done():
@@ -277,10 +278,42 @@ func remove(ctx context.Context, tx *bolt.Tx, node gc.Node) error {
 			}
 			ssbkt := sbkt.Bucket([]byte(parts[0]))
 			if ssbkt != nil {
-				log.G(ctx).WithField("key", parts[1]).WithField("snapshotter", parts[0]).Debug("delete snapshot")
-				return ssbkt.DeleteBucket([]byte(parts[1]))
+				return removeSnapshot(log.G(ctx).WithField("snapshotter", parts[0]), ssbkt, []byte(parts[1]), nil)
 			}
 		}
+	}
+
+	return nil
+}
+
+func removeSnapshot(l *logrus.Entry, ssbkt *bolt.Bucket, key, child []byte) error {
+	bkt := ssbkt.Bucket(key)
+	if bkt == nil {
+		return nil
+	}
+
+	cbkt := bkt.Bucket(bucketKeyChildren)
+	if cbkt != nil {
+		if len(child) > 0 {
+			if err := cbkt.Delete(child); err != nil {
+				return err
+			}
+		}
+		if k, _ := cbkt.Cursor().First(); k != nil {
+			return nil
+		}
+	}
+
+	child = key
+	key = bkt.Get(bucketKeyParent)
+
+	l.WithField("key", string(key)).Debug("delete snapshot")
+	if err := ssbkt.DeleteBucket(child); err != nil {
+		return err
+	}
+
+	if len(key) > 0 {
+		return removeSnapshot(l, ssbkt, key, child)
 	}
 
 	return nil

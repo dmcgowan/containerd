@@ -188,21 +188,15 @@ func TestGCRefs(t *testing.T) {
 		gcnode(ResourceContent, "ns2", dgst(1).String()): nil,
 		gcnode(ResourceContent, "ns2", dgst(2).String()): nil,
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn1"):   nil,
-		gcnode(ResourceSnapshot, "ns1", "overlay/sn2"): {
-			gcnode(ResourceSnapshot, "ns1", "overlay/sn1"),
-		},
-		gcnode(ResourceSnapshot, "ns1", "overlay/sn3"): {
-			gcnode(ResourceSnapshot, "ns1", "overlay/sn2"),
-		},
+		gcnode(ResourceSnapshot, "ns1", "overlay/sn2"):   nil,
+		gcnode(ResourceSnapshot, "ns1", "overlay/sn3"):   nil,
 		gcnode(ResourceSnapshot, "ns1", "overlay/sn4"): {
 			gcnode(ResourceSnapshot, "ns1", "btrfs/sn1"),
 			gcnode(ResourceSnapshot, "ns1", "overlay/sn1"),
 		},
 		gcnode(ResourceSnapshot, "ns1", "btrfs/sn1"):   nil,
 		gcnode(ResourceSnapshot, "ns2", "overlay/sn1"): nil,
-		gcnode(ResourceSnapshot, "ns2", "overlay/sn2"): {
-			gcnode(ResourceSnapshot, "ns2", "overlay/sn1"),
-		},
+		gcnode(ResourceSnapshot, "ns2", "overlay/sn2"): nil,
 	}
 
 	if err := db.Update(func(tx *bolt.Tx) error {
