@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/gc"
@@ -183,6 +184,11 @@ func scanAll(ctx context.Context, tx *bolt.Tx, nc chan<- gc.Node) error {
 	// iterate through each namespace
 	v1c := v1bkt.Cursor()
 
+	var spent time.Duration
+	defer func() {
+		log.G(ctx).WithField("total", spent).Warnf("time sending snapshots")
+	}()
+
 	for k, v := v1c.First(); k != nil; k, v = v1c.Next() {
 		if v != nil {
 			continue
@@ -198,6 +204,10 @@ func scanAll(ctx context.Context, tx *bolt.Tx, nc chan<- gc.Node) error {
 				}
 				snbkt := sbkt.Bucket(sk)
 				return snbkt.ForEach(func(k, v []byte) error {
+					t1 := time.Now()
+					defer func() {
+						spent += time.Now().Sub(t1)
+					}()
 					if v != nil {
 						return nil
 					}
