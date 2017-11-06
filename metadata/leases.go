@@ -20,7 +20,7 @@ type Lease struct {
 	CreatedAt time.Time
 	Labels    map[string]string
 
-	Content   []string
+	Content   []digest.Digest
 	Snapshots map[string][]string
 }
 
@@ -134,8 +134,37 @@ func (lm *LeaseManager) List(ctx context.Context, includeResources bool, filter 
 		}
 		l.Labels = labels
 
-		// TODO: Read Snapshots
-		// TODO: Read Content
+		if includeResources {
+			cbkt := txbkt.Bucket(bucketKeyObjectContent)
+			if cbkt != nil {
+				if err := cbkt.ForEach(func(k, v []byte) error {
+					l.Content = append(l.Content, digest.Digest(k))
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+
+			sbkt := txbkt.Bucket(bucketKeyObjectSnapshots)
+			if sbkt != nil {
+				l.Snapshots = map[string][]string{}
+				if err := sbkt.ForEach(func(sk, sv []byte) error {
+					if sv != nil {
+						return nil
+					}
+					snbkt := sbkt.Bucket(sk)
+					sn := string(sk)
+
+					return snbkt.ForEach(func(k, v []byte) error {
+						l.Snapshots[sn] = append(l.Snapshots[sn], string(k))
+						return nil
+					})
+				}); err != nil {
+					return err
+				}
+			}
+
+		}
 
 		leases = append(leases, l)
 
