@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/snapshot"
 	"github.com/opencontainers/image-spec/identity"
 	"github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runc/libcontainer/user"
@@ -258,6 +260,9 @@ func withRemappedSnapshotBase(id string, i Image, uid, gid uint32, readonly bool
 			snapshotter = client.SnapshotService(c.Snapshotter)
 			parent      = identity.ChainID(diffIDs).String()
 			usernsID    = fmt.Sprintf("%s-%d-%d", parent, uid, gid)
+			opt         = snapshot.WithLabels(map[string]string{
+				"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339),
+			})
 		)
 		if _, err := snapshotter.Stat(ctx, usernsID); err == nil {
 			if _, err := snapshotter.Prepare(ctx, id, usernsID); err != nil {
@@ -275,7 +280,7 @@ func withRemappedSnapshotBase(id string, i Image, uid, gid uint32, readonly bool
 			snapshotter.Remove(ctx, usernsID)
 			return err
 		}
-		if err := snapshotter.Commit(ctx, usernsID, usernsID+"-remap"); err != nil {
+		if err := snapshotter.Commit(ctx, usernsID, usernsID+"-remap", opt); err != nil {
 			return err
 		}
 		if readonly {
