@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cmd/ctr/commands"
+	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/rootfs"
 	"github.com/urfave/cli"
 )
 
@@ -24,6 +27,7 @@ var Command = cli.Command{
 		infoCommand,
 		listCommand,
 		setLabelsCommand,
+		diffCommand,
 	},
 }
 
@@ -206,5 +210,48 @@ var infoCommand = cli.Command{
 		commands.PrintAsJSON(info)
 
 		return nil
+	},
+}
+
+var diffCommand = cli.Command{
+	Name:      "diff",
+	Usage:     "get diff about a container",
+	ArgsUsage: "CONTAINER",
+	Action: func(context *cli.Context) error {
+		id := context.Args().First()
+		if id == "" {
+			return errors.New("container id must be provided")
+		}
+		client, ctx, cancel, err := commands.NewClient(context)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+		container, err := client.LoadContainer(ctx, id)
+		if err != nil {
+			return err
+		}
+		info, err := container.Info(ctx)
+		if err != nil {
+			return err
+		}
+
+		ctx, done, err := client.WithLease(ctx)
+		if err != nil {
+			return err
+		}
+		defer done()
+
+		desc, err := rootfs.Diff(ctx, info.SnapshotKey, client.SnapshotService(info.Snapshotter), client.DiffService())
+		if err != nil {
+			return err
+		}
+		ra, err := client.ContentStore().ReaderAt(ctx, desc.Digest)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(os.Stdout, content.NewReader(ra))
+
+		return err
 	},
 }
