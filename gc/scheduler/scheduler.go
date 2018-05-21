@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/plugin"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // config configures the garbage collection policies.
@@ -273,6 +274,11 @@ func (s *gcScheduler) run(ctx context.Context) {
 			if !triggered && lastCollection != nil && deletions == 0 &&
 				(s.mutationThreshold == 0 || mutations < s.mutationThreshold) {
 				schedC, nextCollection = schedule(interval)
+				log.G(ctx).WithFields(logrus.Fields{
+					"triggered": triggered,
+					"deletions": deletions,
+					"mutations": mutations,
+				}).Debug("skipping collection")
 				continue
 			}
 		case e := <-s.eventC:
@@ -305,6 +311,7 @@ func (s *gcScheduler) run(ctx context.Context) {
 			return
 		}
 
+		log.G(ctx).Debug("started garbage collected")
 		s.waiterL.Lock()
 
 		stats, err := s.c.GarbageCollect(ctx)
