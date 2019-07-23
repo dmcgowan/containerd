@@ -33,4 +33,6 @@ const (
 	LeasesService = "leases-service"
 	// DiffService is id of diff service.
 	DiffService = "diff-service"
+	// MountService is the id of the mount service.
+	MountService = "mount-service"
 )

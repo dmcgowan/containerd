@@ -75,6 +75,8 @@ const (
 	ContentPlugin Type = "io.containerd.content.v1"
 	// GCPlugin implements garbage collection policy
 	GCPlugin Type = "io.containerd.gc.v1"
+	// MountPlugin implements a non-system mount type
+	MountPlugin Type = "io.containerd.mount.v1"
 )
 
 const (
