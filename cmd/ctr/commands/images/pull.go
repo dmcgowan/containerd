@@ -17,6 +17,7 @@
 package images
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/containerd/containerd"
@@ -78,44 +79,99 @@ command. As part of this process, we do the following:
 		if err != nil {
 			return err
 		}
-		img, err := content.Fetch(ctx, client, ref, config)
-		if err != nil {
-			return err
-		}
 
-		log.G(ctx).WithField("image", ref).Debug("unpacking")
-
-		// TODO: Show unpack status
-
-		var p []ocispec.Platform
-		if context.Bool("all-platforms") {
-			p, err = images.Platforms(ctx, client.ContentStore(), img.Target)
-			if err != nil {
-				return errors.Wrap(err, "unable to resolve image platforms")
-			}
-		} else {
-			for _, s := range context.StringSlice("platform") {
-				ps, err := platforms.Parse(s)
-				if err != nil {
-					return errors.Wrapf(err, "unable to parse platform %s", s)
-				}
-				p = append(p, ps)
-			}
-		}
-		if len(p) == 0 {
-			p = append(p, platforms.DefaultSpec())
-		}
-
-		for _, platform := range p {
-			fmt.Printf("unpacking %s %s...\n", platforms.Format(platform), img.Target.Digest)
-			i := containerd.NewImageWithPlatform(client, img, platforms.Only(platform))
-			err = i.Unpack(ctx, context.String("snapshotter"))
+		// Multiple unpack on pull not yet supported
+		if context.Bool("all-platforms") || len(config.Platforms) > 1 {
+			img, err := content.Fetch(ctx, client, ref, config)
 			if err != nil {
 				return err
 			}
+
+			log.G(ctx).WithField("image", ref).Debug("unpacking")
+			var p []ocispec.Platform
+			if context.Bool("all-platforms") {
+				p, err = images.Platforms(ctx, client.ContentStore(), img.Target)
+				if err != nil {
+					return errors.Wrap(err, "unable to resolve image platforms")
+				}
+			} else {
+				for _, s := range context.StringSlice("platform") {
+					ps, err := platforms.Parse(s)
+					if err != nil {
+						return errors.Wrapf(err, "unable to parse platform %s", s)
+					}
+					p = append(p, ps)
+				}
+			}
+			if len(p) == 0 {
+				p = append(p, platforms.DefaultSpec())
+			}
+
+			for _, platform := range p {
+				fmt.Printf("unpacking %s %s...\n", platforms.Format(platform), img.Target.Digest)
+				i := containerd.NewImageWithPlatform(client, img, platforms.Only(platform))
+				err = i.Unpack(ctx, context.String("snapshotter"))
+				if err != nil {
+					return err
+				}
+			}
+			fmt.Println("done")
+			return nil
 		}
 
-		fmt.Println("done")
-		return nil
+		// TODO: Show unpack status
+		_, err = Pull(ctx, client, ref, config)
+
+		return err
 	},
+}
+
+// Pull loads all resources into the content store and returns the image
+func Pull(ctx context.Context, client *containerd.Client, ref string, config *content.FetchConfig) (containerd.Image, error) {
+	ongoing := content.NewJobs(ref)
+
+	pctx, stopProgress := context.WithCancel(ctx)
+	progress := make(chan struct{})
+
+	go func() {
+		if config.ProgressOutput != nil {
+			// no progress bar, because it hides some debug logs
+			content.ShowProgress(pctx, ongoing, client.ContentStore(), config.ProgressOutput)
+		}
+		close(progress)
+	}()
+
+	h := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		if desc.MediaType != images.MediaTypeDockerSchema1Manifest {
+			ongoing.Add(desc)
+		}
+		return nil, nil
+	})
+
+	log.G(pctx).WithField("image", ref).Debug("fetching")
+	labels := commands.LabelArgs(config.Labels)
+	opts := []containerd.RemoteOpt{
+		containerd.WithPullLabels(labels),
+		containerd.WithResolver(config.Resolver),
+		containerd.WithImageHandler(h),
+		containerd.WithSchema1Conversion,
+		containerd.WithAppendDistributionSourceLabel(),
+		containerd.WithPullUnpack,
+	}
+	if config.Snapshotter != "" {
+		opts = append(opts, containerd.WithPullSnapshotter(config.Snapshotter))
+	}
+
+	for _, platform := range config.Platforms {
+		opts = append(opts, containerd.WithPlatform(platform))
+	}
+
+	img, err := client.Pull(pctx, ref, opts...)
+	stopProgress()
+	if err != nil {
+		return nil, err
+	}
+
+	<-progress
+	return img, nil
 }

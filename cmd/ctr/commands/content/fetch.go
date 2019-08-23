@@ -95,6 +95,8 @@ type FetchConfig struct {
 	Labels []string
 	// Platforms to fetch
 	Platforms []string
+	// Snapshotter is the configured snapshotter for unpacking resources
+	Snapshotter string
 }
 
 // NewFetchConfig returns the default FetchConfig from cli flags
@@ -104,8 +106,9 @@ func NewFetchConfig(ctx context.Context, clicontext *cli.Context) (*FetchConfig,
 		return nil, err
 	}
 	config := &FetchConfig{
-		Resolver: resolver,
-		Labels:   clicontext.StringSlice("label"),
+		Resolver:    resolver,
+		Labels:      clicontext.StringSlice("label"),
+		Snapshotter: clicontext.String("snapshotter"),
 	}
 	if !clicontext.GlobalBool("debug") {
 		config.ProgressOutput = os.Stdout
@@ -122,7 +125,7 @@ func NewFetchConfig(ctx context.Context, clicontext *cli.Context) (*FetchConfig,
 
 // Fetch loads all resources into the content store and returns the image
 func Fetch(ctx context.Context, client *containerd.Client, ref string, config *FetchConfig) (images.Image, error) {
-	ongoing := newJobs(ref)
+	ongoing := NewJobs(ref)
 
 	pctx, stopProgress := context.WithCancel(ctx)
 	progress := make(chan struct{})
@@ -130,14 +133,14 @@ func Fetch(ctx context.Context, client *containerd.Client, ref string, config *F
 	go func() {
 		if config.ProgressOutput != nil {
 			// no progress bar, because it hides some debug logs
-			showProgress(pctx, ongoing, client.ContentStore(), config.ProgressOutput)
+			ShowProgress(pctx, ongoing, client.ContentStore(), config.ProgressOutput)
 		}
 		close(progress)
 	}()
 
 	h := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		if desc.MediaType != images.MediaTypeDockerSchema1Manifest {
-			ongoing.add(desc)
+			ongoing.Add(desc)
 		}
 		return nil, nil
 	})
@@ -166,7 +169,7 @@ func Fetch(ctx context.Context, client *containerd.Client, ref string, config *F
 	return img, nil
 }
 
-func showProgress(ctx context.Context, ongoing *jobs, cs content.Store, out io.Writer) {
+func ShowProgress(ctx context.Context, ongoing *Jobs, cs content.Store, out io.Writer) {
 	var (
 		ticker   = time.NewTicker(100 * time.Millisecond)
 		fw       = progress.NewWriter(out)
@@ -216,7 +219,7 @@ outer:
 			}
 
 			// now, update the items in jobs that are not in active
-			for _, j := range ongoing.jobs() {
+			for _, j := range ongoing.Jobs() {
 				key := remotes.MakeRefKey(ctx, j)
 				keys = append(keys, key)
 				if _, ok := activeSeen[key]; ok {
@@ -283,12 +286,12 @@ outer:
 	}
 }
 
-// jobs provides a way of identifying the download keys for a particular task
+// Jobs provides a way of identifying the download keys for a particular task
 // encountering during the pull walk.
 //
 // This is very minimal and will probably be replaced with something more
 // featured.
-type jobs struct {
+type Jobs struct {
 	name     string
 	added    map[digest.Digest]struct{}
 	descs    []ocispec.Descriptor
@@ -296,14 +299,14 @@ type jobs struct {
 	resolved bool
 }
 
-func newJobs(name string) *jobs {
-	return &jobs{
+func NewJobs(name string) *Jobs {
+	return &Jobs{
 		name:  name,
 		added: map[digest.Digest]struct{}{},
 	}
 }
 
-func (j *jobs) add(desc ocispec.Descriptor) {
+func (j *Jobs) Add(desc ocispec.Descriptor) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.resolved = true
@@ -315,7 +318,7 @@ func (j *jobs) add(desc ocispec.Descriptor) {
 	j.added[desc.Digest] = struct{}{}
 }
 
-func (j *jobs) jobs() []ocispec.Descriptor {
+func (j *Jobs) Jobs() []ocispec.Descriptor {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -323,7 +326,7 @@ func (j *jobs) jobs() []ocispec.Descriptor {
 	return append(descs, j.descs...)
 }
 
-func (j *jobs) isResolved() bool {
+func (j *Jobs) isResolved() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.resolved
