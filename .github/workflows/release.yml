@@ -76,7 +76,7 @@ jobs:
       - name: Checkout containerd
         uses: actions/checkout@v2
         with:
-          repository: containerd/containerd
+          repository: dmcgowan/containerd
           ref: ${{ github.ref }}
           path: src/github.com/containerd/containerd
       - name: HCS Shim commit
@@ -119,11 +119,69 @@ jobs:
           name: containerd-binaries-${{ matrix.os }}
           path: src/github.com/containerd/containerd/*.tar.gz*
 
+  cri-build:
+    name: Build CRI Release Binaries
+    runs-on: ubuntu-18.04
+    needs: [check]
+    steps:
+      - name: Download builds and release notes
+        uses: actions/download-artifact@v2
+        with:
+          path: builds
+
+      - name: Install Go
+        uses: actions/setup-go@v1
+        with:
+          go-version: '1.13.14'
+
+      - name: Set env
+        shell: bash
+        run: |
+          releasever=${{ github.ref }}
+          releasever="${releasever#refs/tags/}"
+          echo "::set-env name=RELEASE_VER::${releasever}"
+          echo "::set-env name=GOPATH::${{ github.workspace }}"
+          echo "::add-path::${{ github.workspace }}/bin"
+
+      - name: Checkout containerd
+        uses: actions/checkout@v2
+        with:
+          repository: dmcgowan/containerd
+          ref: ${{ github.ref }}
+          path: src/github.com/containerd/containerd
+
+      - name: Install containerd dependencies
+        env:
+          RUNC_FLAVOR: runc
+          DESTDIR: ${{ github.workspace }}/cri-release
+        run: |
+          mkdir ${DESTDIR}
+          sudo PATH=$PATH script/setup/install-seccomp
+          script/setup/install-runc
+          script/setup/install-cni
+          script/setup/install-critools
+        working-directory: src/github.com/containerd/containerd
+
+      - name: Make tar
+        shell: bash
+        run: |
+          tree || ls
+          TARFILE="cri-containerd-${RELEASE_VER#v}-linux-amd64.tar.gz"
+          tar czf ${TARFILE} etc usr opt
+          sha256sum ${TARFILE} >${TARFILE}.sha256sum
+        working-directory: cri-release
+
+      - name: Save build binaries
+        uses: actions/upload-artifact@v2
+        with:
+          name: cri-containerd-binaries
+          path: cri-release/cri-containerd-*.tar.gz*
+
   release:
     name: Create containerd Release
     runs-on: ubuntu-18.04
     timeout-minutes: 10
-    needs: [build, check]
+    needs: [cri-build, build, check]
 
     steps:
       - name: Download builds and release notes
