@@ -100,7 +100,7 @@ jobs:
           if [[ "${GOARCH}" != "amd64" ]]; then
             sudo add-apt-repository "deb [arch=arm64,s390x,ppc64el] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc) main" || true
             sudo add-apt-repository "deb [arch=arm64,s390x,ppc64el] http://ports.ubuntu.com/ubuntu-ports/ $(lsb_release -sc)-updates main" || true
-            sed -i 's,deb http://azure, deb [arch=amd64] http://azure,' /etc/apt/sources.list
+            sudo sed -i 's,deb http://azure, deb [arch=amd64] http://azure,' /etc/apt/sources.list
 
             sudo dpkg --add-architecture arm64
             sudo dpkg --add-architecture s390x
@@ -115,12 +115,11 @@ jobs:
               libseccomp-dev:amd64 \
               libseccomp-dev:arm64 \
               libseccomp-dev:s390x \
-              libseccomp-dev:ppc64el
-              # libbtrfs-dev is not available for Ubuntu 18.04
-              # libbtrfs-dev:amd64 \
-              # libbtrfs-dev:arm64 \
-              # libbtrfs-dev:s390x \
-              # libbtrfs-dev:ppc64el
+              libseccomp-dev:ppc64el \
+              btrfs-tools:amd64 \
+              btrfs-tools:arm64 \
+              btrfs-tools:s390x \
+              btrfs-tools:ppc64el
           fi
 
       - name: Checkout containerd
