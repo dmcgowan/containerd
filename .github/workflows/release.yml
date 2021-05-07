@@ -17,6 +17,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v2
         with:
+          repository: dmcgowan/containerd
           ref: ${{ github.ref }}
           path: src/github.com/containerd/containerd
 
@@ -83,7 +84,7 @@ jobs:
       - name: Checkout containerd
         uses: actions/checkout@v2
         with:
-          repository: containerd/containerd
+          repository: dmcgowan/containerd
           ref: ${{ github.ref }}
           path: src/github.com/containerd/containerd
 

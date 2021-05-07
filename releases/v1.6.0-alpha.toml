@@ -1,0 +1,14 @@
+# commit to be tagged for new release
+commit = "HEAD"
+
+project_name = "containerd"
+github_repo = "containerd/containerd"
+match_deps = "^github.com/(containerd/[a-zA-Z0-9-]+)$"
+
+# previous release
+previous = "v1.5.0"
+
+pre_release = true
+
+preface = """\
+The seventh major release of containerd"""
