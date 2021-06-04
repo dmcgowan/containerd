@@ -56,7 +56,7 @@ type config struct {
 	// since the previous garbage collection. A value of 0 indicates that
 	// garbage collection will only be run after a manual trigger or
 	// deletion. Unlike the deletion threshold, the mutation threshold does
-	// not cause scheduling of a garbage collection, but ensures GC is run
+	// not cause rescheduling of a garbage collection, but ensures GC is run
 	// at the next scheduled GC.
 	//
 	// Default 100
@@ -78,6 +78,20 @@ type config struct {
 	//
 	// Default is "100ms"
 	StartupDelay duration `toml:"startup_delay"`
+
+	// MaxDelay represents the maximum time to schedule garbage collection.
+	// When garbage collection is not triggered manually or by mutations,
+	// the schedule interval will increase to this delay. The max delay
+	// should be seen as the maximum time delay between any mutation and
+	// a scheduled garbage collection. Use the threshold configurations to
+	// tune the frequency and rescheduling of garbage collection.
+	// Use "s" for second.
+	//
+	// A minimum value of 10 seconds is enfored to prevent over scheduling
+	// of the garbage collector.
+	//
+	// Default "300s"
+	MaxDelay duration `toml:"max_interval"`
 }
 
 type duration time.Duration
@@ -108,6 +122,7 @@ func init() {
 			MutationThreshold: 100,
 			ScheduleDelay:     duration(0),
 			StartupDelay:      duration(100 * time.Millisecond),
+			MaxDelay:          duration(300 * time.Second),
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			md, err := ic.Get(plugin.MetadataPlugin)
@@ -127,6 +142,7 @@ func init() {
 				"DeletionThreshold": fmt.Sprint(m.deletionThreshold),
 				"MutationThreshold": fmt.Sprint(m.mutationThreshold),
 				"ScheduleDelay":     fmt.Sprint(m.scheduleDelay),
+				"MaxDelay":          fmt.Sprint(m.maxDelay),
 			}
 
 			go m.run(ic.Context)
@@ -160,6 +176,7 @@ type gcScheduler struct {
 	mutationThreshold int
 	scheduleDelay     time.Duration
 	startupDelay      time.Duration
+	maxDelay          time.Duration
 }
 
 func newScheduler(c collector, cfg *config) *gcScheduler {
@@ -173,6 +190,7 @@ func newScheduler(c collector, cfg *config) *gcScheduler {
 		mutationThreshold: cfg.MutationThreshold,
 		scheduleDelay:     time.Duration(cfg.ScheduleDelay),
 		startupDelay:      time.Duration(cfg.StartupDelay),
+		maxDelay:          time.Duration(cfg.MaxDelay),
 	}
 
 	if s.pauseThreshold < 0.0 {
@@ -183,6 +201,9 @@ func newScheduler(c collector, cfg *config) *gcScheduler {
 	}
 	if s.mutationThreshold < 0 {
 		s.mutationThreshold = 0
+	}
+	if s.maxDelay < 10*time.Second {
+		s.maxDelay = 10 * time.Second
 	}
 	if s.scheduleDelay < 0 {
 		s.scheduleDelay = 0
@@ -240,43 +261,51 @@ func (s *gcScheduler) mutationCallback(dirty bool) {
 	}()
 }
 
-func schedule(d time.Duration) (<-chan time.Time, *time.Time) {
+func schedule(d time.Duration) (<-chan time.Time, time.Time) {
 	next := time.Now().Add(d)
-	return time.After(d), &next
+	return time.After(d), next
 }
 
 func (s *gcScheduler) run(ctx context.Context) {
 	var (
 		schedC <-chan time.Time
 
-		lastCollection *time.Time
-		nextCollection *time.Time
+		lastCollection time.Time
+		nextCollection time.Time
 
-		interval    = time.Second
+		interval    = s.maxDelay
 		gcTime      time.Duration
 		collections int
 		// TODO(dmcg): expose collection stats as metrics
 
-		triggered bool
+		triggered = true // Always trigger on first event or interval
+
 		deletions int
 		mutations int
 	)
+
 	if s.startupDelay > 0 {
-		schedC, nextCollection = schedule(s.startupDelay)
+		interval = s.startupDelay
 	}
+	schedC, nextCollection = schedule(interval)
 	for {
 		select {
 		case <-schedC:
 			// Check if garbage collection can be skipped because
 			// it is not needed or was not requested and reschedule
 			// it to attempt again after another time interval.
-			if !triggered && lastCollection != nil && deletions == 0 &&
+			if !triggered && deletions == 0 &&
 				(s.mutationThreshold == 0 || mutations < s.mutationThreshold) {
+				// Increase interval to avoid checking while idle
+				interval = interval * 2
+				if interval > s.maxDelay {
+					interval = s.maxDelay
+				}
 				schedC, nextCollection = schedule(interval)
 				continue
 			}
 		case e := <-s.eventC:
-			if lastCollection != nil && lastCollection.After(e.ts) {
+			if lastCollection.After(e.ts) {
 				continue
 			}
 			if e.dirty {
@@ -288,16 +317,13 @@ func (s *gcScheduler) run(ctx context.Context) {
 				triggered = true
 			}
 
-			// Check if condition should cause immediate collection.
-			if triggered ||
-				(s.deletionThreshold > 0 && deletions >= s.deletionThreshold) ||
-				(nextCollection == nil && ((s.deletionThreshold == 0 && deletions > 0) ||
-					(s.mutationThreshold > 0 && mutations >= s.mutationThreshold))) {
-				// Check if not already scheduled before delay threshold
-				if nextCollection == nil || nextCollection.After(time.Now().Add(s.scheduleDelay)) {
-					// TODO(dmcg): track re-schedules for tuning schedule config
-					schedC, nextCollection = schedule(s.scheduleDelay)
-				}
+			// Check whether should reschedule the garbage collection sooner
+			// if condition should cause immediate collection
+			//  and not already scheduled before delay threshold
+			if (triggered || (s.deletionThreshold > 0 && deletions >= s.deletionThreshold)) &&
+				nextCollection.After(time.Now().Add(s.scheduleDelay)) {
+				// TODO(dmcg): track re-schedules for tuning schedule config
+				schedC, nextCollection = schedule(s.scheduleDelay)
 			}
 
 			continue
@@ -308,15 +334,14 @@ func (s *gcScheduler) run(ctx context.Context) {
 		s.waiterL.Lock()
 
 		stats, err := s.c.GarbageCollect(ctx)
-		last := time.Now()
 		if err != nil {
 			log.G(ctx).WithError(err).Error("garbage collection failed")
 
-			// Reschedule garbage collection for same duration + 1 second
-			schedC, nextCollection = schedule(nextCollection.Sub(*lastCollection) + time.Second)
-
-			// Update last collection time even though failure occurred
-			lastCollection = &last
+			interval = interval * 2
+			if interval > s.maxDelay {
+				interval = s.maxDelay
+			}
+			schedC, nextCollection = schedule(interval)
 
 			for _, w := range s.waiters {
 				close(w)
@@ -342,9 +367,11 @@ func (s *gcScheduler) run(ctx context.Context) {
 			// Pause threshold is always 0.0 < threshold <= 0.5
 			avg := float64(gcTime) / float64(collections)
 			interval = time.Duration(avg/s.pauseThreshold - avg)
+		} else {
+			interval = s.maxDelay
 		}
 
-		lastCollection = &last
+		lastCollection = time.Now()
 		schedC, nextCollection = schedule(interval)
 
 		for _, w := range s.waiters {
