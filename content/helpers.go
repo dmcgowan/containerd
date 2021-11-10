@@ -29,6 +29,8 @@ import (
 	"github.com/pkg/errors"
 )
 
+var ErrReset = errors.New("writer has been reset")
+
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		buffer := make([]byte, 1<<20)
@@ -130,26 +132,41 @@ func OpenWriter(ctx context.Context, cs Ingester, opts ...WriterOpt) (Writer, er
 // the size or digest is unknown, these values may be empty.
 //
 // Copy is buffered, so no need to wrap reader in buffered io.
-func Copy(ctx context.Context, cw Writer, r io.Reader, size int64, expected digest.Digest, opts ...Opt) error {
+func Copy(ctx context.Context, cw Writer, or io.Reader, size int64, expected digest.Digest, opts ...Opt) error {
 	ws, err := cw.Status()
 	if err != nil {
 		return errors.Wrap(err, "failed to get status")
 	}
-
+	r := or
 	if ws.Offset > 0 {
-		r, err = seekReader(r, ws.Offset, size)
+		r, err = seekReader(or, ws.Offset, size)
 		if err != nil {
 			return errors.Wrapf(err, "unable to resume write to %v", ws.Ref)
 		}
 	}
 
-	copied, err := copyWithBuffer(cw, r)
-	if err != nil {
-		return errors.Wrap(err, "failed to copy")
-	}
-	if size != 0 && copied < size-ws.Offset {
-		// Short writes would return its own error, this indicates a read failure
-		return errors.Wrapf(io.ErrUnexpectedEOF, "failed to read expected number of bytes")
+	// Max resets
+	for i := 0; i < 5; i++ {
+		copied, err := copyWithBuffer(cw, r)
+		if err != nil {
+			if errors.Cause(err) == ErrReset {
+				ws, err := cw.Status()
+				if err != nil {
+					return errors.Wrap(err, "failed to get status")
+				}
+				r, err = seekReader(or, ws.Offset, size)
+				if err != nil {
+					return errors.Wrapf(err, "unable to resume write to %v", ws.Ref)
+				}
+				continue
+			}
+			return errors.Wrap(err, "failed to copy")
+		}
+		if size != 0 && copied < size-ws.Offset {
+			// Short writes would return its own error, this indicates a read failure
+			return errors.Wrapf(io.ErrUnexpectedEOF, "failed to read expected number of bytes")
+		}
+		break
 	}
 
 	if err := cw.Commit(ctx, size, expected, opts...); err != nil {
