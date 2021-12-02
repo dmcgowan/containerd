@@ -260,18 +260,13 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 
 	// TODO: Support chunked upload
 
-	pr, pw := io.Pipe()
-	respC := make(chan response, 1)
-	body := io.NopCloser(pr)
+	// TODO: Pass along context?
+	pushw := newPushWriter(ref, desc.Digest, p.tracker)
 
 	req.body = func() (io.ReadCloser, error) {
-		if body == nil {
-			return nil, errors.New("cannot reuse body, request must be retried")
-		}
-		// Only use the body once since pipe cannot be seeked
-		ob := body
-		body = nil
-		return ob, nil
+		pr, pw := io.Pipe()
+		pushw.setPipe(pw)
+		return io.NopCloser(pr), nil
 	}
 	req.size = desc.Size
 
@@ -280,7 +275,8 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 		resp, err := req.doWithRetries(ctx, nil)
 		if err != nil {
 			respC <- response{err: err}
-			pr.CloseWithError(err)
+			// pushWriter.CloseWithError
+			//pr.CloseWithError(err)
 			return
 		}
 
@@ -289,20 +285,13 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 		default:
 			err := remoteserrors.NewUnexpectedStatusErr(resp)
 			log.G(ctx).WithField("resp", resp).WithField("body", string(err.(remoteserrors.ErrUnexpectedStatus).Body)).Debug("unexpected response")
-			pr.CloseWithError(err)
+			// pushWriter.CloseWithError
+			//pr.CloseWithError(err)
 		}
 		respC <- response{Response: resp}
 	}()
 
-	return &pushWriter{
-		base:       p.dockerBase,
-		ref:        ref,
-		pipe:       pw,
-		responseC:  respC,
-		isManifest: isManifest,
-		expected:   desc.Digest,
-		tracker:    p.tracker,
-	}, nil
+	return pushw, nil
 }
 
 func getManifestPath(object string, dgst digest.Digest) []string {
@@ -330,15 +319,36 @@ type response struct {
 }
 
 type pushWriter struct {
-	base *dockerBase
-	ref  string
-
-	pipe       *io.PipeWriter
-	responseC  <-chan response
-	isManifest bool
-
+	ref      string
 	expected digest.Digest
 	tracker  StatusTracker
+
+	pipe *io.PipeWriter
+
+	pipeC     chan *io.PipeWriter
+	responseC chan *http.Response
+	errC      chan error
+}
+
+func newPushWriter(ref string, expected digest.Digest, tracker StatusTracker) *pushWriter {
+	pipeC := make(chan *io.PipeWriter, 1)
+	respC := make(chan *http.Response, 1)
+	errC := make(chan error, 1)
+	// Initialize and create response
+	return nil
+}
+
+func (pw *pushWriter) setPipe(p *io.PipeWriter) {
+	// TODO: wait for cancel?
+	pw.pipeC <- p
+}
+
+func (pw *pushWriter) setError(err error) {
+	// TODO: wait for cancel?
+	pw.errC <- err
+}
+func (pw *pushWriter) setResponse(resp *http.Response) {
+	pw.respC <- resp
 }
 
 func (pw *pushWriter) Write(p []byte) (n int, err error) {
@@ -346,6 +356,38 @@ func (pw *pushWriter) Write(p []byte) (n int, err error) {
 	if err != nil {
 		return n, err
 	}
+
+	if pw.pipe == nil {
+		// TODO: Wait for cancel?
+		// TODO: Wait for error?
+		p, ok := <-pw.pipeC
+		if !ok {
+			return 0, io.ErrClosedPipe
+		}
+		pw.pipe = p
+	} else {
+		select {
+		case p, ok := <-pw.pipeC:
+			if !ok {
+				return 0, io.ErrClosedPipe
+			}
+			pw.pipe.CloseWithError(content.ErrReset)
+			pw.pipe = p
+
+			// If content has already been written, the bytes
+			// cannot be written and the caller must reset
+			// TODO: Determine if tracker can be trusted or
+			// if ErrReset should always be returned here
+			if status.Offset > 0 {
+				status.Offset = 0
+				status.UpdatedAt = time.Now()
+				pw.tracker.SetStatus(pw.ref, status)
+				return 0, content.ErrReset
+			}
+		default:
+		}
+	}
+
 	n, err = pw.pipe.Write(p)
 	status.Offset += int64(n)
 	status.UpdatedAt = time.Now()
@@ -354,7 +396,20 @@ func (pw *pushWriter) Write(p []byte) (n int, err error) {
 }
 
 func (pw *pushWriter) Close() error {
-	return pw.pipe.Close()
+	// Ensure pipeC is closed but handle `Close()` being
+	// called multiple times without panicking
+	select {
+	case _, ok := <-pw.pipeC:
+		if ok {
+			close(pw.pipeC)
+		}
+	default:
+		close(pw.pipeC)
+	}
+	if pw.pipe != nil {
+		return pw.pipe.Close()
+	}
+	return nil
 }
 
 func (pw *pushWriter) Status() (content.Status, error) {
