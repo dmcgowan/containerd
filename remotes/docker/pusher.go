@@ -271,10 +271,9 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 	req.size = desc.Size
 
 	go func() {
-		defer close(respC)
 		resp, err := req.doWithRetries(ctx, nil)
 		if err != nil {
-			respC <- response{err: err}
+			pushw.setError(err)
 			// pushWriter.CloseWithError
 			//pr.CloseWithError(err)
 			return
@@ -287,8 +286,9 @@ func (p dockerPusher) push(ctx context.Context, desc ocispec.Descriptor, ref str
 			log.G(ctx).WithField("resp", resp).WithField("body", string(err.(remoteserrors.ErrUnexpectedStatus).Body)).Debug("unexpected response")
 			// pushWriter.CloseWithError
 			//pr.CloseWithError(err)
+			// TODO: Set and return?
 		}
-		respC <- response{Response: resp}
+		pushw.setResponse(resp)
 	}()
 
 	return pushw, nil
@@ -325,17 +325,21 @@ type pushWriter struct {
 
 	pipe *io.PipeWriter
 
-	pipeC     chan *io.PipeWriter
-	responseC chan *http.Response
-	errC      chan error
+	pipeC chan *io.PipeWriter
+	respC chan *http.Response
+	errC  chan error
 }
 
 func newPushWriter(ref string, expected digest.Digest, tracker StatusTracker) *pushWriter {
-	pipeC := make(chan *io.PipeWriter, 1)
-	respC := make(chan *http.Response, 1)
-	errC := make(chan error, 1)
 	// Initialize and create response
-	return nil
+	return &pushWriter{
+		ref:      ref,
+		expected: expected,
+		tracker:  tracker,
+		pipeC:    make(chan *io.PipeWriter, 1),
+		respC:    make(chan *http.Response, 1),
+		errC:     make(chan error, 1),
+	}
 }
 
 func (pw *pushWriter) setPipe(p *io.PipeWriter) {
@@ -436,7 +440,7 @@ func (pw *pushWriter) Commit(ctx context.Context, size int64, expected digest.Di
 		return err
 	}
 	// TODO: timeout waiting for response
-	resp := <-pw.responseC
+	resp := <-pw.respC
 	if resp.err != nil {
 		return resp.err
 	}
