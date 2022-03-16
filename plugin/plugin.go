@@ -82,6 +82,8 @@ const (
 	StreamingPlugin Type = "io.containerd.streaming.v1"
 	// TracingProcessorPlugin implements a open telemetry span processor
 	TracingProcessorPlugin Type = "io.containerd.tracing.processor.v1"
+	// TransferPlugin implements a transfer service
+	TransferPlugin Type = "io.containerd.transfer.v1"
 )
 
 const (
