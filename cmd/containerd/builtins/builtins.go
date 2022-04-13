@@ -23,6 +23,7 @@ import (
 	_ "github.com/containerd/containerd/gc/scheduler"
 	_ "github.com/containerd/containerd/leases/plugin"
 	_ "github.com/containerd/containerd/metadata/plugin"
+	_ "github.com/containerd/containerd/plugins/streaming"
 	_ "github.com/containerd/containerd/runtime/restart/monitor"
 	_ "github.com/containerd/containerd/runtime/v2"
 	_ "github.com/containerd/containerd/services/containers"
@@ -37,6 +38,7 @@ import (
 	_ "github.com/containerd/containerd/services/opt"
 	_ "github.com/containerd/containerd/services/sandbox"
 	_ "github.com/containerd/containerd/services/snapshots"
+	_ "github.com/containerd/containerd/services/streaming"
 	_ "github.com/containerd/containerd/services/tasks"
 	_ "github.com/containerd/containerd/services/version"
 )
