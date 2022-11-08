@@ -21,6 +21,7 @@ import (
 	"io"
 
 	"github.com/containerd/containerd/content"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -54,6 +55,10 @@ type Resolver interface {
 type Fetcher interface {
 	// Fetch the resource identified by the descriptor.
 	Fetch(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error)
+}
+
+type ReferrersFetcher interface {
+	FetchReferrers(ctx context.Context, dgst digest.Digest, artifactTypes ...string) (io.ReadCloser, ocispec.Descriptor, error)
 }
 
 // Pusher pushes content
