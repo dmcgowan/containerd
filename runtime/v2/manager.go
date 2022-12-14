@@ -426,3 +426,11 @@ func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit,
 
 	return exit, nil
 }
+
+// ShimManager returns the underlying shim manager
+// In 1.6, there is no sandbox manager to get direct access to underlying shim manager,
+// this gives access to the underlying shims.
+// In 1.7 and 2.0, this function is not needed
+func (m *TaskManager) ShimManager() *ShimManager {
+	return m.manager
+}
