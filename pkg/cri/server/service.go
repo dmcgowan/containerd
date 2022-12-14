@@ -48,6 +48,7 @@ import (
 	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	osinterface "github.com/containerd/containerd/pkg/os"
 	"github.com/containerd/containerd/pkg/registrar"
+	v2 "github.com/containerd/containerd/runtime/v2"
 )
 
 // defaultNetworkPlugin is used for the default CNI configuration
@@ -99,6 +100,8 @@ type criService struct {
 	netPlugin map[string]cni.CNI
 	// client is an instance of the containerd client
 	client *containerd.Client
+	// shimManager gets access to underlying runtime shims
+	shimManager *v2.ShimManager
 	// streamServer is the streaming server serves container streaming request.
 	streamServer streaming.Server
 	// eventMonitor is the monitor monitors containerd events.
@@ -122,6 +125,12 @@ type criService struct {
 
 // NewCRIService returns a new instance of CRIService
 func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIService, error) {
+	return NewCRIServiceWithShimManager(config, client, nil)
+}
+
+// NewCRIServiceWithShimManager returns a new instance of CRIService
+// TODO: With opts?
+func NewCRIServiceWithShimManager(config criconfig.Config, client *containerd.Client, sm *v2.ShimManager) (CRIService, error) {
 	var err error
 	labels := label.NewStore()
 	c := &criService{
@@ -137,6 +146,7 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 		initialized:                 atomic.NewBool(false),
 		netPlugin:                   make(map[string]cni.CNI),
 		unpackDuplicationSuppressor: kmutex.New(),
+		shimManager:                 sm,
 	}
 
 	if client.SnapshotService(c.config.ContainerdConfig.Snapshotter) == nil {

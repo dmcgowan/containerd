@@ -29,10 +29,12 @@ import (
 	"github.com/containerd/containerd/api/services/namespaces/v1"
 	"github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/plugin"
+	v2 "github.com/containerd/containerd/runtime/v2"
 	"github.com/containerd/containerd/services"
 	"github.com/containerd/containerd/snapshots"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -96,8 +98,12 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create containerd client: %w", err)
 	}
+	sm, err := getShimManager(ic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shim manager: %w", err)
+	}
 
-	s, err := server.NewCRIService(c, client)
+	s, err := server.NewCRIServiceWithShimManager(c, client, sm)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create CRI service: %w", err)
 	}
@@ -109,6 +115,18 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 		// TODO(random-liu): Whether and how we can stop containerd.
 	}()
 	return s, nil
+}
+
+// getShimManager gets the shim manager from the task plugin.
+func getShimManager(ic *plugin.InitContext) (*v2.ShimManager, error) {
+	p, err := ic.GetByID(plugin.RuntimePluginV2, "task")
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get task service plugin: %w", err)
+	}
+	return p.(*v2.TaskManager).ShimManager(), nil
 }
 
 // getServicesOpts get service options from plugin context.
