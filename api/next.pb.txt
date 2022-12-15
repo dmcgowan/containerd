@@ -4518,3 +4518,44 @@ file {
   weak_dependency: 1
   syntax: "proto3"
 }
+file {
+  name: "github.com/containerd/containerd/api/shim/portforward/v1/portforward.proto"
+  package: "containerd.shim.portforward.v1"
+  dependency: "google/protobuf/empty.proto"
+  message_type {
+    name: "PortForwardRequest"
+    field {
+      name: "id"
+      number: 1
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "id"
+    }
+    field {
+      name: "port"
+      number: 2
+      label: LABEL_OPTIONAL
+      type: TYPE_INT32
+      json_name: "port"
+    }
+    field {
+      name: "addr"
+      number: 3
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "addr"
+    }
+  }
+  service {
+    name: "PortForward"
+    method {
+      name: "PortForward"
+      input_type: ".containerd.shim.portforward.v1.PortForwardRequest"
+      output_type: ".google.protobuf.Empty"
+    }
+  }
+  options {
+    go_package: "github.com/containerd/containerd/api/shim/portforward/v1;portforward"
+  }
+  syntax: "proto3"
+}

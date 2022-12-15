@@ -214,6 +214,11 @@ func (s *shim) Close() error {
 	return s.client.Close()
 }
 
+// Client returns the underlying client connection
+func (s *shim) Client() *ttrpc.Client {
+	return s.client
+}
+
 func (s *shim) delete(ctx context.Context) error {
 	var (
 		result *multierror.Error
