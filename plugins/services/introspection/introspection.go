@@ -20,6 +20,7 @@ import (
 	context "context"
 
 	api "github.com/containerd/containerd/v2/api/services/introspection/v1"
+	apitypes "github.com/containerd/containerd/v2/api/types"
 	"github.com/containerd/containerd/v2/pkg/errdefs"
 	ptypes "github.com/containerd/containerd/v2/protobuf/types"
 	"github.com/containerd/log"
@@ -29,6 +30,7 @@ import (
 type Service interface {
 	Plugins(context.Context, []string) (*api.PluginsResponse, error)
 	Server(context.Context, *ptypes.Empty) (*api.ServerResponse, error)
+	Runtime(ctx context.Context, in *api.RuntimeRequest) (*apitypes.RuntimeInfo, error)
 }
 
 type introspectionRemote struct {
@@ -57,6 +59,16 @@ func (i *introspectionRemote) Plugins(ctx context.Context, filters []string) (*a
 
 func (i *introspectionRemote) Server(ctx context.Context, in *ptypes.Empty) (*api.ServerResponse, error) {
 	resp, err := i.client.Server(ctx, in)
+
+	if err != nil {
+		return nil, errdefs.FromGRPC(err)
+	}
+
+	return resp, nil
+}
+
+func (i *introspectionRemote) Runtime(ctx context.Context, in *api.RuntimeRequest) (*apitypes.RuntimeInfo, error) {
+	resp, err := i.client.Runtime(ctx, in)
 
 	if err != nil {
 		return nil, errdefs.FromGRPC(err)

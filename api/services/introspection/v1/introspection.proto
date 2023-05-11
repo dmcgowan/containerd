@@ -18,6 +18,8 @@ syntax = "proto3";
 
 package containerd.services.introspection.v1;
 
+import "google/protobuf/any.proto";
+import "github.com/containerd/containerd/api/types/introspection.proto";
 import "github.com/containerd/containerd/api/types/platform.proto";
 import "google/rpc/status.proto";
 import "google/protobuf/empty.proto";
@@ -33,6 +35,8 @@ service Introspection {
 	rpc Plugins(PluginsRequest) returns (PluginsResponse);
 	// Server returns information about the containerd server
 	rpc Server(google.protobuf.Empty) returns (ServerResponse);
+	// Runtime returns the runtime info
+	rpc Runtime(RuntimeRequest) returns (types.RuntimeInfo);
 }
 
 message Plugin {
@@ -110,4 +114,11 @@ message DeprecationWarning {
 	string id = 1;
 	string message = 2;
 	google.protobuf.Timestamp last_occurrence = 3;
+}
+
+message RuntimeRequest {
+	string runtime_path = 1;
+	// Options correspond to CreateTaskRequest.options.
+	// This is needed to pass the runc binary path, etc.
+	google.protobuf.Any options = 2;
 }

@@ -37,6 +37,7 @@ import (
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/plugins"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/pprof"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/run"
+	"github.com/containerd/containerd/v2/cmd/ctr/commands/runtimes"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/sandboxes"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/snapshots"
 	"github.com/containerd/containerd/v2/cmd/ctr/commands/tasks"
@@ -129,6 +130,7 @@ containerd CLI
 		sandboxes.Command,
 		info.Command,
 		deprecations.Command,
+		runtimes.Command,
 	}, extraCmds...)
 	app.Before = func(context *cli.Context) error {
 		if context.GlobalBool("debug") {

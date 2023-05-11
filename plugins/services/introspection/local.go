@@ -19,6 +19,7 @@ package introspection
 import (
 	context "context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,6 +33,7 @@ import (
 
 	api "github.com/containerd/containerd/v2/api/services/introspection/v1"
 	"github.com/containerd/containerd/v2/api/types"
+	containerdruntime "github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/pkg/errdefs"
 	"github.com/containerd/containerd/v2/pkg/filters"
 	"github.com/containerd/containerd/v2/plugins"
@@ -41,13 +43,14 @@ import (
 	ptypes "github.com/containerd/containerd/v2/protobuf/types"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	"github.com/containerd/typeurl/v2"
 )
 
 func init() {
 	registry.Register(&plugin.Registration{
 		Type:     plugins.ServicePlugin,
 		ID:       services.IntrospectionService,
-		Requires: []plugin.Type{plugins.WarningPlugin},
+		Requires: []plugin.Type{plugins.WarningPlugin, plugins.RuntimePluginV2},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			i, err := ic.GetByID(plugins.WarningPlugin, plugins.DeprecationsPlugin)
 			if err != nil {
@@ -59,11 +62,17 @@ func init() {
 				return nil, errors.New("could not create a local client for warning service")
 			}
 
+			v2r, err := ic.GetByID(plugins.RuntimePluginV2, "task")
+			if err != nil {
+				return nil, err
+			}
+
 			// this service fetches all plugins through the plugin set of the plugin context
 			return &Local{
 				plugins:       ic.Plugins(),
 				root:          ic.Properties[plugins.PropertyRootDir],
 				warningClient: warningClient,
+				v2Runtime:     v2r.(containerdruntime.PlatformRuntime),
 			}, nil
 		},
 	})
@@ -76,6 +85,7 @@ type Local struct {
 	plugins       *plugin.Set
 	pluginCache   []*api.Plugin
 	warningClient warning.Service
+	v2Runtime     containerdruntime.PlatformRuntime
 }
 
 var _ = (api.IntrospectionClient)(&Local{})
@@ -266,4 +276,24 @@ func warningsPB(ctx context.Context, warnings []warning.Warning) []*api.Deprecat
 		})
 	}
 	return pb
+}
+
+func (l *Local) Runtime(ctx context.Context, req *api.RuntimeRequest, _ ...grpc.CallOption) (*types.RuntimeInfo, error) {
+	var (
+		rtOptions interface{}
+		err       error
+	)
+	if req.Options != nil {
+		rtOptions, err = typeurl.UnmarshalAny(req.Options)
+		if err != nil {
+			err = fmt.Errorf("failed to unmarshal RuntimeRequest.Options: %w", err)
+			return nil, errdefs.ToGRPC(err)
+		}
+	}
+	info, err := l.v2Runtime.RuntimeInfo(ctx, req.RuntimePath, rtOptions)
+	if err != nil {
+		err = fmt.Errorf("failed to get runtime info for %q: %w", req.RuntimePath, err)
+		return nil, errdefs.ToGRPC(err)
+	}
+	return info, nil
 }
