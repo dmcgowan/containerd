@@ -23,7 +23,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/log"
 )
 
 // SourceDateEpochEnv is the SOURCE_DATE_EPOCH env var.
