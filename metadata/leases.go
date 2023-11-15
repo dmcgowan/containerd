@@ -26,9 +26,9 @@ import (
 
 	"github.com/containerd/containerd/v2/errdefs"
 	"github.com/containerd/containerd/v2/filters"
-	"github.com/containerd/containerd/v2/leases"
 	"github.com/containerd/containerd/v2/metadata/boltutil"
 	"github.com/containerd/containerd/v2/namespaces"
+	"github.com/containerd/containerd/v2/pkg/leases"
 	digest "github.com/opencontainers/go-digest"
 	bolt "go.etcd.io/bbolt"
 )

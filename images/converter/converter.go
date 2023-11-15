@@ -22,7 +22,7 @@ import (
 
 	"github.com/containerd/containerd/v2/content"
 	"github.com/containerd/containerd/v2/images"
-	"github.com/containerd/containerd/v2/leases"
+	"github.com/containerd/containerd/v2/pkg/leases"
 	"github.com/containerd/containerd/v2/platforms"
 )
 

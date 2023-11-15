@@ -35,10 +35,10 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/content"
-	"github.com/containerd/containerd/v2/leases"
 	"github.com/containerd/containerd/v2/namespaces"
 	criconfig "github.com/containerd/containerd/v2/pkg/cri/config"
 	criserver "github.com/containerd/containerd/v2/pkg/cri/server"
+	"github.com/containerd/containerd/v2/pkg/leases"
 	"github.com/containerd/log"
 	"github.com/containerd/log/logtest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
