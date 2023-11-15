@@ -19,9 +19,9 @@ package plugin
 import (
 	"context"
 
-	"github.com/containerd/containerd/v2/gc"
 	"github.com/containerd/containerd/v2/leases"
 	"github.com/containerd/containerd/v2/metadata"
+	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"

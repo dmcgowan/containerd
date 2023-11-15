@@ -20,11 +20,11 @@ import (
 	// base containerd imports
 	_ "github.com/containerd/containerd/v2/diff/walking/plugin"
 	_ "github.com/containerd/containerd/v2/events/plugin"
-	_ "github.com/containerd/containerd/v2/gc/scheduler"
 	_ "github.com/containerd/containerd/v2/leases/plugin"
 	_ "github.com/containerd/containerd/v2/metadata/plugin"
 	_ "github.com/containerd/containerd/v2/pkg/cri"
 	_ "github.com/containerd/containerd/v2/pkg/nri/plugin"
+	_ "github.com/containerd/containerd/v2/plugins/gc"
 	_ "github.com/containerd/containerd/v2/plugins/imageverifier"
 	_ "github.com/containerd/containerd/v2/plugins/sandbox"
 	_ "github.com/containerd/containerd/v2/plugins/streaming"
