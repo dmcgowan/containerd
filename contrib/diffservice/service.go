@@ -26,6 +26,8 @@ import (
 	"github.com/containerd/containerd/v2/oci"
 	"github.com/containerd/typeurl/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type service struct {
@@ -43,6 +45,9 @@ func FromApplierAndComparer(a diff.Applier, c diff.Comparer) diffapi.DiffServer 
 func (s *service) Apply(ctx context.Context, er *diffapi.ApplyRequest) (*diffapi.ApplyResponse, error) {
 	if s.applier == nil {
 		return nil, errdefs.ToGRPC(errdefs.ErrNotImplemented)
+	}
+	if er.Diff == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Diff required")
 	}
 
 	var (

@@ -24,6 +24,8 @@ import (
 	"github.com/containerd/containerd/v2/mount"
 	ptypes "github.com/containerd/containerd/v2/protobuf/types"
 	"github.com/containerd/containerd/v2/snapshots"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var empty = &ptypes.Empty{}
@@ -107,6 +109,9 @@ func (s service) Stat(ctx context.Context, sr *snapshotsapi.StatSnapshotRequest)
 }
 
 func (s service) Update(ctx context.Context, sr *snapshotsapi.UpdateSnapshotRequest) (*snapshotsapi.UpdateSnapshotResponse, error) {
+	if sr.Info == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Info required")
+	}
 	info, err := s.sn.Update(ctx, snapshots.InfoFromProto(sr.Info), sr.UpdateMask.GetPaths()...)
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
