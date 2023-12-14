@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 
 	diffapi "github.com/containerd/containerd/v2/api/services/diff/v1"
 	"github.com/containerd/containerd/v2/diff"
@@ -67,6 +68,9 @@ func (r *diffRemote) Apply(ctx context.Context, desc ocispec.Descriptor, mounts 
 	if err != nil {
 		return ocispec.Descriptor{}, errdefs.FromGRPC(err)
 	}
+	if resp.Applied == nil {
+		return ocispec.Descriptor{}, fmt.Errorf("invalid server response: missing Applied: %w", errdefs.ErrUnknown)
+	}
 	return oci.DescriptorFromProto(resp.Applied), nil
 }
 
@@ -95,6 +99,9 @@ func (r *diffRemote) Compare(ctx context.Context, a, b []mount.Mount, opts ...di
 	resp, err := r.client.Diff(ctx, req)
 	if err != nil {
 		return ocispec.Descriptor{}, errdefs.FromGRPC(err)
+	}
+	if resp.Diff == nil {
+		return ocispec.Descriptor{}, fmt.Errorf("invalid server response: missing Diff: %w", errdefs.ErrUnknown)
 	}
 	return oci.DescriptorFromProto(resp.Diff), nil
 }

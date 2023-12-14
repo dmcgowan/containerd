@@ -73,7 +73,7 @@ var listCommand = cli.Command{
 		}
 		if quiet {
 			for _, plugin := range response.Plugins {
-				fmt.Println(plugin.ID)
+				fmt.Println(plugin.GetID())
 			}
 			return nil
 		}
@@ -81,6 +81,9 @@ var listCommand = cli.Command{
 		if detailed {
 			first := true
 			for _, plugin := range response.Plugins {
+				if plugin == nil {
+					continue
+				}
 				if !first {
 					fmt.Fprintln(w, "\t\t\t")
 				}
@@ -119,6 +122,9 @@ var listCommand = cli.Command{
 
 		fmt.Fprintln(w, "TYPE\tID\tPLATFORMS\tSTATUS\t")
 		for _, plugin := range response.Plugins {
+			if plugin == nil {
+				continue
+			}
 			status := "ok"
 
 			if plugin.InitErr != nil {

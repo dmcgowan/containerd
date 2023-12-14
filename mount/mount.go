@@ -165,6 +165,9 @@ func ToProto(mounts []Mount) []*types.Mount {
 func FromProto(mm []*types.Mount) []Mount {
 	mounts := make([]Mount, len(mm))
 	for i, m := range mm {
+		if m == nil {
+			return nil
+		}
 		mounts[i] = Mount{
 			Type:    m.Type,
 			Source:  m.Source,
