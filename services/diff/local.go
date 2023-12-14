@@ -32,6 +32,8 @@ import (
 	"github.com/containerd/typeurl/v2"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type config struct {
@@ -91,12 +93,18 @@ type local struct {
 var _ diffapi.DiffClient = &local{}
 
 func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.CallOption) (*diffapi.ApplyResponse, error) {
+	if er.Diff == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Diff required")
+	}
 	var (
 		ocidesc ocispec.Descriptor
 		err     error
 		desc    = oci.DescriptorFromProto(er.Diff)
 		mounts  = mount.FromProto(er.Mounts)
 	)
+	if mounts == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Mounts required")
+	}
 
 	var opts []diff.ApplyOpt
 	if er.Payloads != nil {
@@ -132,6 +140,9 @@ func (l *local) Diff(ctx context.Context, dr *diffapi.DiffRequest, _ ...grpc.Cal
 		aMounts = mount.FromProto(dr.Left)
 		bMounts = mount.FromProto(dr.Right)
 	)
+	if aMounts == nil || bMounts == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Left and Right mounts must not be empty")
+	}
 
 	var opts []diff.Opt
 	if dr.MediaType != "" {

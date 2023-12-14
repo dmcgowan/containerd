@@ -118,6 +118,9 @@ func (l *local) List(ctx context.Context, req *api.ListNamespacesRequest, _ ...g
 }
 
 func (l *local) Create(ctx context.Context, req *api.CreateNamespaceRequest, _ ...grpc.CallOption) (*api.CreateNamespaceResponse, error) {
+	if req.Namespace == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Namespace required")
+	}
 	var resp api.CreateNamespaceResponse
 
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context, store namespaces.Store) error {
@@ -150,6 +153,9 @@ func (l *local) Create(ctx context.Context, req *api.CreateNamespaceRequest, _ .
 }
 
 func (l *local) Update(ctx context.Context, req *api.UpdateNamespaceRequest, _ ...grpc.CallOption) (*api.UpdateNamespaceResponse, error) {
+	if req.Namespace == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Namespace required")
+	}
 	var resp api.UpdateNamespaceResponse
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context, store namespaces.Store) error {
 		if req.UpdateMask != nil && len(req.UpdateMask.Paths) > 0 {

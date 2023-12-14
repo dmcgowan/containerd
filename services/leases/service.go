@@ -28,6 +28,8 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func init() {
@@ -107,6 +109,9 @@ func (s *service) List(ctx context.Context, r *api.ListRequest) (*api.ListRespon
 }
 
 func (s *service) AddResource(ctx context.Context, r *api.AddResourceRequest) (*ptypes.Empty, error) {
+	if r.Resource == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Resource required")
+	}
 	lease := leases.Lease{
 		ID: r.ID,
 	}
@@ -121,6 +126,9 @@ func (s *service) AddResource(ctx context.Context, r *api.AddResourceRequest) (*
 }
 
 func (s *service) DeleteResource(ctx context.Context, r *api.DeleteResourceRequest) (*ptypes.Empty, error) {
+	if r.Resource == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Resource required")
+	}
 	lease := leases.Lease{
 		ID: r.ID,
 	}

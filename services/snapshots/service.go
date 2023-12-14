@@ -30,6 +30,8 @@ import (
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func init() {
@@ -179,6 +181,9 @@ func (s *service) Stat(ctx context.Context, sr *snapshotsapi.StatSnapshotRequest
 }
 
 func (s *service) Update(ctx context.Context, sr *snapshotsapi.UpdateSnapshotRequest) (*snapshotsapi.UpdateSnapshotResponse, error) {
+	if sr.Info == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Info required")
+	}
 	log.G(ctx).WithField("key", sr.Info.Name).Debugf("update snapshot")
 	sn, err := s.getSnapshotter(sr.Snapshotter)
 	if err != nil {

@@ -116,6 +116,9 @@ func (l *local) ListStream(ctx context.Context, req *api.ListContainersRequest, 
 }
 
 func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ ...grpc.CallOption) (*api.CreateContainerResponse, error) {
+	if req.Container == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Container required")
+	}
 	var resp api.CreateContainerResponse
 
 	if err := l.withStoreUpdate(ctx, func(ctx context.Context) error {
@@ -147,6 +150,9 @@ func (l *local) Create(ctx context.Context, req *api.CreateContainerRequest, _ .
 }
 
 func (l *local) Update(ctx context.Context, req *api.UpdateContainerRequest, _ ...grpc.CallOption) (*api.UpdateContainerResponse, error) {
+	if req.Container == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Container required")
+	}
 	if req.Container.ID == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "Container.ID required")
 	}

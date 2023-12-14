@@ -51,6 +51,9 @@ func (s *service) Apply(ctx context.Context, er *diffapi.ApplyRequest) (*diffapi
 		desc    = oci.DescriptorFromProto(er.Diff)
 		mounts  = mount.FromProto(er.Mounts)
 	)
+	if mounts == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Mounts required")
+	}
 
 	var opts []diff.ApplyOpt
 	if er.Payloads != nil {
@@ -82,6 +85,9 @@ func (s *service) Diff(ctx context.Context, dr *diffapi.DiffRequest) (*diffapi.D
 		aMounts = mount.FromProto(dr.Left)
 		bMounts = mount.FromProto(dr.Right)
 	)
+	if aMounts == nil || bMounts == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Left and Right mounts must not be empty")
+	}
 
 	var opts []diff.Opt
 	if dr.MediaType != "" {

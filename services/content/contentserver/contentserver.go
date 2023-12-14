@@ -77,6 +77,9 @@ func (s *service) Info(ctx context.Context, req *api.InfoRequest) (*api.InfoResp
 }
 
 func (s *service) Update(ctx context.Context, req *api.UpdateRequest) (*api.UpdateResponse, error) {
+	if req.Info == nil {
+		return nil, status.Error(codes.InvalidArgument, "no digest provided")
+	}
 	_, err := digest.Parse(req.Info.Digest)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%q failed validation", req.Info.Digest)

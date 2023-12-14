@@ -20,6 +20,8 @@ import (
 	"context"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	api "github.com/containerd/containerd/v2/api/services/sandbox/v1"
 	"github.com/containerd/containerd/v2/api/types"
@@ -62,6 +64,9 @@ func (s *sandboxService) Register(server *grpc.Server) error {
 }
 
 func (s *sandboxService) Create(ctx context.Context, req *api.StoreCreateRequest) (*api.StoreCreateResponse, error) {
+	if req.Sandbox == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Sandbox required")
+	}
 	log.G(ctx).WithField("req", req).Debug("create sandbox")
 	sb, err := s.store.Create(ctx, sandbox.FromProto(req.Sandbox))
 	if err != nil {
@@ -72,6 +77,9 @@ func (s *sandboxService) Create(ctx context.Context, req *api.StoreCreateRequest
 }
 
 func (s *sandboxService) Update(ctx context.Context, req *api.StoreUpdateRequest) (*api.StoreUpdateResponse, error) {
+	if req.Sandbox == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Sandbox required")
+	}
 	log.G(ctx).WithField("req", req).Debug("update sandbox")
 
 	sb, err := s.store.Update(ctx, sandbox.FromProto(req.Sandbox), req.Fields...)

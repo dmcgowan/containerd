@@ -116,10 +116,13 @@ func (l *local) List(ctx context.Context, req *imagesapi.ListImagesRequest, _ ..
 }
 
 func (l *local) Create(ctx context.Context, req *imagesapi.CreateImageRequest, _ ...grpc.CallOption) (*imagesapi.CreateImageResponse, error) {
-	log.G(ctx).WithField("name", req.Image.Name).WithField("target", req.Image.Target.Digest).Debugf("create image")
+	if req.Image == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Image required")
+	}
 	if req.Image.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "Image.Name required")
 	}
+	log.G(ctx).WithField("name", req.Image.Name).WithField("target", req.Image.Target.Digest).Debugf("create image")
 
 	var (
 		image = imageFromProto(req.Image)
@@ -149,6 +152,9 @@ func (l *local) Create(ctx context.Context, req *imagesapi.CreateImageRequest, _
 }
 
 func (l *local) Update(ctx context.Context, req *imagesapi.UpdateImageRequest, _ ...grpc.CallOption) (*imagesapi.UpdateImageResponse, error) {
+	if req.Image == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Image required")
+	}
 	if req.Image.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "Image.Name required")
 	}
