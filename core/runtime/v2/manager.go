@@ -537,20 +537,21 @@ func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit,
 	return exit, nil
 }
 
-func (m *TaskManager) RuntimeInfo(ctx context.Context, runtimeName string, runtimeOptions interface{}) (*apitypes.RuntimeInfo, error) {
-	runtimePath, err := m.manager.resolveRuntimePath(runtimeName)
+func (m *TaskManager) PluginInfo(ctx context.Context, request interface{}) (interface{}, error) {
+	req, ok := request.(*apitypes.RuntimeRequest)
+	if !ok {
+		return nil, fmt.Errorf("unknown request type %T: %w", request, errdefs.ErrNotImplemented)
+	}
+
+	runtimePath, err := m.manager.resolveRuntimePath(req.RuntimePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
 	}
 	var optsB []byte
-	if runtimeOptions != nil {
-		optsPBAny, err := protobuf.MarshalAnyToProto(runtimeOptions)
+	if req.Options != nil {
+		optsB, err = proto.Marshal(req.Options)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal %T: %w", runtimeOptions, err)
-		}
-		optsB, err = proto.Marshal(optsPBAny)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal %T: %w", optsPBAny, err)
+			return nil, fmt.Errorf("failed to marshal %s: %w", req.Options.TypeUrl, err)
 		}
 	}
 	var stderr bytes.Buffer

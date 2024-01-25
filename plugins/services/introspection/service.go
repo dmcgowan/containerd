@@ -21,7 +21,6 @@ import (
 	"errors"
 
 	api "github.com/containerd/containerd/v2/api/services/introspection/v1"
-	apitypes "github.com/containerd/containerd/v2/api/types"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services"
 	ptypes "github.com/containerd/containerd/v2/protobuf/types"
@@ -74,6 +73,6 @@ func (s *server) Server(ctx context.Context, empty *ptypes.Empty) (*api.ServerRe
 	return s.local.Server(ctx, empty)
 }
 
-func (s *server) Runtime(ctx context.Context, req *api.RuntimeRequest) (*apitypes.RuntimeInfo, error) {
-	return s.local.Runtime(ctx, req)
+func (s *server) PluginInfo(ctx context.Context, req *api.PluginInfoRequest) (*api.PluginInfoResponse, error) {
+	return s.local.PluginInfo(ctx, req)
 }

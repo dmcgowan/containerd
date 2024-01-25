@@ -8,7 +8,6 @@ package introspection
 
 import (
 	context "context"
-	types "github.com/containerd/containerd/v2/api/types"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -31,8 +30,8 @@ type IntrospectionClient interface {
 	Plugins(ctx context.Context, in *PluginsRequest, opts ...grpc.CallOption) (*PluginsResponse, error)
 	// Server returns information about the containerd server
 	Server(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ServerResponse, error)
-	// Runtime returns the runtime info
-	Runtime(ctx context.Context, in *RuntimeRequest, opts ...grpc.CallOption) (*types.RuntimeInfo, error)
+	// PluginInfo returns information directly from a plugin if the plugin supports it
+	PluginInfo(ctx context.Context, in *PluginInfoRequest, opts ...grpc.CallOption) (*PluginInfoResponse, error)
 }
 
 type introspectionClient struct {
@@ -61,9 +60,9 @@ func (c *introspectionClient) Server(ctx context.Context, in *emptypb.Empty, opt
 	return out, nil
 }
 
-func (c *introspectionClient) Runtime(ctx context.Context, in *RuntimeRequest, opts ...grpc.CallOption) (*types.RuntimeInfo, error) {
-	out := new(types.RuntimeInfo)
-	err := c.cc.Invoke(ctx, "/containerd.services.introspection.v1.Introspection/Runtime", in, out, opts...)
+func (c *introspectionClient) PluginInfo(ctx context.Context, in *PluginInfoRequest, opts ...grpc.CallOption) (*PluginInfoResponse, error) {
+	out := new(PluginInfoResponse)
+	err := c.cc.Invoke(ctx, "/containerd.services.introspection.v1.Introspection/PluginInfo", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,8 +80,8 @@ type IntrospectionServer interface {
 	Plugins(context.Context, *PluginsRequest) (*PluginsResponse, error)
 	// Server returns information about the containerd server
 	Server(context.Context, *emptypb.Empty) (*ServerResponse, error)
-	// Runtime returns the runtime info
-	Runtime(context.Context, *RuntimeRequest) (*types.RuntimeInfo, error)
+	// PluginInfo returns information directly from a plugin if the plugin supports it
+	PluginInfo(context.Context, *PluginInfoRequest) (*PluginInfoResponse, error)
 	mustEmbedUnimplementedIntrospectionServer()
 }
 
@@ -96,8 +95,8 @@ func (UnimplementedIntrospectionServer) Plugins(context.Context, *PluginsRequest
 func (UnimplementedIntrospectionServer) Server(context.Context, *emptypb.Empty) (*ServerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Server not implemented")
 }
-func (UnimplementedIntrospectionServer) Runtime(context.Context, *RuntimeRequest) (*types.RuntimeInfo, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Runtime not implemented")
+func (UnimplementedIntrospectionServer) PluginInfo(context.Context, *PluginInfoRequest) (*PluginInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PluginInfo not implemented")
 }
 func (UnimplementedIntrospectionServer) mustEmbedUnimplementedIntrospectionServer() {}
 
@@ -148,20 +147,20 @@ func _Introspection_Server_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Introspection_Runtime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RuntimeRequest)
+func _Introspection_PluginInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PluginInfoRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(IntrospectionServer).Runtime(ctx, in)
+		return srv.(IntrospectionServer).PluginInfo(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/containerd.services.introspection.v1.Introspection/Runtime",
+		FullMethod: "/containerd.services.introspection.v1.Introspection/PluginInfo",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(IntrospectionServer).Runtime(ctx, req.(*RuntimeRequest))
+		return srv.(IntrospectionServer).PluginInfo(ctx, req.(*PluginInfoRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -182,8 +181,8 @@ var Introspection_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Introspection_Server_Handler,
 		},
 		{
-			MethodName: "Runtime",
-			Handler:    _Introspection_Runtime_Handler,
+			MethodName: "PluginInfo",
+			Handler:    _Introspection_PluginInfo_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -893,39 +893,57 @@ func (c *Client) RuntimeInfo(ctx context.Context, runtimePath string, runtimeOpt
 	if runtimePath != "" {
 		rt = runtimePath
 	}
-	req := &introspectionapi.RuntimeRequest{
+	rr := &apitypes.RuntimeRequest{
 		RuntimePath: rt,
 	}
 	var err error
 	if runtimeOptions != nil {
-		req.Options, err = protobuf.MarshalAnyToProto(runtimeOptions)
+		rr.Options, err = protobuf.MarshalAnyToProto(runtimeOptions)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal %T: %w", runtimeOptions, err)
 		}
 	}
+	options, err := protobuf.MarshalAnyToProto(rr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal runtime requst: %w", err)
+	}
+
 	s := c.IntrospectionService()
-	resp, err := s.Runtime(ctx, req)
+
+	req := &introspectionapi.PluginInfoRequest{
+		Type:    string(plugins.RuntimePluginV2),
+		ID:      "task",
+		Options: options,
+	}
+
+	resp, err := s.PluginInfo(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+
+	var info apitypes.RuntimeInfo
+	if err := typeurl.UnmarshalTo(resp.Extra, &info); err != nil {
+		return nil, fmt.Errorf("failed to get runtime info from plugin info: %w", err)
+	}
+
 	var result RuntimeInfo
-	result.Name = resp.Name
-	if resp.Version != nil {
-		result.Version.Version = resp.Version.Version
-		result.Version.Revision = resp.Version.Revision
+	result.Name = info.Name
+	if info.Version != nil {
+		result.Version.Version = info.Version.Version
+		result.Version.Revision = info.Version.Revision
 	}
-	if resp.Options != nil {
-		result.Options, err = typeurl.UnmarshalAny(resp.Options)
+	if info.Options != nil {
+		result.Options, err = typeurl.UnmarshalAny(info.Options)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal RuntimeInfo.Options (%T): %w", resp.Options, err)
+			return nil, fmt.Errorf("failed to unmarshal RuntimeInfo.Options (%T): %w", info.Options, err)
 		}
 	}
-	if resp.Features != nil {
-		result.Features, err = typeurl.UnmarshalAny(resp.Features)
+	if info.Features != nil {
+		result.Features, err = typeurl.UnmarshalAny(info.Features)
 		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal RuntimeInfo.Features (%T): %w", resp.Features, err)
+			return nil, fmt.Errorf("failed to unmarshal RuntimeInfo.Features (%T): %w", info.Features, err)
 		}
 	}
-	result.Annotations = resp.Annotations
+	result.Annotations = info.Annotations
 	return &result, nil
 }

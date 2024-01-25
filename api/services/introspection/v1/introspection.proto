@@ -35,8 +35,8 @@ service Introspection {
 	rpc Plugins(PluginsRequest) returns (PluginsResponse);
 	// Server returns information about the containerd server
 	rpc Server(google.protobuf.Empty) returns (ServerResponse);
-	// Runtime returns the runtime info
-	rpc Runtime(RuntimeRequest) returns (types.RuntimeInfo);
+	// PluginInfo returns information directly from a plugin if the plugin supports it
+	rpc PluginInfo(PluginInfoRequest) returns (PluginInfoResponse);
 }
 
 message Plugin {
@@ -116,9 +116,18 @@ message DeprecationWarning {
 	google.protobuf.Timestamp last_occurrence = 3;
 }
 
-message RuntimeRequest {
-	string runtime_path = 1;
-	// Options correspond to CreateTaskRequest.options.
-	// This is needed to pass the runc binary path, etc.
-	google.protobuf.Any options = 2;
+message PluginInfoRequest {
+	string type = 1;
+	string id = 2;
+
+	// Options may be used to request extra dynamic information from
+	// a plugin.
+	// This object is determined by the plugin and the plugin may return
+	// NotImplemented or InvalidArgument if it is not supported
+	google.protobuf.Any options = 3;
+}
+
+message PluginInfoResponse {
+	Plugin plugin = 1;
+	google.protobuf.Any extra = 2;
 }

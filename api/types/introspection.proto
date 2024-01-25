@@ -22,6 +22,13 @@ import "google/protobuf/any.proto";
 
 option go_package = "github.com/containerd/containerd/v2/api/types;types";
 
+message RuntimeRequest {
+	string runtime_path = 1;
+	// Options correspond to CreateTaskRequest.options.
+	// This is needed to pass the runc binary path, etc.
+	google.protobuf.Any options = 2;
+}
+
 message RuntimeVersion {
 	string version = 1;
 	string revision = 2;
