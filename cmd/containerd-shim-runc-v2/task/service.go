@@ -765,6 +765,8 @@ func (s *service) Events(ctx context.Context, _ *emptypb.Empty, streamer taskAPI
 			Timestamp: timestamppb.Now(),
 		}); err != nil {
 			log.G(ctx).WithError(err).Error("post event")
+
+			return err
 		}
 	}
 
