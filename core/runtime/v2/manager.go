@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/events/exchange"
+	eventsproxy "github.com/containerd/containerd/v2/core/events/proxy"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/core/sandbox"
@@ -530,32 +531,14 @@ func (m *TaskManager) tryStreamEvents(ctx context.Context, shim *shimTask) error
 
 	log.G(ctx).Info("using shim events streaming")
 
-	stream, err := shim.task.Events(context.Background(), nil)
-	if err != nil {
-		return fmt.Errorf("failed to obtain events streamer from shim: %w", err)
-	}
-
-	go func() {
-		for {
-			evt, err := stream.Recv()
-			if err != nil {
-				log.G(ctx).WithError(err).Error("failed to receive shim event from stream")
-				break
-			}
-
-			log.G(ctx).Debugf("got shim event %q from stream: %+v", evt.Topic, evt.Event.GetTypeUrl())
-
-			if err := m.manager.events.Forward(context.Background(), &events.Envelope{
-				Timestamp: evt.Timestamp.AsTime(),
-				Namespace: evt.Namespace,
-				Topic:     evt.Topic,
-				Event:     evt.Event,
-			}); err != nil {
-				log.G(ctx).WithError(err).Error("failed to publish event from shim stream: %w", evt)
-				continue
-			}
+	// TODO: Inherit vars from context
+	fwdCtx := context.Background()
+	go func(client any) {
+		ep := eventsproxy.NewRemoteEvents(client)
+		if err := events.ForwardAll(fwdCtx, m.manager.events, ep); err != nil {
+			log.G(ctx).WithError(err).Error("failed while forwarding event stream for shim")
 		}
-	}()
+	}(shim.Client())
 
 	return nil
 }

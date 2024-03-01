@@ -18,8 +18,10 @@ package events
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 )
 
@@ -77,4 +79,23 @@ type Forwarder interface {
 // Subscriber allows callers to subscribe to events
 type Subscriber interface {
 	Subscribe(ctx context.Context, filters ...string) (ch <-chan *Envelope, errs <-chan error)
+}
+
+// ForwardAll forwards messages from a subscription until an error is received
+func ForwardAll(ctx context.Context, f Forwarder, s Subscriber) error {
+	sub, errs := s.Subscribe(ctx)
+	for {
+		select {
+		case evt := <-sub:
+			if err := f.Forward(ctx, evt); err != nil {
+				log.G(ctx).WithError(err).Errorf("event forward error: %v", evt)
+			}
+		case err := <-errs:
+			if err != nil {
+				return fmt.Errorf("error from subscription: %w", err)
+			}
+			return nil
+		}
+
+	}
 }
