@@ -25,6 +25,7 @@ import (
 	_ "github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/task/plugin"
 	"github.com/containerd/containerd/v2/pkg/shim"
 	_ "github.com/containerd/containerd/v2/plugins/events"
+	_ "github.com/containerd/containerd/v2/plugins/services/events/ttrpc"
 )
 
 func main() {
