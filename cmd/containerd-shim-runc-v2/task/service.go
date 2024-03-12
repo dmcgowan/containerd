@@ -24,9 +24,6 @@ import (
 	"os"
 	"sync"
 
-	"google.golang.org/protobuf/types/known/emptypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
-
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
 	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
@@ -35,9 +32,8 @@ import (
 	"github.com/containerd/containerd/v2/api/types/task"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/runc"
-	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/runtime/v2/runc/options"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oom"
 	oomv1 "github.com/containerd/containerd/v2/pkg/oom/v1"
 	oomv2 "github.com/containerd/containerd/v2/pkg/oom/v2"
@@ -61,7 +57,7 @@ var (
 )
 
 // NewTaskService creates a new instance of a task service
-func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
+func NewTaskService(ctx context.Context, publisher events.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
 	var (
 		ep  oom.Watcher
 		err error
@@ -85,7 +81,6 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 		running:         make(map[int][]containerProcess),
 		pendingExecs:    make(map[*runc.Container]int),
 		exitSubscribers: make(map[*map[int][]runcC.Exit]struct{}),
-		publisher:       publisher,
 	}
 	go s.processExits()
 	runcC.Monitor = reaper.Default
@@ -127,8 +122,6 @@ type service struct {
 	exitSubscribers map[*map[int][]runcC.Exit]struct{}
 
 	shutdown shutdown.Service
-
-	publisher shim.Publisher
 }
 
 type containerProcess struct {
@@ -747,31 +740,6 @@ func (s *service) getContainerPids(ctx context.Context, container *runc.Containe
 		pids = append(pids, uint32(pid))
 	}
 	return pids, nil
-}
-
-func (s *service) Events(ctx context.Context, _ *emptypb.Empty, streamer taskAPI.TTRPCTask_EventsServer) error {
-	ns, _ := namespaces.Namespace(ctx)
-	ctx = namespaces.WithNamespace(context.Background(), ns)
-	for e := range s.events {
-		evt, err := protobuf.MarshalAnyToProto(e)
-		if err != nil {
-			return fmt.Errorf("failed to marshal shim event to any: %w", err)
-		}
-
-		if err := streamer.Send(&taskAPI.Event{
-			Topic:     runtime.GetTopic(e),
-			Namespace: ns,
-			Event:     evt,
-			Timestamp: timestamppb.Now(),
-		}); err != nil {
-			log.G(ctx).WithError(err).Error("post event")
-
-			return err
-		}
-	}
-
-	// TODO: publisher is currently involved in shim's lifecycle. Remove it.
-	return s.publisher.Close()
 }
 
 func (s *service) getContainer(id string) (*runc.Container, error) {

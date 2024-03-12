@@ -187,8 +187,6 @@ type ShimInstance interface {
 	Delete(ctx context.Context) error
 	// Version returns shim's features compatibility version.
 	Version() int
-	// Features returns a list of additional features supported by newer shims.
-	Features() []string
 }
 
 func parseStartResponse(response []byte) (client.BootstrapParams, error) {
@@ -375,10 +373,6 @@ func (s *shim) ID() string {
 
 func (s *shim) Version() int {
 	return s.params.Version
-}
-
-func (s *shim) Features() []string {
-	return s.params.Features
 }
 
 func (s *shim) Namespace() string {

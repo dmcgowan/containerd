@@ -515,28 +515,17 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 
 // tryStreamEvents streams evetns from shim (if its supported by the shim implementation).
 func (m *TaskManager) tryStreamEvents(ctx context.Context, shim *shimTask) error {
-	// TODO: Use slices.Contains once on Go 1.21
-	supportsStreaming := false
-	for _, f := range shim.Features() {
-		if f == shimbinary.EventStreaming {
-			supportsStreaming = true
-			break
-		}
-	}
+	log.G(ctx).Debug("try using shim events streaming")
 
-	// Shims will use legacy events reporting.
-	if !supportsStreaming {
-		return nil
-	}
-
-	log.G(ctx).Info("using shim events streaming")
-
-	// TODO: Inherit vars from context
-	fwdCtx := context.Background()
+	fwdCtx := log.WithLogger(context.Background(), log.G(ctx))
 	go func(client any) {
 		ep := eventsproxy.NewRemoteEvents(client)
 		if err := events.ForwardAll(fwdCtx, m.manager.events, ep); err != nil {
-			log.G(ctx).WithError(err).Error("failed while forwarding event stream for shim")
+			if errdefs.IsNotImplemented(err) {
+				log.G(ctx).WithError(err).Debug("shim does not support event streaming, relying on legacy callback")
+			} else {
+				log.G(ctx).WithError(err).Error("failed while forwarding event stream for shim")
+			}
 		}
 	}(shim.Client())
 

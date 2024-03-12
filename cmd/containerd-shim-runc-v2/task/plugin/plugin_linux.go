@@ -18,7 +18,7 @@ package plugin
 
 import (
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/task"
-	"github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/pkg/shutdown"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/plugin"
@@ -34,7 +34,7 @@ func init() {
 			plugins.InternalPlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			pp, err := ic.GetByID(plugins.EventPlugin, "publisher")
+			pp, err := ic.GetByID(plugins.EventPlugin, "exchange")
 			if err != nil {
 				return nil, err
 			}
@@ -42,7 +42,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return task.NewTaskService(ic.Context, pp.(shim.Publisher), ss.(shutdown.Service))
+			return task.NewTaskService(ic.Context, pp.(events.Publisher), ss.(shutdown.Service))
 		},
 	})
 
