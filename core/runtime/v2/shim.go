@@ -114,9 +114,9 @@ func loadShim(ctx context.Context, bundle *Bundle, onClose func()) (_ ShimInstan
 	}()
 
 	shim := &shim{
-		bundle:  bundle,
-		client:  conn,
-		version: params.Version,
+		bundle: bundle,
+		client: conn,
+		params: params,
 	}
 
 	return shim, nil
@@ -359,9 +359,9 @@ func (gc *grpcConn) UserOnCloseWait(ctx context.Context) error {
 }
 
 type shim struct {
-	bundle  *Bundle
-	client  any
-	version int
+	bundle *Bundle
+	client any
+	params client.BootstrapParams
 }
 
 var _ ShimInstance = (*shim)(nil)
@@ -372,7 +372,7 @@ func (s *shim) ID() string {
 }
 
 func (s *shim) Version() int {
-	return s.version
+	return s.params.Version
 }
 
 func (s *shim) Namespace() string {

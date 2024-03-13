@@ -32,9 +32,8 @@ import (
 	"github.com/containerd/containerd/v2/api/types/task"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/runc"
-	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/runtime/v2/runc/options"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oom"
 	oomv1 "github.com/containerd/containerd/v2/pkg/oom/v1"
 	oomv2 "github.com/containerd/containerd/v2/pkg/oom/v2"
@@ -58,7 +57,7 @@ var (
 )
 
 // NewTaskService creates a new instance of a task service
-func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
+func NewTaskService(ctx context.Context, publisher events.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
 	var (
 		ep  oom.Watcher
 		err error
@@ -88,7 +87,7 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 	if err := s.initPlatform(); err != nil {
 		return nil, fmt.Errorf("failed to initialized platform behavior: %w", err)
 	}
-	go s.forward(ctx, publisher)
+
 	sd.RegisterCallback(func(context.Context) error {
 		close(s.events)
 		return nil
@@ -741,18 +740,6 @@ func (s *service) getContainerPids(ctx context.Context, container *runc.Containe
 		pids = append(pids, uint32(pid))
 	}
 	return pids, nil
-}
-
-func (s *service) forward(ctx context.Context, publisher shim.Publisher) {
-	ns, _ := namespaces.Namespace(ctx)
-	ctx = namespaces.WithNamespace(context.Background(), ns)
-	for e := range s.events {
-		err := publisher.Publish(ctx, runtime.GetTopic(e), e)
-		if err != nil {
-			log.G(ctx).WithError(err).Error("post event")
-		}
-	}
-	publisher.Close()
 }
 
 func (s *service) getContainer(id string) (*runc.Container, error) {
