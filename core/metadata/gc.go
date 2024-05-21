@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	eventstypes "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/v2/pkg/gc"
 	"github.com/containerd/log"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/containerd/containerd/v2/pkg/gc"
 )
 
 const (
@@ -225,18 +227,23 @@ func (c *gcContext) leased(namespace, lease string, fn func(gc.Node)) {
 }
 
 func (c *gcContext) cancel(ctx context.Context) {
-	for _, gctx := range c.contexts {
+	for t, gctx := range c.contexts {
 		if err := gctx.Cancel(); err != nil {
-			log.G(ctx).WithError(err).Error("failed to cancel collection context")
+			log.G(ctx).WithField("type", t).WithError(err).Error("failed to cancel collection context")
 		}
 	}
 }
 
-func (c *gcContext) finish(ctx context.Context) {
-	for _, gctx := range c.contexts {
-		if err := gctx.Finish(); err != nil {
-			log.G(ctx).WithError(err).Error("failed to finish collection context")
-		}
+func (c *gcContext) finish(ctx context.Context, wg *sync.WaitGroup) {
+	wg.Add(len(c.contexts))
+	for t, gctx := range c.contexts {
+		gctx := gctx
+		go func() {
+			if err := gctx.Finish(); err != nil {
+				log.G(ctx).WithField("type", t).WithError(err).Error("failed to finish collection context")
+			}
+			wg.Done()
+		}()
 	}
 }
 
