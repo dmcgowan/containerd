@@ -73,6 +73,10 @@ const (
 	CRIServicePlugin plugin.Type = "io.containerd.cri.v1"
 	// ShimPlugin implements a shim service
 	ShimPlugin plugin.Type = "io.containerd.shim.v1"
+	// MountManagerPlugin implements the mount manager interface
+	MountManagerPlugin plugin.Type = "io.containerd.mount-manager.v1"
+	// MountHandlerPlugin implements the mount handler interface
+	MountHandlerPlugin plugin.Type = "io.containerd.mount-handler.v1"
 )
 
 const (
