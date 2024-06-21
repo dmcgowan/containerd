@@ -20,6 +20,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/ttrpc"
+	"google.golang.org/grpc"
+
 	api "github.com/containerd/containerd/api/services/events/v1"
 	apittrpc "github.com/containerd/containerd/api/services/ttrpc/events/v1"
 	"github.com/containerd/containerd/events"
@@ -27,9 +31,6 @@ import (
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/protobuf"
 	ptypes "github.com/containerd/containerd/protobuf/types"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/ttrpc"
-	"google.golang.org/grpc"
 )
 
 func init() {
@@ -77,7 +78,7 @@ func (s *service) RegisterTTRPC(server *ttrpc.Server) error {
 
 func (s *service) Publish(ctx context.Context, r *api.PublishRequest) (*ptypes.Empty, error) {
 	if err := s.events.Publish(ctx, r.Topic, r.Event); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &ptypes.Empty{}, nil
@@ -85,7 +86,7 @@ func (s *service) Publish(ctx context.Context, r *api.PublishRequest) (*ptypes.E
 
 func (s *service) Forward(ctx context.Context, r *api.ForwardRequest) (*ptypes.Empty, error) {
 	if err := s.events.Forward(ctx, fromProto(r.Envelope)); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &ptypes.Empty{}, nil

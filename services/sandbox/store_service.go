@@ -21,12 +21,13 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/log"
+
 	api "github.com/containerd/containerd/api/services/sandbox/v1"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/sandbox"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
 )
 
 func init() {
@@ -63,7 +64,7 @@ func (s *sandboxService) Create(ctx context.Context, req *api.StoreCreateRequest
 	log.G(ctx).WithField("req", req).Debug("create sandbox")
 	sb, err := s.store.Create(ctx, sandbox.FromProto(req.Sandbox))
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &api.StoreCreateResponse{Sandbox: sandbox.ToProto(&sb)}, nil
@@ -74,7 +75,7 @@ func (s *sandboxService) Update(ctx context.Context, req *api.StoreUpdateRequest
 
 	sb, err := s.store.Update(ctx, sandbox.FromProto(req.Sandbox), req.Fields...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &api.StoreUpdateResponse{Sandbox: sandbox.ToProto(&sb)}, nil
@@ -85,7 +86,7 @@ func (s *sandboxService) List(ctx context.Context, req *api.StoreListRequest) (*
 
 	resp, err := s.store.List(ctx, req.Filters...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	list := make([]*types.Sandbox, len(resp))
@@ -100,7 +101,7 @@ func (s *sandboxService) Get(ctx context.Context, req *api.StoreGetRequest) (*ap
 	log.G(ctx).WithField("req", req).Debug("get sandbox")
 	resp, err := s.store.Get(ctx, req.SandboxID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	desc := sandbox.ToProto(&resp)
@@ -110,7 +111,7 @@ func (s *sandboxService) Get(ctx context.Context, req *api.StoreGetRequest) (*ap
 func (s *sandboxService) Delete(ctx context.Context, req *api.StoreDeleteRequest) (*api.StoreDeleteResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("delete sandbox")
 	if err := s.store.Delete(ctx, req.SandboxID); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &api.StoreDeleteResponse{}, nil

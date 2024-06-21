@@ -27,6 +27,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/go-runc"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
+
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/containers"
@@ -45,12 +52,6 @@ import (
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v1 "github.com/containerd/containerd/runtime/v1"
 	"github.com/containerd/containerd/runtime/v1/shim/v1"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/go-runc"
-	"github.com/containerd/log"
-	"github.com/containerd/typeurl/v2"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -256,7 +257,7 @@ func (r *Runtime) Create(ctx context.Context, id string, opts runtime.CreateOpts
 	}
 	cr, err := s.Create(ctx, sopts)
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	t, err := newTask(id, namespace, int(cr.Pid), s, r.events, r.tasks, bundle)
 	if err != nil {

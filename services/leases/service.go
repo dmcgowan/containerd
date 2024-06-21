@@ -19,13 +19,14 @@ package leases
 import (
 	"context"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"google.golang.org/grpc"
+
 	api "github.com/containerd/containerd/api/services/leases/v1"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/protobuf"
 	ptypes "github.com/containerd/containerd/protobuf/types"
-	"github.com/containerd/errdefs"
-	"google.golang.org/grpc"
 )
 
 func init() {
@@ -67,7 +68,7 @@ func (s *service) Create(ctx context.Context, r *api.CreateRequest) (*api.Create
 
 	l, err := s.lm.Create(ctx, opts...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &api.CreateResponse{
@@ -83,7 +84,7 @@ func (s *service) Delete(ctx context.Context, r *api.DeleteRequest) (*ptypes.Emp
 	if err := s.lm.Delete(ctx, leases.Lease{
 		ID: r.ID,
 	}, opts...); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return &ptypes.Empty{}, nil
 }
@@ -91,7 +92,7 @@ func (s *service) Delete(ctx context.Context, r *api.DeleteRequest) (*ptypes.Emp
 func (s *service) List(ctx context.Context, r *api.ListRequest) (*api.ListResponse, error) {
 	l, err := s.lm.List(ctx, r.Filters...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	apileases := make([]*api.Lease, len(l))
@@ -113,7 +114,7 @@ func (s *service) AddResource(ctx context.Context, r *api.AddResourceRequest) (*
 		ID:   r.Resource.ID,
 		Type: r.Resource.Type,
 	}); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return &ptypes.Empty{}, nil
 }
@@ -127,7 +128,7 @@ func (s *service) DeleteResource(ctx context.Context, r *api.DeleteResourceReque
 		ID:   r.Resource.ID,
 		Type: r.Resource.Type,
 	}); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return &ptypes.Empty{}, nil
 }
@@ -139,7 +140,7 @@ func (s *service) ListResources(ctx context.Context, r *api.ListResourcesRequest
 
 	rs, err := s.lm.ListResources(ctx, lease)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	apiResources := make([]*api.Resource, 0, len(rs))

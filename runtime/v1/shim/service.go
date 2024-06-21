@@ -27,6 +27,16 @@ import (
 	"sync"
 
 	"github.com/containerd/console"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	runc "github.com/containerd/go-runc"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/events"
@@ -40,14 +50,6 @@ import (
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	shimapi "github.com/containerd/containerd/runtime/v1/shim/v1"
 	"github.com/containerd/containerd/sys/reaper"
-	"github.com/containerd/errdefs"
-	runc "github.com/containerd/go-runc"
-	"github.com/containerd/log"
-	"github.com/containerd/typeurl/v2"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 var (
@@ -186,10 +188,10 @@ func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *
 		rootfs,
 	)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	if err := process.Create(ctx, config); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	// save the main task id and bundle to the shim for additional requests
 	s.id = r.ID
@@ -223,7 +225,7 @@ func (s *Service) Delete(ctx context.Context, r *ptypes.Empty) (*shimapi.DeleteR
 		return nil, err
 	}
 	if err := p.Delete(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.mu.Lock()
 	delete(s.processes, s.id)
@@ -246,7 +248,7 @@ func (s *Service) DeleteProcess(ctx context.Context, r *shimapi.DeleteProcessReq
 		return nil, err
 	}
 	if err := p.Delete(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.mu.Lock()
 	delete(s.processes, r.ID)
@@ -264,13 +266,13 @@ func (s *Service) Exec(ctx context.Context, r *shimapi.ExecProcessRequest) (*pty
 
 	if p := s.processes[r.ID]; p != nil {
 		s.mu.Unlock()
-		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ID)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ID)
 	}
 
 	p := s.processes[s.id]
 	s.mu.Unlock()
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 
 	process, err := p.(*process.Init).Exec(ctx, s.config.Path, &process.ExecConfig{
@@ -282,7 +284,7 @@ func (s *Service) Exec(ctx context.Context, r *shimapi.ExecProcessRequest) (*pty
 		Spec:     r.Spec,
 	})
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.mu.Lock()
 	s.processes[r.ID] = process
@@ -293,7 +295,7 @@ func (s *Service) Exec(ctx context.Context, r *shimapi.ExecProcessRequest) (*pty
 // ResizePty of a process
 func (s *Service) ResizePty(ctx context.Context, r *shimapi.ResizePtyRequest) (*ptypes.Empty, error) {
 	if r.ID == "" {
-		return nil, errdefs.ToGRPCf(errdefs.ErrInvalidArgument, "id not provided")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrInvalidArgument, "id not provided")
 	}
 	ws := console.WinSize{
 		Width:  uint16(r.Width),
@@ -306,7 +308,7 @@ func (s *Service) ResizePty(ctx context.Context, r *shimapi.ResizePtyRequest) (*
 		return nil, fmt.Errorf("process does not exist %s", r.ID)
 	}
 	if err := p.Resize(ws); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -381,7 +383,7 @@ func (s *Service) Kill(ctx context.Context, r *shimapi.KillRequest) (*ptypes.Emp
 			return nil, err
 		}
 		if err := p.Kill(ctx, r.Signal, r.All); err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, errgrpc.ToGRPC(err)
 		}
 		return empty, nil
 	}
@@ -391,7 +393,7 @@ func (s *Service) Kill(ctx context.Context, r *shimapi.KillRequest) (*ptypes.Emp
 		return nil, err
 	}
 	if err := p.Kill(ctx, r.Signal, r.All); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -400,7 +402,7 @@ func (s *Service) Kill(ctx context.Context, r *shimapi.KillRequest) (*ptypes.Emp
 func (s *Service) ListPids(ctx context.Context, r *shimapi.ListPidsRequest) (*shimapi.ListPidsResponse, error) {
 	pids, err := s.getContainerPids(ctx, r.ID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	var processes []*task.ProcessInfo
 
@@ -468,7 +470,7 @@ func (s *Service) Checkpoint(ctx context.Context, r *shimapi.CheckpointTaskReque
 		EmptyNamespaces:          options.EmptyNamespaces,
 		WorkDir:                  options.WorkPath,
 	}); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -487,7 +489,7 @@ func (s *Service) Update(ctx context.Context, r *shimapi.UpdateTaskRequest) (*pt
 		return nil, err
 	}
 	if err := p.(*process.Init).Update(ctx, r.Resources); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -599,7 +601,7 @@ func (s *Service) getInitProcess() (process.Process, error) {
 
 	p := s.processes[s.id]
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 	return p, nil
 }
@@ -611,7 +613,7 @@ func (s *Service) getExecProcess(id string) (process.Process, error) {
 
 	p := s.processes[id]
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", id)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", id)
 	}
 	return p, nil
 }

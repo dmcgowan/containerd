@@ -20,17 +20,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/typeurl/v2"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"google.golang.org/grpc"
+
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/services"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/typeurl/v2"
-	"github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"google.golang.org/grpc"
 )
 
 type config struct {
@@ -119,7 +121,7 @@ func (l *local) Apply(ctx context.Context, er *diffapi.ApplyRequest, _ ...grpc.C
 	}
 
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &diffapi.ApplyResponse{
@@ -158,7 +160,7 @@ func (l *local) Diff(ctx context.Context, dr *diffapi.DiffRequest, _ ...grpc.Cal
 		}
 	}
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &diffapi.DiffResponse{

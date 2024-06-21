@@ -20,15 +20,16 @@ import (
 	"errors"
 	"io"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
+	"google.golang.org/grpc"
+
 	api "github.com/containerd/containerd/api/services/streaming/v1"
 	"github.com/containerd/containerd/pkg/streaming"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/protobuf"
 	ptypes "github.com/containerd/containerd/protobuf/types"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/containerd/typeurl/v2"
-	"google.golang.org/grpc"
 )
 
 func init() {
@@ -106,9 +107,9 @@ type serviceStream struct {
 }
 
 func (ss *serviceStream) Send(a typeurl.Any) (err error) {
-	err = errdefs.FromGRPC(ss.s.Send(protobuf.FromAny(a)))
+	err = errgrpc.ToNative(ss.s.Send(protobuf.FromAny(a)))
 	if !errors.Is(err, io.EOF) {
-		err = errdefs.FromGRPC(err)
+		err = errgrpc.ToNative(err)
 	}
 	return
 }
@@ -116,7 +117,7 @@ func (ss *serviceStream) Send(a typeurl.Any) (err error) {
 func (ss *serviceStream) Recv() (a typeurl.Any, err error) {
 	a, err = ss.s.Recv()
 	if !errors.Is(err, io.EOF) {
-		err = errdefs.FromGRPC(err)
+		err = errgrpc.ToNative(err)
 	}
 	return
 }

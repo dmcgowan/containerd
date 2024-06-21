@@ -22,14 +22,15 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/log"
+
 	eventtypes "github.com/containerd/containerd/api/events"
 	api "github.com/containerd/containerd/api/services/sandbox/v1"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/protobuf"
 	"github.com/containerd/containerd/sandbox"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
 )
 
 func init() {
@@ -77,13 +78,13 @@ func (s *controllerService) Create(ctx context.Context, req *api.ControllerCreat
 	// TODO: Rootfs
 	err := s.local.Create(ctx, req.GetSandboxID(), sandbox.WithOptions(req.GetOptions()))
 	if err != nil {
-		return &api.ControllerCreateResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerCreateResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	if err := s.publisher.Publish(ctx, "sandboxes/create", &eventtypes.SandboxCreate{
 		SandboxID: req.GetSandboxID(),
 	}); err != nil {
-		return &api.ControllerCreateResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerCreateResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	return &api.ControllerCreateResponse{
@@ -95,13 +96,13 @@ func (s *controllerService) Start(ctx context.Context, req *api.ControllerStartR
 	log.G(ctx).WithField("req", req).Debug("start sandbox")
 	inst, err := s.local.Start(ctx, req.GetSandboxID())
 	if err != nil {
-		return &api.ControllerStartResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerStartResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	if err := s.publisher.Publish(ctx, "sandboxes/start", &eventtypes.SandboxStart{
 		SandboxID: req.GetSandboxID(),
 	}); err != nil {
-		return &api.ControllerStartResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerStartResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	return &api.ControllerStartResponse{
@@ -114,14 +115,14 @@ func (s *controllerService) Start(ctx context.Context, req *api.ControllerStartR
 
 func (s *controllerService) Stop(ctx context.Context, req *api.ControllerStopRequest) (*api.ControllerStopResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("delete sandbox")
-	return &api.ControllerStopResponse{}, errdefs.ToGRPC(s.local.Stop(ctx, req.GetSandboxID()))
+	return &api.ControllerStopResponse{}, errgrpc.ToGRPC(s.local.Stop(ctx, req.GetSandboxID()))
 }
 
 func (s *controllerService) Wait(ctx context.Context, req *api.ControllerWaitRequest) (*api.ControllerWaitResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("wait sandbox")
 	exitStatus, err := s.local.Wait(ctx, req.GetSandboxID())
 	if err != nil {
-		return &api.ControllerWaitResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerWaitResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	if err := s.publisher.Publish(ctx, "sandboxes/exit", &eventtypes.SandboxExit{
@@ -129,7 +130,7 @@ func (s *controllerService) Wait(ctx context.Context, req *api.ControllerWaitReq
 		ExitStatus: exitStatus.ExitStatus,
 		ExitedAt:   protobuf.ToTimestamp(exitStatus.ExitedAt),
 	}); err != nil {
-		return &api.ControllerWaitResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerWaitResponse{}, errgrpc.ToGRPC(err)
 	}
 
 	return &api.ControllerWaitResponse{
@@ -142,7 +143,7 @@ func (s *controllerService) Status(ctx context.Context, req *api.ControllerStatu
 	log.G(ctx).WithField("req", req).Debug("sandbox status")
 	cstatus, err := s.local.Status(ctx, req.GetSandboxID(), req.GetVerbose())
 	if err != nil {
-		return &api.ControllerStatusResponse{}, errdefs.ToGRPC(err)
+		return &api.ControllerStatusResponse{}, errgrpc.ToGRPC(err)
 	}
 	extra := &anypb.Any{}
 	if cstatus.Extra != nil {
@@ -164,5 +165,5 @@ func (s *controllerService) Status(ctx context.Context, req *api.ControllerStatu
 
 func (s *controllerService) Shutdown(ctx context.Context, req *api.ControllerShutdownRequest) (*api.ControllerShutdownResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("shutdown sandbox")
-	return &api.ControllerShutdownResponse{}, errdefs.ToGRPC(s.local.Shutdown(ctx, req.GetSandboxID()))
+	return &api.ControllerShutdownResponse{}, errgrpc.ToGRPC(s.local.Shutdown(ctx, req.GetSandboxID()))
 }

@@ -26,6 +26,11 @@ import (
 	"sync"
 
 	cgroups "github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/log"
+	"github.com/containerd/ttrpc"
+
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/identifiers"
@@ -34,9 +39,6 @@ import (
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/containerd/runtime/v1/shim/client"
 	"github.com/containerd/containerd/runtime/v1/shim/v1"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/containerd/ttrpc"
 )
 
 // Task on a linux based system
@@ -94,7 +96,7 @@ func (t *Task) PID(_ context.Context) (uint32, error) {
 func (t *Task) Delete(ctx context.Context) (*runtime.Exit, error) {
 	rsp, shimErr := t.shim.Delete(ctx, empty)
 	if shimErr != nil {
-		shimErr = errdefs.FromGRPC(shimErr)
+		shimErr = errgrpc.ToNative(shimErr)
 		if !errdefs.IsNotFound(shimErr) &&
 			// NOTE: The last Detete call has deleted the init process
 			// record in shim service. However, the last call took
@@ -138,7 +140,7 @@ func (t *Task) Start(ctx context.Context) error {
 		ID: t.id,
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	t.pid = int(r.Pid)
 	if !hasCgroup {
@@ -168,7 +170,7 @@ func (t *Task) State(ctx context.Context) (runtime.State, error) {
 	})
 	if err != nil {
 		if !errors.Is(err, ttrpc.ErrClosed) {
-			return runtime.State{}, errdefs.FromGRPC(err)
+			return runtime.State{}, errgrpc.ToNative(err)
 		}
 		return runtime.State{}, errdefs.ErrNotFound
 	}
@@ -187,7 +189,7 @@ func (t *Task) State(ctx context.Context) (runtime.State, error) {
 // Pause the task and all processes
 func (t *Task) Pause(ctx context.Context) error {
 	if _, err := t.shim.Pause(ctx, empty); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	t.events.Publish(ctx, runtime.TaskPausedEventTopic, &eventstypes.TaskPaused{
 		ContainerID: t.id,
@@ -198,7 +200,7 @@ func (t *Task) Pause(ctx context.Context) error {
 // Resume the task and all processes
 func (t *Task) Resume(ctx context.Context) error {
 	if _, err := t.shim.Resume(ctx, empty); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	t.events.Publish(ctx, runtime.TaskResumedEventTopic, &eventstypes.TaskResumed{
 		ContainerID: t.id,
@@ -215,7 +217,7 @@ func (t *Task) Kill(ctx context.Context, signal uint32, all bool) error {
 		Signal: signal,
 		All:    all,
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -234,7 +236,7 @@ func (t *Task) Exec(ctx context.Context, id string, opts runtime.ExecOpts) (runt
 		Spec:     opts.Spec,
 	}
 	if _, err := t.shim.Exec(ctx, request); err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return &Process{
 		id: id,
@@ -248,7 +250,7 @@ func (t *Task) Pids(ctx context.Context) ([]runtime.ProcessInfo, error) {
 		ID: t.id,
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	var processList []runtime.ProcessInfo
 	for _, p := range resp.Processes {
@@ -268,7 +270,7 @@ func (t *Task) ResizePty(ctx context.Context, size runtime.ConsoleSize) error {
 		Height: size.Height,
 	})
 	if err != nil {
-		err = errdefs.FromGRPC(err)
+		err = errgrpc.ToNative(err)
 	}
 	return err
 }
@@ -280,7 +282,7 @@ func (t *Task) CloseIO(ctx context.Context) error {
 		Stdin: true,
 	})
 	if err != nil {
-		err = errdefs.FromGRPC(err)
+		err = errgrpc.ToNative(err)
 	}
 	return err
 }
@@ -292,7 +294,7 @@ func (t *Task) Checkpoint(ctx context.Context, path string, options *types.Any) 
 		Options: options,
 	}
 	if _, err := t.shim.Checkpoint(ctx, r); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	t.events.Publish(ctx, runtime.TaskCheckpointedEventTopic, &eventstypes.TaskCheckpointed{
 		ContainerID: t.id,
@@ -305,7 +307,7 @@ func (t *Task) Update(ctx context.Context, resources *types.Any, _ map[string]st
 	if _, err := t.shim.Update(ctx, &shim.UpdateTaskRequest{
 		Resources: resources,
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }

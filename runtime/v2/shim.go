@@ -28,11 +28,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs/errgrpc"
 	"github.com/containerd/ttrpc"
 	"github.com/hashicorp/go-multierror"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/runtime/task/v2"
@@ -45,8 +49,6 @@ import (
 	ptypes "github.com/containerd/containerd/protobuf/types"
 	"github.com/containerd/containerd/runtime"
 	client "github.com/containerd/containerd/runtime/v2/shim"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
 )
 
 const (
@@ -431,7 +433,7 @@ func (s *shimTask) Shutdown(ctx context.Context) error {
 		ID: s.ID(),
 	})
 	if err != nil && !errors.Is(err, ttrpc.ErrClosed) {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -448,7 +450,7 @@ func (s *shimTask) PID(ctx context.Context) (uint32, error) {
 		ID: s.ID(),
 	})
 	if err != nil {
-		return 0, errdefs.FromGRPC(err)
+		return 0, errgrpc.ToNative(err)
 	}
 
 	return response.TaskPid, nil
@@ -461,7 +463,7 @@ func (s *shimTask) delete(ctx context.Context, sandboxed bool, removeTask func(c
 	if shimErr != nil {
 		log.G(ctx).WithField("id", s.ID()).WithError(shimErr).Debug("failed to delete task")
 		if !errors.Is(shimErr, ttrpc.ErrClosed) {
-			shimErr = errdefs.FromGRPC(shimErr)
+			shimErr = errgrpc.ToNative(shimErr)
 			if !errdefs.IsNotFound(shimErr) {
 				return nil, shimErr
 			}
@@ -545,7 +547,7 @@ func (s *shimTask) Create(ctx context.Context, opts runtime.CreateOpts) (runtime
 
 	_, err := s.task.Create(ctx, request)
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 
 	return s, nil
@@ -555,7 +557,7 @@ func (s *shimTask) Pause(ctx context.Context) error {
 	if _, err := s.task.Pause(ctx, &task.PauseRequest{
 		ID: s.ID(),
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -564,7 +566,7 @@ func (s *shimTask) Resume(ctx context.Context) error {
 	if _, err := s.task.Resume(ctx, &task.ResumeRequest{
 		ID: s.ID(),
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -574,7 +576,7 @@ func (s *shimTask) Start(ctx context.Context) error {
 		ID: s.ID(),
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -585,7 +587,7 @@ func (s *shimTask) Kill(ctx context.Context, signal uint32, all bool) error {
 		Signal: signal,
 		All:    all,
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -604,7 +606,7 @@ func (s *shimTask) Exec(ctx context.Context, id string, opts runtime.ExecOpts) (
 		Spec:     opts.Spec,
 	}
 	if _, err := s.task.Exec(ctx, request); err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return &process{
 		id:   id,
@@ -617,7 +619,7 @@ func (s *shimTask) Pids(ctx context.Context) ([]runtime.ProcessInfo, error) {
 		ID: s.ID(),
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	var processList []runtime.ProcessInfo
 	for _, p := range resp.Processes {
@@ -636,7 +638,7 @@ func (s *shimTask) ResizePty(ctx context.Context, size runtime.ConsoleSize) erro
 		Height: size.Height,
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -647,7 +649,7 @@ func (s *shimTask) CloseIO(ctx context.Context) error {
 		Stdin: true,
 	})
 	if err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -661,7 +663,7 @@ func (s *shimTask) Wait(ctx context.Context) (*runtime.Exit, error) {
 		ID: s.ID(),
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return &runtime.Exit{
 		Pid:       taskPid,
@@ -677,7 +679,7 @@ func (s *shimTask) Checkpoint(ctx context.Context, path string, options *ptypes.
 		Options: options,
 	}
 	if _, err := s.task.Checkpoint(ctx, request); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -688,7 +690,7 @@ func (s *shimTask) Update(ctx context.Context, resources *ptypes.Any, annotation
 		Resources:   resources,
 		Annotations: annotations,
 	}); err != nil {
-		return errdefs.FromGRPC(err)
+		return errgrpc.ToNative(err)
 	}
 	return nil
 }
@@ -698,7 +700,7 @@ func (s *shimTask) Stats(ctx context.Context) (*ptypes.Any, error) {
 		ID: s.ID(),
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return response.Stats, nil
 }
@@ -720,7 +722,7 @@ func (s *shimTask) State(ctx context.Context) (runtime.State, error) {
 	})
 	if err != nil {
 		if !errors.Is(err, ttrpc.ErrClosed) {
-			return runtime.State{}, errdefs.FromGRPC(err)
+			return runtime.State{}, errgrpc.ToNative(err)
 		}
 		return runtime.State{}, errdefs.ErrNotFound
 	}

@@ -19,12 +19,13 @@ package events
 import (
 	"context"
 
+	"github.com/containerd/errdefs/errgrpc"
+
 	api "github.com/containerd/containerd/api/services/ttrpc/events/v1"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/protobuf"
 	ptypes "github.com/containerd/containerd/protobuf/types"
-	"github.com/containerd/errdefs"
 )
 
 type ttrpcService struct {
@@ -33,7 +34,7 @@ type ttrpcService struct {
 
 func (s *ttrpcService) Forward(ctx context.Context, r *api.ForwardRequest) (*ptypes.Empty, error) {
 	if err := s.events.Forward(ctx, fromTProto(r.Envelope)); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &ptypes.Empty{}, nil

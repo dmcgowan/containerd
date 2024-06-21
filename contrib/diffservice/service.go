@@ -19,14 +19,16 @@ package diffservice
 import (
 	"context"
 
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/containerd/typeurl/v2"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/diff"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/typeurl/v2"
-	"github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type service struct {
@@ -43,7 +45,7 @@ func FromApplierAndComparer(a diff.Applier, c diff.Comparer) diffapi.DiffServer 
 }
 func (s *service) Apply(ctx context.Context, er *diffapi.ApplyRequest) (*diffapi.ApplyResponse, error) {
 	if s.applier == nil {
-		return nil, errdefs.ToGRPC(errdefs.ErrNotImplemented)
+		return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
 	}
 
 	var (
@@ -65,7 +67,7 @@ func (s *service) Apply(ctx context.Context, er *diffapi.ApplyRequest) (*diffapi
 
 	ocidesc, err = s.applier.Apply(ctx, desc, mounts, opts...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &diffapi.ApplyResponse{
@@ -75,7 +77,7 @@ func (s *service) Apply(ctx context.Context, er *diffapi.ApplyRequest) (*diffapi
 
 func (s *service) Diff(ctx context.Context, dr *diffapi.DiffRequest) (*diffapi.DiffResponse, error) {
 	if s.comparer == nil {
-		return nil, errdefs.ToGRPC(errdefs.ErrNotImplemented)
+		return nil, errgrpc.ToGRPC(errdefs.ErrNotImplemented)
 	}
 	var (
 		ocidesc ocispec.Descriptor
@@ -101,7 +103,7 @@ func (s *service) Diff(ctx context.Context, dr *diffapi.DiffRequest) (*diffapi.D
 
 	ocidesc, err = s.comparer.Compare(ctx, aMounts, bMounts, opts...)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	return &diffapi.DiffResponse{

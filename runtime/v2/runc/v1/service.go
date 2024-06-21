@@ -31,6 +31,13 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups/v3/cgroup1"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	runcC "github.com/containerd/go-runc"
+	"github.com/containerd/typeurl/v2"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+
 	eventstypes "github.com/containerd/containerd/api/events"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/containerd/api/types/task"
@@ -48,11 +55,6 @@ import (
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	"github.com/containerd/containerd/sys/reaper"
-	"github.com/containerd/errdefs"
-	runcC "github.com/containerd/go-runc"
-	"github.com/containerd/typeurl/v2"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -313,7 +315,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 	p, err := container.Start(ctx, r)
 	if err != nil {
 		s.eventSendMu.Unlock()
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	switch r.ExecID {
 	case "":
@@ -349,7 +351,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 	}
 	p, err := container.Delete(ctx, r)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	// if we deleted our init task, close the platform and send the task delete event
 	if r.ExecID == "" {
@@ -378,12 +380,12 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 	}
 	ok, cancel := container.ReserveProcess(r.ExecID)
 	if !ok {
-		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
 	}
 	process, err := container.Exec(ctx, r)
 	if err != nil {
 		cancel()
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	s.send(&eventstypes.TaskExecAdded{
@@ -400,7 +402,7 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 		return nil, err
 	}
 	if err := container.ResizePty(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -450,7 +452,7 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.E
 		return nil, err
 	}
 	if err := container.Pause(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskPaused{
 		ContainerID: container.ID,
@@ -465,7 +467,7 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 		return nil, err
 	}
 	if err := container.Resume(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskResumed{
 		ContainerID: container.ID,
@@ -480,7 +482,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 		return nil, err
 	}
 	if err := container.Kill(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -493,7 +495,7 @@ func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.Pi
 	}
 	pids, err := s.getContainerPids(ctx, r.ID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	var processes []*task.ProcessInfo
 	for _, pid := range pids {
@@ -539,7 +541,7 @@ func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskReque
 		return nil, err
 	}
 	if err := container.Checkpoint(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -551,7 +553,7 @@ func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*pt
 		return nil, err
 	}
 	if err := container.Update(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -564,7 +566,7 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 	}
 	p, err := container.Process(r.ExecID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	p.Wait()
 
@@ -601,14 +603,14 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 	}
 	cgx := container.Cgroup()
 	if cgx == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
 	}
 	cg, ok := cgx.(cgroup1.Cgroup)
 	if !ok {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotImplemented, "cgroup v2 not implemented for Stats")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotImplemented, "cgroup v2 not implemented for Stats")
 	}
 	if cg == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
 	}
 	stats, err := cg.Stat(cgroup1.IgnoreNotExist)
 	if err != nil {
@@ -672,7 +674,7 @@ func (s *service) checkProcesses(e runcC.Exit) {
 func (s *service) getContainerPids(ctx context.Context, id string) ([]uint32, error) {
 	p, err := s.container.Process("")
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	ps, err := p.(*process.Init).Runtime().Ps(ctx, id)
 	if err != nil {
@@ -704,7 +706,7 @@ func (s *service) getContainer() (*runc.Container, error) {
 	container := s.container
 	s.mu.Unlock()
 	if container == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "container not created")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "container not created")
 	}
 	return container, nil
 }
@@ -716,7 +718,7 @@ func (s *service) getProcess(execID string) (process.Process, error) {
 	}
 	p, err := container.Process(execID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return p, nil
 }

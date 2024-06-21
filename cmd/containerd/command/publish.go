@@ -24,16 +24,18 @@ import (
 	"os"
 	"time"
 
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/errgrpc"
+	"github.com/urfave/cli"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials/insecure"
+
 	eventsapi "github.com/containerd/containerd/api/services/events/v1"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/pkg/dialer"
 	"github.com/containerd/containerd/protobuf/proto"
 	"github.com/containerd/containerd/protobuf/types"
-	"github.com/containerd/errdefs"
-	"github.com/urfave/cli"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/backoff"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 var publishCommand = cli.Command{
@@ -67,7 +69,7 @@ var publishCommand = cli.Command{
 			Topic: topic,
 			Event: payload,
 		}); err != nil {
-			return errdefs.FromGRPC(err)
+			return errgrpc.ToNative(err)
 		}
 		return nil
 	},
