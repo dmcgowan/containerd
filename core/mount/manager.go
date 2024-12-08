@@ -54,15 +54,25 @@ type ActivateOptions struct {
 	// Labels are the labels to use for the activation
 	Labels map[string]string
 
-	// TempMount specifies that the mount will be used temporarily
+	// Temporary specifies that the mount will be used temporarily
 	// and all mounts should be performed
-	TempMount bool
+	Temporary bool
 
 	// Final target with option to perform all mounts, normally the runtime will perform the root filesystem mount
 	// Custom temp directory for temporary mounts (for example devices mounted and used as overlay lowers)
 }
 
 type ActivateOpt func(*ActivateOptions)
+
+func WithTemporary(o *ActivateOptions) {
+	o.Temporary = true
+}
+
+func WithLabels(labels map[string]string) ActivateOpt {
+	return func(o *ActivateOptions) {
+		o.Labels = labels
+	}
+}
 
 // ActiveMount represents a mount which has been mounted by a
 // MountHandler or directly mounted by a mount manager.
