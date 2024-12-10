@@ -32,6 +32,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/metadata/boltutil"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/pkg/gc"
@@ -274,7 +275,7 @@ func (m *DB) Update(fn func(*bolt.Tx) error) error {
 // Publisher returns an event publisher if one is configured
 // and the current context is not inside a transaction.
 func (m *DB) Publisher(ctx context.Context) events.Publisher {
-	_, ok := ctx.Value(transactionKey{}).(*bolt.Tx)
+	_, ok := boltutil.Transaction(ctx)
 	if ok {
 		// Do no publish events within a transaction
 		return nil
@@ -466,10 +467,10 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 		m.dirtyCS = false
 	}
 
+	c.finish(ctx, &wg)
+
 	stats.MetaD = time.Since(t1)
 	m.wlock.Unlock()
-
-	c.finish(ctx)
 
 	wg.Wait()
 
