@@ -17,10 +17,12 @@
 package proxy
 
 import (
+	"time"
+
 	"github.com/containerd/containerd/api/types"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/pkg/protobuf"
 )
 
 func ActivationInfoToProto(a mount.ActivationInfo) *types.ActivationInfo {
@@ -28,6 +30,19 @@ func ActivationInfoToProto(a mount.ActivationInfo) *types.ActivationInfo {
 		Name:   a.Name,
 		Active: ActiveMountToProto(a.Active),
 		System: mount.ToProto(a.System),
+		Labels: a.Labels,
+	}
+
+}
+
+func ActivationInfoFromProto(a *types.ActivationInfo) mount.ActivationInfo {
+	if a == nil {
+		return mount.ActivationInfo{}
+	}
+	return mount.ActivationInfo{
+		Name:   a.Name,
+		Active: ActiveMountFromProto(a.Active),
+		System: mount.FromProto(a.System),
 		Labels: a.Labels,
 	}
 
@@ -43,10 +58,43 @@ func ActiveMountToProto(a []mount.ActiveMount) []*types.ActiveMount {
 				Target:  m.Target,
 				Options: m.Options,
 			},
-			MountedAt:  protobuf.ToTimestamp(*m.MountedAt),
+			MountedAt:  toTimestamp(m.MountedAt),
 			MountPoint: m.MountPoint,
 			Data:       m.MountData,
 		}
 	}
 	return c
+}
+
+func ActiveMountFromProto(a []*types.ActiveMount) []mount.ActiveMount {
+	c := make([]mount.ActiveMount, len(a))
+	for i, m := range a {
+		c[i] = mount.ActiveMount{
+			Mount: mount.Mount{
+				Type:    m.Mount.Type,
+				Source:  m.Mount.Source,
+				Target:  m.Mount.Target,
+				Options: m.Mount.Options,
+			},
+			MountedAt:  fromTimestamp(m.MountedAt),
+			MountPoint: m.MountPoint,
+			MountData:  m.Data,
+		}
+	}
+	return c
+}
+
+func toTimestamp(from *time.Time) *timestamppb.Timestamp {
+	if from == nil {
+		return nil
+	}
+	return timestamppb.New(*from)
+}
+
+func fromTimestamp(from *timestamppb.Timestamp) *time.Time {
+	if from == nil {
+		return nil
+	}
+	t := from.AsTime()
+	return &t
 }
