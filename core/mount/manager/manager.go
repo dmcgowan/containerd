@@ -111,9 +111,12 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 			}
 
 			mountConv[i] = mv
-		} else if mm.handlers != nil {
-			handler, ok := mm.handlers[mounts[i].Type]
-			if ok {
+		} else {
+			var handler mount.MountHandler
+			if mm.handlers != nil {
+				handler = mm.handlers[mounts[i].Type]
+			}
+			if handler != nil || config.Temporary {
 				if handlers == nil {
 					handlers = make([]mount.MountHandler, len(mounts))
 				}
@@ -320,6 +323,15 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 			}
 			mounts[firstSystemMount] = newM
 		}
+	}
+	// If no system mounts, add a bind mount if temporary
+	// TODO: Add config for weather to add the bind mount?
+	if config.Temporary && firstSystemMount > 0 {
+		mounts = append(mounts, mount.Mount{
+			Type:   "bind",
+			Source: mounted[firstSystemMount-1].MountPoint,
+			// TODO : Configurable bind mount options?
+		})
 	}
 
 	info.Name = name
