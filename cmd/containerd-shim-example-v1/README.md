@@ -3,7 +3,6 @@
 This is a simple example of how to create a shim, it will not run any process but
 show where to add your process code.
 
-
 ## How to run
 
 To try this on MacOS
@@ -19,3 +18,7 @@ You can look at the containerd logs to see the shim output.
 tab after `make binaries` if you have not already done so.
 
  > **_NOTE:_** currently this requires some manual cleanup of the shim process and container
+
+## How to add your functionality
+
+Implement the task functions under `task/service.go`
