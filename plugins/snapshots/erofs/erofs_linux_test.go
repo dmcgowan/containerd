@@ -18,6 +18,7 @@ package erofs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +32,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/testutil"
 )
 
-func newSnapshotter(t *testing.T) func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
+func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
 	_, err := exec.LookPath("mkfs.erofs")
 	if err != nil {
 		t.Skipf("could not find mkfs.erofs: %v", err)
@@ -41,8 +42,6 @@ func newSnapshotter(t *testing.T) func(ctx context.Context, root string) (snapsh
 		t.Skip("check for erofs kernel support failed, skipping test")
 	}
 	return func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
-		var opts []Opt
-
 		snapshotter, err := NewSnapshotter(root, opts...)
 		if err != nil {
 			return nil, nil, err
@@ -52,9 +51,86 @@ func newSnapshotter(t *testing.T) func(ctx context.Context, root string) (snapsh
 	}
 }
 
+func setupSnapshotter(t *testing.T) []Opt {
+	mkfs, err := exec.LookPath("mkfs.ext4")
+	if err != nil {
+		t.Skipf("Could not find mkfs.ext4: %v", err)
+	}
+
+	loopbackSize := int64(24 << 20) // 8 MB
+	if os.Getpagesize() > 4096 {
+		loopbackSize = int64(16 << 20) // 16 MB
+	}
+
+	scratch := filepath.Join(t.TempDir(), "scratch")
+	scratchDevFile, err := os.OpenFile(scratch, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatalf("failed to create %s: %v", scratch, err)
+	}
+
+	if err := scratchDevFile.Truncate(loopbackSize); err != nil {
+		scratchDevFile.Close()
+		t.Fatalf("failed to resize %s file: %v", scratch, err)
+	}
+
+	if err := scratchDevFile.Sync(); err != nil {
+		scratchDevFile.Close()
+		t.Fatalf("failed to sync %s file: %v", scratch, err)
+	}
+	scratchDevFile.Close()
+
+	if out, err := exec.Command(mkfs, scratch).CombinedOutput(); err != nil {
+		t.Fatalf("failed to make ext4 filesystem (out: %q): %v", out, err)
+	}
+
+	if err := testMount(t, scratch); err != nil {
+		t.Fatal(err)
+	}
+
+	return []Opt{
+		WithScratchFile(scratch, "ext4"),
+	}
+}
+
+func testMount(t *testing.T, scratchFile string) error {
+	root, err := os.MkdirTemp(t.TempDir(), "")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+
+	m := []mount.Mount{
+		{
+			Type:    "ext4",
+			Source:  scratchFile,
+			Options: []string{"loop", "direct-io", "sync"},
+		},
+	}
+
+	if err := mount.All(m, root); err != nil {
+		return fmt.Errorf("failed to mount device %s: %w", scratchFile, err)
+	}
+
+	if err := os.Remove(filepath.Join(root, "lost+found")); err != nil {
+		return err
+	}
+	if err := os.Mkdir(filepath.Join(root, "work"), 0755); err != nil {
+		return err
+	}
+	if err := os.Mkdir(filepath.Join(root, "upper"), 0755); err != nil {
+		return err
+	}
+	return mount.UnmountAll(root, 0)
+}
+
 func TestErofs(t *testing.T) {
 	testutil.RequiresRoot(t)
 	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t))
+}
+
+func TestErofsWithQuota(t *testing.T) {
+	testutil.RequiresRoot(t)
+	testsuite.SnapshotterSuite(t, "erofs", newSnapshotter(t, setupSnapshotter(t)...))
 }
 
 func TestErofsFsverity(t *testing.T) {

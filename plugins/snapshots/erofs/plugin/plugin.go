@@ -41,6 +41,12 @@ type Config struct {
 
 	// If `SetImmutable` is enabled, IMMUTABLE_FL will be set on layer blobs.
 	SetImmutable bool `toml:"set_immutable"`
+
+	// ScratchFile is the scratch block file to use as an empty block
+	ScratchFile string `toml:"scratch_file"`
+
+	// FSType is the filesystem type for the mount
+	FSType string `toml:"fs_type"`
 }
 
 func init() {
@@ -72,6 +78,10 @@ func init() {
 
 			if config.SetImmutable {
 				opts = append(opts, erofs.WithImmutable())
+			}
+
+			if config.ScratchFile != "" {
+				opts = append(opts, erofs.WithScratchFile(config.ScratchFile, config.FSType))
 			}
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
