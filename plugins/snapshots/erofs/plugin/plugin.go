@@ -41,6 +41,15 @@ type Config struct {
 
 	// If `SetImmutable` is enabled, IMMUTABLE_FL will be set on layer blobs.
 	SetImmutable bool `toml:"set_immutable"`
+
+	// DefaultSizeMB is the default size of a writable layer in MB
+	DefaultSizeMB int64 `toml:"default_size_mb"`
+
+	// ScratchFile is the scratch block file to use as an empty block
+	ScratchFile string `toml:"scratch_file"`
+
+	// FSType is the filesystem type for the mount
+	FSType string `toml:"fs_type"`
 }
 
 func init() {
@@ -72,6 +81,14 @@ func init() {
 
 			if config.SetImmutable {
 				opts = append(opts, erofs.WithImmutable())
+			}
+
+			if config.ScratchFile != "" {
+				opts = append(opts, erofs.WithScratchFile(config.ScratchFile, config.FSType))
+			}
+
+			if config.DefaultSizeMB > 0 {
+				opts = append(opts, erofs.WithDefaultSize(config.DefaultSizeMB*1024*1024))
 			}
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
