@@ -28,9 +28,10 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/containerd/containerd/api/types"
+	"github.com/containerd/platforms"
+
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
-	"github.com/containerd/platforms"
 )
 
 const (
@@ -90,8 +91,6 @@ func generateDefaultSpecWithPlatform(ctx context.Context, platform, id string, s
 	switch plat.OS {
 	case "windows":
 		err = populateDefaultWindowsSpec(ctx, s, id)
-	case "darwin":
-		err = populateDefaultDarwinSpec(s)
 	default:
 		err = populateDefaultUnixSpec(ctx, s, id)
 		if err == nil && runtime.GOOS == "windows" {
