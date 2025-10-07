@@ -185,12 +185,7 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 		return td, err
 	}
 	if kind == snapshots.KindActive {
-		if s.blockMode {
-			// TODO: Get size from snapshot labels
-			if err := createWritableImage(ctx, filepath.Join(td, "layer.ext4", ""), s.defaultWritable, ""); err != nil {
-				return td, fmt.Errorf("failed to create writable image: %w", err)
-			}
-		} else {
+		if !s.blockMode {
 			if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
 				return td, err
 			}
@@ -236,11 +231,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 			return []mount.Mount{
 				{
 					Source: s.writablePath(snap.ID),
-					Type:   "ext4",
-					Options: append(options,
+					Type:   "mkfs/ext4",
+					Options: []string{
+						"mkfs.fs=ext4",
+						// TODO: Get size from snapshot labels
+						fmt.Sprintf("mkfs.size_mb=%d", s.defaultWritable),
+						// TODO: Add UUID
 						roFlag,
 						"loop",
-					),
+					},
 				},
 				{
 					Source:  "{{ mount 0 }}/upper",
@@ -274,9 +273,16 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 	if snap.Kind == snapshots.KindActive {
 		if s.blockMode {
 			mounts = append(mounts, mount.Mount{
-				Source:  s.writablePath(snap.ID),
-				Type:    "ext4",
-				Options: []string{"rw", "loop"},
+				Source: s.writablePath(snap.ID),
+				Type:   "mkfs/ext4",
+				Options: []string{
+					"mkfs.fs=ext4",
+					// TODO: Get size from snapshot labels
+					fmt.Sprintf("mkfs.size_mb=%d", s.defaultWritable),
+					// TODO: Add UUID
+					"rw",
+					"loop",
+				},
 			}, mount.Mount{
 				Source:  "{{ mount 0 }}/upper",
 				Type:    "format/mkdir",

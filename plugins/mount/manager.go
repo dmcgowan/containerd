@@ -32,7 +32,6 @@ import (
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/metadata/boltutil"
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/core/mount/handlers"
 	"github.com/containerd/containerd/v2/core/mount/manager"
 	"github.com/containerd/containerd/v2/plugins"
 )
@@ -54,9 +53,9 @@ func init() {
 			if err != nil && !errors.Is(err, plugin.ErrPluginNotFound) {
 				return nil, err
 			}
-			mhandlers := make(map[string]mount.Handler, len(hp))
+			var opts []manager.Opt
 			for k, v := range hp {
-				mhandlers[k] = v.(mount.Handler)
+				opts = append(opts, manager.WithMountHandler(k, v.(mount.Handler)))
 			}
 
 			root := ic.Properties[plugins.PropertyStateDir]
@@ -68,13 +67,17 @@ func init() {
 				return nil, merr
 			}
 
-			if _, ok := mhandlers["mkdir"]; !ok {
-				mkdir, err := handlers.MkdirHandler(targets)
-				if err != nil {
-					return nil, fmt.Errorf("failed to create mkdir handler: %w", err)
-				}
-				mhandlers["mkdir"] = mkdir
-			}
+			// roots are the directories that mount handlers can operate in
+			// TODO: support additional roots from config
+			opts = append(opts, manager.WithAllowedRoot(filepath.Dir(ic.Properties[plugins.PropertyRootDir])))
+
+			//if _, ok := mhandlers["mkdir"]; !ok {
+			//	mkdir, err := handlers.MkdirHandler(roots...)
+			//	if err != nil {
+			//		return nil, fmt.Errorf("failed to create mkdir handler: %w", err)
+			//	}
+			//	mhandlers["mkdir"] = mkdir
+			//}
 
 			metadb := filepath.Join(root, "mounts.db")
 
@@ -83,7 +86,11 @@ func init() {
 				return nil, fmt.Errorf("failed to open database file: %w", err)
 			}
 
-			mm := manager.NewManager(db, targets, mhandlers)
+			mm, err := manager.NewManager(db, targets, opts...)
+			if err != nil {
+				db.Close()
+				return nil, fmt.Errorf("failed to create mount manager: %w", err)
+			}
 
 			//TODO: IF has sync
 			if sync, ok := mm.(interface{ Sync(context.Context) error }); ok {
@@ -92,6 +99,7 @@ func init() {
 				// ensure startup waits until ready to continue
 				tx, err := db.Begin(true)
 				if err != nil {
+					db.Close()
 					return nil, fmt.Errorf("failed to open database for write: %w", err)
 				}
 				ctx := boltutil.WithTransaction(ic.Context, tx)

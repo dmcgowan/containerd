@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package handlers
+package manager
 
 import (
 	"context"
@@ -46,22 +46,25 @@ func TestMkdirHandler(t *testing.T) {
 	}
 	sourcedir := filepath.Join(root, "m")
 
-	mh, err := MkdirHandler(root)
+	r, err := os.OpenRoot(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	m := mount.Mount{
-		Type:   "mkdir",
-		Source: sourcedir,
-		Options: []string{
-			fmt.Sprintf("mode=%o", testmode),
-			fmt.Sprintf("uid=%d", luid),
-			fmt.Sprintf("gid=%d", lgid),
+	mh := mkdir{
+		rootMap: map[string]*os.Root{
+			root: r,
 		},
 	}
 
-	_, err = mh.Mount(ctx, m, "", nil)
+	m := mount.Mount{
+		Type:   "mkdir/overlay",
+		Source: "overlay",
+		Options: []string{
+			fmt.Sprintf("mkdir.path=%s:%o:%d:%d", sourcedir, testmode, luid, lgid),
+		},
+	}
+
+	_, err = mh.Transform(ctx, m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +87,8 @@ func TestMkdirHandler(t *testing.T) {
 		t.Fatalf("expected gid 1000 got %d", sys.Gid)
 	}
 
-	m.Source = filepath.Join(td, "notinroot")
-	_, err = mh.Mount(ctx, m, "", nil)
+	m.Options = append(m.Options, fmt.Sprintf("mkdir.path=%s", filepath.Join(td, "notinroot")))
+	_, err = mh.Transform(ctx, m, nil)
 	if err == nil {
 		t.Fatal("expected error on source not in root")
 	} else if !errdefs.IsNotImplemented(err) {

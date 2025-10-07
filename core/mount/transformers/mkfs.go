@@ -20,19 +20,19 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/containerd/errdefs"
-
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/errdefs"
 )
 
-// MkdirHandler returns a handler which ensures a directory
-// is created with the correct permission and ownership
-func MkdirHandler(roots ...string) (mount.Handler, error) {
+// MkfsHandler returns a handler which formats the given
+// source with the provided filesystem if not created.
+func MkfsHandler(roots ...string) (mount.Handler, error) {
 	var rootMap = map[string]*os.Root{}
 	for _, root := range roots {
 		if !filepath.IsAbs(root) {
@@ -50,12 +50,12 @@ func MkdirHandler(roots ...string) (mount.Handler, error) {
 	}, nil
 }
 
-type mkdirHandler struct {
+type mkfsHandler struct {
 	rootMap map[string]*os.Root
 }
 
-func (h *mkdirHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (mount.ActiveMount, error) {
-	if m.Type != "mkdir" {
+func (h *mkfsHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (mount.ActiveMount, error) {
+	if m.Type != "mkfs" {
 		return mount.ActiveMount{}, errdefs.ErrNotImplemented
 	}
 
@@ -73,14 +73,10 @@ func (h *mkdirHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []
 		return mount.ActiveMount{}, fmt.Errorf("no root %q configured for mkdir: %w", m.Source, errdefs.ErrNotImplemented)
 	}
 
-	// Find root map
-
 	var (
-		luid                 = os.Getuid()
-		lgid                 = os.Getgid()
-		uid, gid             = luid, lgid
-		mode     os.FileMode = 0700
-		err      error
+		format = "ext4"
+		size   int64
+		id     string
 	)
 	// Parse options
 	for _, o := range m.Options {
@@ -90,44 +86,43 @@ func (h *mkdirHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []
 			value = "true"
 		}
 		switch key {
-		case "uid":
-			uid, err = strconv.Atoi(value)
-		case "gid":
-			gid, err = strconv.Atoi(value)
-		case "mode":
-			var p uint64
-			p, err = strconv.ParseUint(value, 8, 32)
-			if err == nil {
-				mode = os.FileMode(p)
-				if mode != mode&os.ModePerm {
-					err = fmt.Errorf("invalid mode %o", p)
-				}
+		case "size_mb":
+			sizemb, err := strconv.Atoi(value)
+			if err != nil {
+				return mount.ActiveMount{}, fmt.Errorf("bad option %s: %w", key, err)
 			}
+			size = int64(sizemb) * 1024 * 1024
+		case "fs":
+			format = value
+		case "uuid":
+			id = value
 		default:
 			return mount.ActiveMount{}, fmt.Errorf("unknown mount option %s: %w", key, errdefs.ErrInvalidArgument)
 		}
-		if err != nil {
-			return mount.ActiveMount{}, fmt.Errorf("bad option %s: %w", key, err)
-		}
+	}
+	switch format {
+	case "ext4":
+		// ok
+	default:
+		return mount.ActiveMount{}, fmt.Errorf("unsupported filesystem %q: %w", format, errdefs.ErrInvalidArgument)
 	}
 
-	if st, err := r.Stat(subpath); err == nil {
-		if st.Mode()&os.ModePerm != mode {
-			// TODO: Chmod support added in go1.25
-			return mount.ActiveMount{}, fmt.Errorf("chmod not supported yet for mkdir handler: %w", errdefs.ErrNotImplemented)
-		}
-		// TODO: check ownership, chown support added in go1.25
+	if _, err := r.Stat(subpath); err == nil {
+		// Check magic number
 	} else if os.IsNotExist(err) {
-		// TODO: MkdirAll added in go1.25
-		if err := r.Mkdir(subpath, mode); err != nil {
-			return mount.ActiveMount{}, fmt.Errorf("failed to create directory %q: %w", m.Source, err)
+		f, err := r.OpenFile(subpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0640)
+		if err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("failed to create file %q: %w", m.Source, err)
 		}
-		if luid != -1 && (luid != uid || lgid != gid) {
-			// TODO: Chown support added in go1.25
-			//if err := r.Chown(subpath, uid, gid); err != nil {
-			//	return fmt.Errorf("failed to chown directory %q: %w", m.Source, err)
-			//}
-			return mount.ActiveMount{}, fmt.Errorf("chown not supported yet for mkdir handler: %w", errdefs.ErrNotImplemented)
+		name := f.Name()
+		err = f.Truncate(size)
+		f.Close()
+		if err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("failed to truncate file %q: %w", m.Source, err)
+		}
+
+		if err := createWritableImage(ctx, name, id); err != nil {
+			return mount.ActiveMount{}, fmt.Errorf("failed format %q: %w", m.Source, err)
 		}
 	} else {
 		return mount.ActiveMount{}, fmt.Errorf("failed to stat %q: %w", m.Source, err)
@@ -141,6 +136,21 @@ func (h *mkdirHandler) Mount(ctx context.Context, m mount.Mount, mp string, _ []
 	}, nil
 }
 
-func (*mkdirHandler) Unmount(ctx context.Context, path string) error {
+func (*mkfsHandler) Unmount(ctx context.Context, path string) error {
+	return nil
+}
+
+func createWritableImage(ctx context.Context, filename string, uuid string) error {
+	args := []string{"-q"}
+	if uuid != "" {
+		args = append(args, []string{"-U", uuid}...)
+	}
+	args = append(args, filename)
+	// TODO: Pre-resolve this and pass it in
+	cmd := exec.CommandContext(ctx, "mkfs.ext4", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", out, err)
+	}
 	return nil
 }
