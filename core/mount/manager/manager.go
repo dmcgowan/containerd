@@ -169,6 +169,11 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 			if tr, ok := prepares[prepare]; ok {
 				log.G(ctx).Warnf("prepare type %q for mount %v", prepare, mounts[i])
 				if shouldPrepare(prepare, mounts[i].Type) {
+					log.G(ctx).WithFields(log.Fields{
+						"prepare": prepare,
+						"i":       i,
+						"allowed": config.AllowMountTypes,
+					}).Debug("setting first system mount")
 					// At least everything before this must be mounted
 					// by the mount manager
 					firstSystemMount = i
@@ -370,6 +375,7 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 				if err != nil {
 					return mount.ActivationInfo{}, err
 				}
+				log.G(ctx).WithField("mount", newM).Debugf("transformed")
 				m = newM
 			}
 		}
@@ -413,6 +419,7 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 			if err != nil {
 				return mount.ActivationInfo{}, err
 			}
+			log.G(ctx).WithField("mount", newM).Debugf("first mount transformed")
 			mounts[firstSystemMount] = newM
 		}
 	}

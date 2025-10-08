@@ -48,7 +48,7 @@ const (
 	// allowedMounts are the custom mount types allowed by the runtime. These
 	// types should not be handled by the mount manager.
 	// To include prepare mount types, use "/*" suffix, such as "format/*"
-	allowedMounts = "containerd.io/runtime-handle-mounts"
+	allowedMounts = "containerd.io/runtime-allow-mounts"
 )
 
 // TaskConfig for the runtime task manager

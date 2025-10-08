@@ -126,7 +126,7 @@ func ConvertErofs(ctx context.Context, layerPath string, srcDir string, mkfsExtr
 func MountsToLayer(mounts []mount.Mount) (string, error) {
 	var layer string
 	switch mnt := mounts[0]; mnt.Type {
-	case "bind", "erofs", "ext4":
+	case "bind", "erofs", "ext4", "mkfs/ext4":
 		layer = filepath.Dir(mnt.Source)
 	case "overlay":
 		var topLower string

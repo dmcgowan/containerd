@@ -94,7 +94,7 @@ func WithLabels(labels map[string]string) ActivateOpt {
 	}
 }
 
-// WithAllowMountTypes indicates the mount types that the peformer
+// WithAllowMountType indicates the mount types that the peformer
 // of the mounts will support. Even if there is a custom handler
 // registered for the mount type to the mount handler, these mounts
 // should not performed unless required to support subsequent mounts.

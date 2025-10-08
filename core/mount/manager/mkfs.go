@@ -25,9 +25,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
+
+	"github.com/containerd/containerd/v2/core/mount"
 )
 
 type mkfs struct {
