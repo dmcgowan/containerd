@@ -242,14 +242,10 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 					},
 				},
 				{
-					Source:  "{{ mount 0 }}/upper",
-					Type:    "format/mkdir",
-					Options: []string{"mode=755"},
-				},
-				{
 					Source: "{{ mount 0 }}/upper",
-					Type:   "format/bind",
+					Type:   "format/mkdir/bind",
 					Options: append(options,
+						"mkdir.path={{ mount 0}}/upper:0755 }}",
 						roFlag,
 						"rbind",
 					),
@@ -283,16 +279,10 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 					"rw",
 					"loop",
 				},
-			}, mount.Mount{
-				Source:  "{{ mount 0 }}/upper",
-				Type:    "format/mkdir",
-				Options: []string{"mode=755"},
-			}, mount.Mount{
-				Source:  "{{ mount 0 }}/work",
-				Type:    "format/mkdir",
-				Options: []string{"mode=755"},
 			})
 			options = append(options,
+				"mkdir.path={{ mount 0 }}/upper:0755",
+				"mkdir.path={{ mount 0 }}/work:0755",
 				"workdir={{ mount 0 }}/work",
 				"upperdir={{ mount 0 }}/upper",
 			)
@@ -339,7 +329,7 @@ func (s *snapshotter) mounts(snap storage.Snapshot, _ snapshots.Info) ([]mount.M
 	options = append(options, s.ovlOptions...)
 
 	return append(mounts, mount.Mount{
-		Type:    "format/overlay",
+		Type:    "format/mkdir/overlay",
 		Source:  "overlay",
 		Options: options,
 	}), nil
