@@ -66,6 +66,8 @@ message BootstrapParams {
   // Each section can contain arbitrary structured data identified by type URL
   // Examples: CRI config, NRI config, sandbox config, etc.
   repeated Extension extensions = 8;
+
+  string socket_dir = 9;
 }
 
 // Extension provides extensibility for new configuration types
