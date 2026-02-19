@@ -1,0 +1,95 @@
+name: Manage Fork PR List
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to perform"
+        required: true
+        type: choice
+        options:
+          - add
+          - remove
+      repo:
+        description: "Owner/repo (e.g. containerd/containerd)"
+        required: true
+        default: "containerd/containerd"
+        type: string
+      pr_number:
+        description: "PR number"
+        required: true
+        type: string
+      title:
+        description: "PR title (optional for add; auto-fetched if omitted)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+  actions: write
+
+jobs:
+  manage-pr-list:
+    name: "${{ inputs.action }} PR"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork
+
+      - name: Validate inputs
+        run: |
+          if ! echo "${{ inputs.pr_number }}" | grep -qE '^[0-9]+$'; then
+            echo "::error::pr_number must be numeric"
+            exit 1
+          fi
+
+      - name: Add PR to list
+        if: inputs.action == 'add'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ inputs.repo }}"
+          PR="${{ inputs.pr_number }}"
+
+          if grep -q "^${REPO} ${PR} " contrib/pr-list; then
+            echo "::error::PR ${REPO}#${PR} already exists in contrib/pr-list"
+            exit 1
+          fi
+
+          TITLE="${{ inputs.title }}"
+          if [ -z "${TITLE}" ]; then
+            TITLE=$(gh pr view "${PR}" --repo "${REPO}" --json title -q .title)
+          fi
+
+          echo "${REPO} ${PR} ${TITLE}" >> contrib/pr-list
+
+      - name: Remove PR from list
+        if: inputs.action == 'remove'
+        run: |
+          REPO="${{ inputs.repo }}"
+          PR="${{ inputs.pr_number }}"
+
+          if ! grep -q "^${REPO} ${PR} " contrib/pr-list; then
+            echo "::error::PR ${REPO}#${PR} not found in contrib/pr-list"
+            exit 1
+          fi
+
+          sed -i "\|^${REPO} ${PR} |d" contrib/pr-list
+
+      - name: Commit and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add contrib/pr-list
+          git commit -m "contrib/pr-list: ${{ inputs.action }} ${{ inputs.repo }}#${{ inputs.pr_number }}"
+          git push origin main-fork
+
+      - name: Trigger merge workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run fork-merge.yml --ref main-fork --repo ${{ github.repository }}
