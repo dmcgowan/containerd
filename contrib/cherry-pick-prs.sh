@@ -65,5 +65,6 @@ cherry_pick_pr containerd/containerd 12667
 cherry_pick_pr containerd/containerd 12785
 cherry_pick_pr containerd/containerd 12865
 cherry_pick_pr dmcgowan/containerd 11 # This needs a PR on containerd/containerd still
+cherry_pick_pr containerd/containerd 12921 # sys, dialer: support AF_UNIX sockets on Windows
 
 
