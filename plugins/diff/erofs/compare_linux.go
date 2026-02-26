@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -35,6 +36,8 @@ import (
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	"github.com/containerd/containerd/v2/internal/ext4reader"
+	"github.com/containerd/containerd/v2/internal/fstar"
 	"github.com/containerd/containerd/v2/pkg/archive"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/epoch"
@@ -122,6 +125,13 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		}
 	}
 
+	// Detect block mode: if the layer has rwlayer.img, the upper is an ext4 block file
+	blockFile := filepath.Join(layer, "rwlayer.img")
+	isBlockMode := false
+	if _, err := os.Stat(blockFile); err == nil {
+		isBlockMode = true
+	}
+
 	upperRoot := filepath.Join(layer, "fs")
 	if compressionType != compression.Uncompressed {
 		dgstr := digest.SHA256.Digester()
@@ -137,7 +147,12 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
 			}
 		}
-		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperRoot)
+		w := io.MultiWriter(compressed, dgstr.Hash())
+		if isBlockMode {
+			errOpen = writeDiffFromBlock(ctx, w, blockFile)
+		} else {
+			errOpen = writeDiff(ctx, w, lower, upperRoot)
+		}
 		compressed.Close()
 		if errOpen != nil {
 			return emptyDesc, fmt.Errorf("failed to write compressed diff: %w", errOpen)
@@ -148,7 +163,11 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		}
 		config.Labels[labels.LabelUncompressed] = dgstr.Digest().String()
 	} else {
-		err := writeDiff(ctx, cw, lower, upperRoot)
+		if isBlockMode {
+			err = writeDiffFromBlock(ctx, cw, blockFile)
+		} else {
+			err = writeDiff(ctx, cw, lower, upperRoot)
+		}
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to create diff tar stream: %w", err)
 		}
@@ -187,6 +206,23 @@ func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts
 		Size:      info.Size,
 		Digest:    info.Digest,
 	}, nil
+}
+
+// writeDiffFromBlock produces an OCI-format tar stream from an ext4
+// block file containing an overlay upper directory.
+func writeDiffFromBlock(ctx context.Context, w io.Writer, blockFile string) error {
+	f, err := os.Open(blockFile)
+	if err != nil {
+		return fmt.Errorf("opening ext4 block file: %w", err)
+	}
+	defer f.Close()
+
+	fsys, err := ext4reader.FS(f)
+	if err != nil {
+		return fmt.Errorf("opening ext4 filesystem: %w", err)
+	}
+
+	return fstar.WriteOverlayTar(ctx, w, fsys, "upper", ext4reader.NewMetadataFunc())
 }
 
 func uniqueRef() string {
