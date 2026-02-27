@@ -67,5 +67,5 @@ cherry_pick_pr containerd/containerd 12865
 cherry_pick_pr dmcgowan/containerd 11 # This needs a PR on containerd/containerd still
 cherry_pick_pr containerd/containerd 12921 # sys, dialer: support AF_UNIX sockets on Windows
 cherry_pick_pr containerd/containerd 12938 # set sparse file attribute on Windows
-
+cherry_pick_pr containerd/containerd 12949 # Add junction support for Windows
 
