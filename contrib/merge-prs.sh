@@ -1,14 +1,24 @@
 #!/bin/bash
 # Merge GitHub PRs into current branch
 #
-# Usage: Edit the invocations below, then run this script
+# Usage: contrib/merge-prs.sh [pr-list-file]
 #
-# merge_pr <owner/repo> <pr_number> [title]
+# Reads a PR list file (default: contrib/pr-list) where each line contains:
+#   <owner/repo> <pr_number> [title]
+#
+# Blank lines and lines starting with # are ignored.
 #
 # Each PR is merged with a --no-ff merge commit for clean history.
 # If any merge has conflicts, the branch is reset to its original state.
 
 set -e
+
+PR_LIST="${1:-contrib/pr-list}"
+
+if [ ! -f "$PR_LIST" ]; then
+    echo "Error: PR list file not found: $PR_LIST"
+    exit 1
+fi
 
 ORIGINAL_HEAD=$(git rev-parse HEAD)
 
@@ -73,22 +83,22 @@ merge_pr() {
 }
 
 echo "Current branch: $(git branch --show-current)"
+echo "PR list: $PR_LIST"
 echo ""
 
-# ============================================================================
-# Edit this section to add/remove PRs to merge
-# ============================================================================
+while IFS= read -r line || [ -n "$line" ]; do
+    # Skip blank lines and comments
+    line="${line%%#*}"
+    line="$(echo "$line" | xargs)"
+    [ -z "$line" ] && continue
 
-# merge_pr <owner/repo> <pr_number> [title]
-merge_pr containerd/containerd 12608 "Update plugin config migration to run on load"
-merge_pr containerd/containerd 12562 "Add plugins for server listeners"
-merge_pr containerd/containerd 12667 "Update transfer service to support automatically garbage collecting extra references"
-merge_pr containerd/containerd 12785 "Make shim socket directory use configured directory"
-merge_pr containerd/containerd 12865 "Read only mounts on Darwin, support resolving uid/gid"
-merge_pr dmcgowan/containerd 11 "This needs a PR on containerd/containerd still"
-merge_pr containerd/containerd 12921 "sys, dialer: support AF_UNIX sockets on Windows"
-merge_pr containerd/containerd 12938 "set sparse file attribute on Windows"
-merge_pr containerd/containerd 12949 "Add junction support for Windows"
-merge_pr containerd/containerd 12968 "Fix send stream EOF"
+    # Parse: repo pr [title]
+    # Title may be quoted, so use a simple split: first two fields are repo and pr,
+    # the rest is the title.
+    repo=$(echo "$line" | awk '{print $1}')
+    pr=$(echo "$line" | awk '{print $2}')
+    title=$(echo "$line" | sed 's/^[^ ]* *[^ ]* *//')
+    [ "$title" = "$pr" ] && title=""
 
-
+    merge_pr "$repo" "$pr" "$title"
+done < "$PR_LIST"
