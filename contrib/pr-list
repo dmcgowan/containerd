@@ -1,0 +1,13 @@
+# PRs to merge into the fork branch
+# Format: <owner/repo> <pr_number> [title]
+
+containerd/containerd 12608 Update plugin config migration to run on load
+containerd/containerd 12562 Add plugins for server listeners
+containerd/containerd 12667 Update transfer service to support automatically garbage collecting extra references
+containerd/containerd 12785 Make shim socket directory use configured directory
+containerd/containerd 12865 Read only mounts on Darwin, support resolving uid/gid
+dmcgowan/containerd 11 This needs a PR on containerd/containerd still
+containerd/containerd 12921 sys, dialer: support AF_UNIX sockets on Windows
+containerd/containerd 12938 set sparse file attribute on Windows
+containerd/containerd 12949 Add junction support for Windows
+containerd/containerd 12968 Fix send stream EOF
