@@ -38,7 +38,41 @@ jobs:
         run: contrib/merge-prs.sh
 
       - name: Push staging branch
-        run: git push --force origin HEAD:refs/heads/main-fork/stage
+        run: git push --force origin HEAD:refs/heads/main-fork-stage
+
+  lint:
+    name: Lint
+    needs: merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork-stage
+      - uses: ./.github/actions/install-go
+        with:
+          go-version: "1.26.1"
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20  # v9.2.0
+        with:
+          version: v2.9.0
+          args: --timeout=8m
+
+  test:
+    name: Unit tests
+    needs: merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork-stage
+      - uses: ./.github/actions/install-go
+        with:
+          go-version: "1.26.1"
+      - name: Test
+        run: make test
 
   build:
     name: Build
@@ -55,7 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: main-fork/stage
+          ref: main-fork-stage
       - uses: ./.github/actions/install-go
         with:
           go-version: ${{ matrix.go-version }}
@@ -67,18 +101,18 @@ jobs:
   promote:
     name: Promote and tag
     runs-on: ubuntu-latest
-    needs: build
+    needs: [lint, test, build]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          ref: main-fork/stage
+          ref: main-fork-stage
           fetch-tags: true
           fetch-depth: 0
 
       - name: Push branch and tag
         run: |
-          git push --force origin HEAD:refs/heads/main-fork/merged
+          git push --force origin HEAD:refs/heads/main-fork-merged
 
           PREFIX="${TAG_PREFIX}"
           LAST=$(git tag -l "${PREFIX}*" | sed "s/^${PREFIX}//" | sort -n | tail -1)
