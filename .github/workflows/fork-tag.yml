@@ -3,7 +3,9 @@ name: Internal CI
 on:
   push:
     branches:
+      - main-fork/merged
       - wip-2.3
+  workflow_dispatch:
 
 permissions:
   contents: write
