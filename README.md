@@ -1,6 +1,14 @@
 # FORK from containerd/containerd main
 
-Only make changes to contrib/cherry-pick-prs.sh
+This branch is a development fork for testing changes not yet in upstream and providing a tag for testing as a dependency.
+It only contains list of PRs based on containerd/containerd main for generating a test branch.
+
+## Managing the PR list
+
+PRs should be opened directly against `containerd/containerd` main or a fork of it (e.g. `dmcgowan/containerd` or your personal fork).
+
+To add or remove a PR from the list, use the **Manage Fork PR List** GitHub Actions workflow
+([Actions > Manage Fork PR List > Run workflow](https://github.com/dmcgowan/containerd/actions/workflows/fork-manage-prs.yml)).
 
 ![containerd banner light mode](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/color/containerd-horizontal-color.png#gh-light-mode-only)
 ![containerd banner dark mode](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/white/containerd-horizontal-white.png#gh-dark-mode-only)
