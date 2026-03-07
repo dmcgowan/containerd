@@ -6,6 +6,7 @@ on:
 permissions:
   contents: write
   pull-requests: read
+  actions: write
 
 jobs:
   rebase:
@@ -81,3 +82,6 @@ jobs:
 
       - name: Force push
         run: git push --force-with-lease origin main-fork
+
+      - name: Trigger merge workflow
+        run: gh workflow run fork-merge.yml --ref main-fork
