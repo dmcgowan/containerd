@@ -1,0 +1,72 @@
+name: Rebase Fork
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  rebase:
+    name: Rebase and prune
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/containerd/containerd.git
+          git fetch upstream main
+
+      - name: Rebase onto upstream main
+        run: git rebase upstream/main
+
+      - name: Prune merged PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REMOVED=""
+          # Read from a snapshot so sed -i modifications don't affect the loop
+          cp contrib/pr-list contrib/pr-list.snapshot
+          while IFS= read -r line; do
+            # Skip comments and blank lines
+            case "$line" in
+              \#*|"") continue ;;
+            esac
+
+            REPO=$(echo "$line" | awk '{print $1}')
+            PR=$(echo "$line" | awk '{print $2}')
+
+            STATE=$(gh pr view "$PR" --repo "$REPO" --json state -q .state 2>/dev/null || echo "UNKNOWN")
+            if [ "$STATE" = "MERGED" ]; then
+              echo "Removing merged PR: ${REPO}#${PR}"
+              sed -i "\|^${REPO} ${PR} |d" contrib/pr-list
+              REMOVED="${REMOVED}  - ${REPO}#${PR}\n"
+            fi
+          done < contrib/pr-list.snapshot
+          rm -f contrib/pr-list.snapshot
+
+          echo "REMOVED<<EOF" >> "$GITHUB_ENV"
+          printf '%b' "$REMOVED" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Commit pruned list
+        if: env.REMOVED != ''
+        run: |
+          git add contrib/pr-list
+          BODY=$(printf '%b' "$REMOVED")
+          git commit -m "contrib/pr-list: remove merged PRs" -m "Removed:
+          ${BODY}"
+
+      - name: Force push
+        run: git push --force-with-lease origin main-fork
