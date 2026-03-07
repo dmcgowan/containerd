@@ -10,6 +10,10 @@ PRs should be opened directly against `containerd/containerd` main or a fork of 
 To add or remove a PR from the list, use the **Manage Fork PR List** GitHub Actions workflow
 ([Actions > Manage Fork PR List > Run workflow](https://github.com/dmcgowan/containerd/actions/workflows/fork-manage-prs.yml)).
 
+To rebase `main-fork` onto the latest upstream main and automatically prune merged PRs from the list,
+use the **Rebase Fork** workflow
+([Actions > Rebase Fork > Run workflow](https://github.com/dmcgowan/containerd/actions/workflows/fork-rebase.yml)).
+
 ![containerd banner light mode](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/color/containerd-horizontal-color.png#gh-light-mode-only)
 ![containerd banner dark mode](https://raw.githubusercontent.com/cncf/artwork/master/projects/containerd/horizontal/white/containerd-horizontal-white.png#gh-dark-mode-only)
 
