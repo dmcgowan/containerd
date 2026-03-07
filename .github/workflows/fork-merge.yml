@@ -1,10 +1,9 @@
-name: Internal CI
+name: Merge Fork PRs
 
 on:
   push:
     branches:
-      - main-fork/merged
-      - wip-2.3
+      - main-fork
   workflow_dispatch:
 
 permissions:
@@ -14,8 +13,36 @@ env:
   TAG_PREFIX: "v2.3.0-alpha.dmcg."
 
 jobs:
+  merge:
+    name: Merge PRs
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Rewrite SSH URLs to HTTPS and use gh as credential helper
+          # so the merge script can fetch PRs (works for private repos too)
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          gh auth setup-git
+
+      - name: Merge PRs from list
+        run: contrib/merge-prs.sh
+
+      - name: Push staging branch
+        run: git push --force origin HEAD:refs/heads/main-fork/stage
+
   build:
     name: Build
+    needs: merge
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
 
@@ -27,6 +54,8 @@ jobs:
           - os: ${{ github.event.repository.private && 'ubuntu-24.04-arm' || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork/stage
       - uses: ./.github/actions/install-go
         with:
           go-version: ${{ matrix.go-version }}
@@ -35,19 +64,22 @@ jobs:
           make build
           make binaries
 
-  tag:
-    name: Auto Tag
+  promote:
+    name: Promote and tag
     runs-on: ubuntu-latest
     needs: build
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          ref: main-fork/stage
           fetch-tags: true
           fetch-depth: 0
 
-      - name: Determine next tag and push
+      - name: Push branch and tag
         run: |
+          git push --force origin HEAD:refs/heads/main-fork/merged
+
           PREFIX="${TAG_PREFIX}"
           LAST=$(git tag -l "${PREFIX}*" | sed "s/^${PREFIX}//" | sort -n | tail -1)
           NEXT=$(( ${LAST:-0} + 1 ))
