@@ -11,6 +11,8 @@ jobs:
   rebase:
     name: Rebase and prune
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -18,10 +20,14 @@ jobs:
           ref: main-fork
           fetch-depth: 0
 
-      - name: Configure git identity
+      - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Rewrite SSH URLs to HTTPS and use gh as credential helper
+          # so the merge script can fetch PRs (works for private repos too)
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          gh auth setup-git
 
       - name: Add upstream and fetch
         run: |
@@ -32,8 +38,6 @@ jobs:
         run: git rebase upstream/main
 
       - name: Prune merged PRs
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           REMOVED=""
           # Read from a snapshot so sed -i modifications don't affect the loop
@@ -67,6 +71,13 @@ jobs:
           BODY=$(printf '%b' "$REMOVED")
           git commit -m "contrib/pr-list: remove merged PRs" -m "Removed:
           ${BODY}"
+
+      - name: Verify PRs merge cleanly
+        run: |
+          REBASE_HEAD=$(git rev-parse HEAD)
+          contrib/merge-prs.sh
+          # All merges succeeded — reset back to just the rebased branch
+          git reset --hard "$REBASE_HEAD"
 
       - name: Force push
         run: git push --force-with-lease origin main-fork
