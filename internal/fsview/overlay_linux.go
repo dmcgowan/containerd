@@ -34,7 +34,7 @@ func isOpaque(f fs.File) bool {
 			if err != nil {
 				continue
 			}
-			if sz == 1 && dest[0] == 'y' {
+			if sz == 1 && len(dest) == 1 && dest[0] == 'y' {
 				return true
 			}
 		}
