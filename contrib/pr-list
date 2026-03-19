@@ -1,7 +1,6 @@
 # PRs to merge into the fork branch
 # Format: <owner/repo> <pr_number> [title]
 
-containerd/containerd 12608 Update plugin config migration to run on load
 containerd/containerd 12562 Add plugins for server listeners
 containerd/containerd 12667 Update transfer service to support automatically garbage collecting extra references
 containerd/containerd 12785 Make shim socket directory use configured directory
