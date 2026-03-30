@@ -23,8 +23,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 
 	winio "github.com/Microsoft/go-winio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
 )
@@ -104,8 +106,46 @@ func handleExitSignals(ctx context.Context, logger *log.Entry, cancel context.Ca
 	}
 }
 
-func openLog(ctx context.Context, _ string) (io.Writer, error) {
-	// On Windows, just return stderr for logging
-	// We don't have FIFO support like Unix
-	return os.Stderr, nil
+func openLog(ctx context.Context, id string) (io.Writer, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return os.Stderr, nil
+	}
+	pipeName := fmt.Sprintf(`\\.\pipe\containerd-shim-%s-%s-log`, ns, id)
+	l, err := winio.ListenPipe(pipeName, nil)
+	if err != nil {
+		return os.Stderr, nil
+	}
+
+	w := &pipeLogWriter{}
+	go func() {
+		c, err := l.Accept()
+		l.Close()
+		if err != nil {
+			return
+		}
+		w.mu.Lock()
+		w.conn = c
+		w.mu.Unlock()
+	}()
+	return w, nil
+}
+
+// pipeLogWriter writes to os.Stderr always, and also to the named pipe
+// connection once containerd has connected to it.
+type pipeLogWriter struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (w *pipeLogWriter) Write(p []byte) (int, error) {
+	n, err := os.Stderr.Write(p)
+
+	w.mu.Lock()
+	c := w.conn
+	w.mu.Unlock()
+	if c != nil {
+		c.Write(p) //nolint:errcheck
+	}
+	return n, err
 }
