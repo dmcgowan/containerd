@@ -23,12 +23,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync"
 
 	winio "github.com/Microsoft/go-winio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
+	"golang.org/x/sys/windows"
 )
 
 func setupSignals(config Config) (chan os.Signal, error) {
@@ -106,6 +106,14 @@ func handleExitSignals(ctx context.Context, logger *log.Entry, cancel context.Ca
 	}
 }
 
+// openLog creates a named pipe for containerd to read shim logs and redirects
+// os.Stderr to it, mirroring the Unix behavior where openLog uses dup2 to
+// replace fd 2 with the log FIFO. After this call, all writes to os.Stderr
+// (including logrus output, VM console io.Copy, and any library writes) are
+// captured by containerd via the log pipe.
+//
+// The pipe name matches the convention expected by openShimLog in
+// core/runtime/v2/shim_windows.go.
 func openLog(ctx context.Context, id string) (io.Writer, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
@@ -117,35 +125,33 @@ func openLog(ctx context.Context, id string) (io.Writer, error) {
 		return os.Stderr, nil
 	}
 
-	w := &pipeLogWriter{}
-	go func() {
-		c, err := l.Accept()
+	// Create an anonymous pipe to replace stderr. All writes to os.Stderr
+	// will go into pw; a background goroutine reads from pr and fans out
+	// to both the original stderr and the named pipe (once connected).
+	pr, pw, err := os.Pipe()
+	if err != nil {
 		l.Close()
-		if err != nil {
-			return
-		}
-		w.mu.Lock()
-		w.conn = c
-		w.mu.Unlock()
-	}()
-	return w, nil
-}
-
-// pipeLogWriter writes to os.Stderr always, and also to the named pipe
-// connection once containerd has connected to it.
-type pipeLogWriter struct {
-	mu   sync.Mutex
-	conn net.Conn
-}
-
-func (w *pipeLogWriter) Write(p []byte) (int, error) {
-	n, err := os.Stderr.Write(p)
-
-	w.mu.Lock()
-	c := w.conn
-	w.mu.Unlock()
-	if c != nil {
-		c.Write(p) //nolint:errcheck
+		return os.Stderr, nil
 	}
-	return n, err
+
+	oldStderr := os.Stderr
+	os.Stderr = pw
+	// Update the process-wide stderr handle so non-Go code also picks it up.
+	windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(pw.Fd())) //nolint:errcheck
+
+	go func() {
+		// Accept one connection from containerd.
+		conn, err := l.Accept()
+		l.Close()
+
+		// Copy from the anonymous pipe to all destinations.
+		var w io.Writer = oldStderr
+		if err == nil {
+			w = io.MultiWriter(oldStderr, conn)
+			defer conn.Close()
+		}
+		io.Copy(w, pr) //nolint:errcheck
+	}()
+
+	return pw, nil
 }
