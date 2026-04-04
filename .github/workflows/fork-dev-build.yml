@@ -1,0 +1,45 @@
+name: Build Dev Release
+
+on:
+  schedule:
+    - cron: "0 12 * * *"  # Daily at noon UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build dev branch
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: main-fork
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/containerd/containerd.git
+          git fetch upstream main
+
+      - name: Build dev branch and tag
+        id: dev-build
+        env:
+          UPSTREAM_REMOTE: upstream
+        run: contrib/build-dev-branch.sh
+
+      - name: Push tag
+        if: steps.dev-build.outputs.tag != ''
+        run: |
+          echo "Pushing tag: ${{ steps.dev-build.outputs.tag }}"
+          git push origin "${{ steps.dev-build.outputs.tag }}"
