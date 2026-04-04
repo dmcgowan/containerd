@@ -1,3 +1,5 @@
+//go:build !linux
+
 /*
    Copyright The containerd Authors.
 
@@ -14,28 +16,14 @@
    limitations under the License.
 */
 
-package protobuf
+package server
 
 import (
-	"github.com/google/go-cmp/cmp"
-	"google.golang.org/protobuf/proto"
+	"context"
+
+	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 )
 
-var Compare = cmp.FilterValues(
-	func(x, y any) bool {
-		_, xok := x.(proto.Message)
-		_, yok := y.(proto.Message)
-		return xok && yok
-	},
-	cmp.Comparer(func(x, y any) bool {
-		vx, ok := x.(proto.Message)
-		if !ok {
-			return false
-		}
-		vy, ok := y.(proto.Message)
-		if !ok {
-			return false
-		}
-		return proto.Equal(vx, vy)
-	}),
-)
+func apply(_ context.Context, _ *srvconfig.Config) error {
+	return nil
+}
