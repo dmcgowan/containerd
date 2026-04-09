@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"time"
 
 	winio "github.com/Microsoft/go-winio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -154,4 +155,37 @@ func openLog(ctx context.Context, id string) (io.Writer, error) {
 	}()
 
 	return pw, nil
+}
+
+// awaitPipeReady polls a named pipe address until it is connectable,
+// retrying for up to 5 seconds with 10ms intervals.
+//
+// The shim "start" helper returns the pipe address before the long-lived
+// daemon has called winio.ListenPipe(). Unlike Unix domain sockets (which
+// appear atomically on Listen), Windows named pipes may take measurable
+// time to appear — especially under load. See #3659, microsoft/hcsshim.
+func awaitPipeReady(address string) error {
+	if address == "" {
+		return nil
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		// Use a 1s per-attempt timeout to avoid blocking indefinitely if
+		// the pipe exists but all instances are busy.
+		dialTimeout := time.Second
+		conn, err := winio.DialPipe(address, &dialTimeout)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		select {
+		case <-deadline:
+			return fmt.Errorf("pipe %s not found after 5s: %w", address, os.ErrNotExist)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
