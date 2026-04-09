@@ -37,6 +37,10 @@ import (
 // When the content was not converted, ConvertFunc returns nil.
 type ConvertFunc func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error)
 
+// UpdateManifestFunc is a callback invoked in convertIndex for each converted
+// manifest descriptor.
+type UpdateManifestFunc func(ctx context.Context, cs content.Store, originalDesc, convertedDesc ocispec.Descriptor) (*ocispec.Descriptor, error)
+
 // DefaultIndexConvertFunc is the default convert func used by Convert.
 func DefaultIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer) ConvertFunc {
 	c := &defaultConverter{
@@ -71,12 +75,13 @@ func IndexConvertFuncWithHook(layerConvertFunc ConvertFunc, docker2oci bool, pla
 }
 
 type defaultConverter struct {
-	layerConvertFunc ConvertFunc
-	docker2oci       bool
-	platformMC       platforms.MatchComparer
-	diffIDMap        map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
-	diffIDMapMu      sync.RWMutex
-	hooks            ConvertHooks
+	layerConvertFunc   ConvertFunc
+	docker2oci         bool
+	platformMC         platforms.MatchComparer
+	diffIDMap          map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
+	diffIDMapMu        sync.RWMutex
+	hooks              ConvertHooks
+	updateManifestFunc UpdateManifestFunc
 }
 
 // convert dispatches desc.MediaType and calls c.convert{Layer,Manifest,Index,Config}.
@@ -151,7 +156,7 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 		manifest ocispec.Manifest
 		modified bool
 	)
-	labels, err := readJSON(ctx, cs, &manifest, desc)
+	labels, err := ReadJSON(ctx, cs, &manifest, desc)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +221,7 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 	}
 
 	if modified {
-		return writeJSON(ctx, cs, &manifest, desc, labels)
+		return WriteJSON(ctx, cs, &manifest, desc, labels)
 	}
 	return nil, nil
 }
@@ -230,7 +235,7 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 		index    ocispec.Index
 		modified bool
 	)
-	labels, err := readJSON(ctx, cs, &index, desc)
+	labels, err := ReadJSON(ctx, cs, &index, desc)
 	if err != nil {
 		return nil, err
 	}
@@ -263,6 +268,14 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 			}
 			mu.Lock()
 			if newMani != nil {
+				if c.updateManifestFunc != nil {
+					if updated, err := c.updateManifestFunc(ctx2, cs, mani, *newMani); err != nil {
+						mu.Unlock()
+						return err
+					} else if updated != nil {
+						newMani = updated
+					}
+				}
 				ClearGCLabels(labels, mani.Digest)
 				labels[labelKey] = newMani.Digest.String()
 				// NOTE: for keeping manifest order, we specify `i` index explicitly
@@ -270,6 +283,15 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 				modified = true
 			} else {
 				newManifests[i] = mani
+				if c.updateManifestFunc != nil {
+					if updated, err := c.updateManifestFunc(ctx2, cs, mani, mani); err != nil {
+						mu.Unlock()
+						return err
+					} else if updated != nil {
+						newManifests[i] = *updated
+						modified = true
+					}
+				}
 			}
 			mu.Unlock()
 			return nil
@@ -286,7 +308,7 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 			}
 		}
 		index.Manifests = newManifestsClean
-		return writeJSON(ctx, cs, &index, desc, labels)
+		return WriteJSON(ctx, cs, &index, desc, labels)
 	}
 	return nil, nil
 }
@@ -303,14 +325,14 @@ func (c *defaultConverter) convertConfig(ctx context.Context, cs content.Store, 
 		modified bool
 	)
 
-	labels, err := readJSON(ctx, cs, &cfg, desc)
+	labels, err := ReadJSON(ctx, cs, &cfg, desc)
 	if err != nil {
 		return nil, err
 	}
 	if labels == nil {
 		labels = make(map[string]string)
 	}
-	if _, err := readJSON(ctx, cs, &cfgAsOCI, desc); err != nil {
+	if _, err := ReadJSON(ctx, cs, &cfgAsOCI, desc); err != nil {
 		return nil, err
 	}
 
@@ -340,7 +362,7 @@ func (c *defaultConverter) convertConfig(ctx context.Context, cs content.Store, 
 		if _, err := clearDockerV1DummyID(cfg); err != nil {
 			return nil, err
 		}
-		return writeJSON(ctx, cs, &cfg, desc, labels)
+		return WriteJSON(ctx, cs, &cfg, desc, labels)
 	}
 	return nil, nil
 }
@@ -378,7 +400,7 @@ func clearDockerV1DummyID(cfg DualConfig) (bool, error) {
 // Unmarshalled as map[string]*json.RawMessage to retain unknown fields on remarshalling.
 type DualConfig map[string]*json.RawMessage
 
-func readJSON(ctx context.Context, cs content.Store, x any, desc ocispec.Descriptor) (map[string]string, error) {
+func ReadJSON(ctx context.Context, cs content.Store, x any, desc ocispec.Descriptor) (map[string]string, error) {
 	info, err := cs.Info(ctx, desc.Digest)
 	if err != nil {
 		return nil, err
@@ -394,7 +416,7 @@ func readJSON(ctx context.Context, cs content.Store, x any, desc ocispec.Descrip
 	return labels, nil
 }
 
-func writeJSON(ctx context.Context, cs content.Store, x any, oldDesc ocispec.Descriptor, labels map[string]string) (*ocispec.Descriptor, error) {
+func WriteJSON(ctx context.Context, cs content.Store, x any, oldDesc ocispec.Descriptor, labels map[string]string) (*ocispec.Descriptor, error) {
 	b, err := json.Marshal(x)
 	if err != nil {
 		return nil, err
