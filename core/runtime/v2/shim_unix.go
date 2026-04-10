@@ -21,12 +21,15 @@ package v2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/fifo"
 	"golang.org/x/sys/unix"
 )
@@ -44,4 +47,27 @@ func checkCopyShimLogError(ctx context.Context, err error) error {
 	default:
 	}
 	return err
+}
+
+// defaultSocketDir returns the directory used for shim unix sockets.
+// The path is intentionally kept short and hardcoded rather than derived
+// from the configured state directory, because unix socket paths are
+// limited to 108 characters.
+func defaultSocketDir() string {
+	defaultDir := filepath.Join(defaults.DefaultStateDir, "s")
+	uid := os.Geteuid()
+	if uid == 0 {
+		return defaultDir
+	}
+
+	// Check if default state dir is already setup for this non-root user
+	if st, err := os.Stat(defaults.DefaultStateDir); err == nil {
+		if sys := st.Sys(); sys != nil {
+			if stat, ok := sys.(*syscall.Stat_t); ok && int(stat.Uid) == uid {
+				return defaultDir
+			}
+		}
+	}
+
+	return fmt.Sprintf("/tmp/containerd-s-%d", uid)
 }

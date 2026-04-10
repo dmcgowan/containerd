@@ -24990,6 +24990,13 @@ file: {
       type_name: ".containerd.runtime.bootstrap.v1.Extension"
       json_name: "extensions"
     }
+    field: {
+      name: "socket_dir"
+      number: 9
+      label: LABEL_OPTIONAL
+      type: TYPE_STRING
+      json_name: "socketDir"
+    }
   }
   message_type: {
     name: "Extension"
@@ -25107,7 +25114,7 @@ file: {
     location: {
       span: 33
       span: 0
-      span: 118
+      span: 120
       span: 1
     }
     location: {
@@ -25149,7 +25156,7 @@ file: {
       path: 0
       span: 42
       span: 0
-      span: 68
+      span: 70
       span: 1
       leading_comments: " BootstrapParams contains all configuration passed from containerd to shim at startup.\n"
     }
@@ -25493,10 +25500,49 @@ file: {
     }
     location: {
       path: 4
+      path: 0
+      path: 2
+      path: 8
+      span: 69
+      span: 2
+      span: 24
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 8
+      path: 5
+      span: 69
+      span: 2
+      span: 8
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 8
       path: 1
-      span: 72
+      span: 69
+      span: 9
+      span: 19
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 8
+      path: 3
+      span: 69
+      span: 22
+      span: 23
+    }
+    location: {
+      path: 4
+      path: 1
+      span: 74
       span: 0
-      span: 79
+      span: 81
       span: 1
       leading_comments: " Extension provides extensibility for new configuration types\n without changing the core BootstrapParams protocol\n"
     }
@@ -25504,7 +25550,7 @@ file: {
       path: 4
       path: 1
       path: 1
-      span: 72
+      span: 74
       span: 8
       span: 17
     }
@@ -25513,7 +25559,7 @@ file: {
       path: 1
       path: 2
       path: 0
-      span: 78
+      span: 80
       span: 2
       span: 32
       leading_comments: " Configuration data with embedded type URL\n Examples of type URLs:\n   - \"containerd.io/cri.v1.PodSandboxConfig\"\n   - \"containerd.io/nri.v1.PluginConfig\"\n   - \"containerd.io/sandbox.v1.SandboxConfig\"\n"
@@ -25524,7 +25570,7 @@ file: {
       path: 2
       path: 0
       path: 6
-      span: 78
+      span: 80
       span: 2
       span: 21
     }
@@ -25534,7 +25580,7 @@ file: {
       path: 2
       path: 0
       path: 1
-      span: 78
+      span: 80
       span: 22
       span: 27
     }
@@ -25544,16 +25590,16 @@ file: {
       path: 2
       path: 0
       path: 3
-      span: 78
+      span: 80
       span: 30
       span: 31
     }
     location: {
       path: 4
       path: 2
-      span: 82
+      span: 84
       span: 0
-      span: 100
+      span: 102
       span: 1
       leading_comments: " BootstrapResult is returned by shim via stdout after successful startup\n"
     }
@@ -25561,7 +25607,7 @@ file: {
       path: 4
       path: 2
       path: 1
-      span: 82
+      span: 84
       span: 8
       span: 23
     }
@@ -25570,7 +25616,7 @@ file: {
       path: 2
       path: 2
       path: 0
-      span: 84
+      span: 86
       span: 2
       span: 20
       leading_comments: " Version of shim parameters (expected 2 for shim v2)\n"
@@ -25581,7 +25627,7 @@ file: {
       path: 2
       path: 0
       path: 5
-      span: 84
+      span: 86
       span: 2
       span: 7
     }
@@ -25591,7 +25637,7 @@ file: {
       path: 2
       path: 0
       path: 1
-      span: 84
+      span: 86
       span: 8
       span: 15
     }
@@ -25601,7 +25647,7 @@ file: {
       path: 2
       path: 0
       path: 3
-      span: 84
+      span: 86
       span: 18
       span: 19
     }
@@ -25610,7 +25656,7 @@ file: {
       path: 2
       path: 2
       path: 1
-      span: 88
+      span: 90
       span: 2
       span: 21
       leading_comments: " Address where shim is listening (e.g., \"unix:///run/containerd/shim.sock\")\n Containerd will connect to this address for task operations\n"
@@ -25621,7 +25667,7 @@ file: {
       path: 2
       path: 1
       path: 5
-      span: 88
+      span: 90
       span: 2
       span: 8
     }
@@ -25631,7 +25677,7 @@ file: {
       path: 2
       path: 1
       path: 1
-      span: 88
+      span: 90
       span: 9
       span: 16
     }
@@ -25641,7 +25687,7 @@ file: {
       path: 2
       path: 1
       path: 3
-      span: 88
+      span: 90
       span: 19
       span: 20
     }
@@ -25650,7 +25696,7 @@ file: {
       path: 2
       path: 2
       path: 2
-      span: 91
+      span: 93
       span: 2
       span: 22
       leading_comments: " Protocol used by shim: \"ttrpc\" or \"grpc\"\n"
@@ -25661,7 +25707,7 @@ file: {
       path: 2
       path: 2
       path: 5
-      span: 91
+      span: 93
       span: 2
       span: 8
     }
@@ -25671,7 +25717,7 @@ file: {
       path: 2
       path: 2
       path: 1
-      span: 91
+      span: 93
       span: 9
       span: 17
     }
@@ -25681,7 +25727,7 @@ file: {
       path: 2
       path: 2
       path: 3
-      span: 91
+      span: 93
       span: 20
       span: 21
     }
@@ -25690,7 +25736,7 @@ file: {
       path: 2
       path: 2
       path: 3
-      span: 96
+      span: 98
       span: 2
       span: 39
       leading_comments: " Optional: Capabilities supported by this shim instance.\n Reserved for future use to allow optional capability negotiation\n between the daemon and shim.\n"
@@ -25701,7 +25747,7 @@ file: {
       path: 2
       path: 3
       path: 4
-      span: 96
+      span: 98
       span: 2
       span: 10
     }
@@ -25711,7 +25757,7 @@ file: {
       path: 2
       path: 3
       path: 6
-      span: 96
+      span: 98
       span: 11
       span: 21
     }
@@ -25721,7 +25767,7 @@ file: {
       path: 2
       path: 3
       path: 1
-      span: 96
+      span: 98
       span: 22
       span: 34
     }
@@ -25731,7 +25777,7 @@ file: {
       path: 2
       path: 3
       path: 3
-      span: 96
+      span: 98
       span: 37
       span: 38
     }
@@ -25740,7 +25786,7 @@ file: {
       path: 2
       path: 2
       path: 4
-      span: 99
+      span: 101
       span: 2
       span: 35
       leading_comments: " Optional: Additional metadata from shim\n"
@@ -25751,7 +25797,7 @@ file: {
       path: 2
       path: 4
       path: 6
-      span: 99
+      span: 101
       span: 2
       span: 21
     }
@@ -25761,7 +25807,7 @@ file: {
       path: 2
       path: 4
       path: 1
-      span: 99
+      span: 101
       span: 22
       span: 30
     }
@@ -25771,16 +25817,16 @@ file: {
       path: 2
       path: 4
       path: 3
-      span: 99
+      span: 101
       span: 33
       span: 34
     }
     location: {
       path: 5
       path: 0
-      span: 104
+      span: 106
       span: 0
-      span: 112
+      span: 114
       span: 1
       leading_comments: " LogLevel defines log verbosity levels independent of any specific\n logging library.\n"
     }
@@ -25788,7 +25834,7 @@ file: {
       path: 5
       path: 0
       path: 1
-      span: 104
+      span: 106
       span: 5
       span: 13
     }
@@ -25797,7 +25843,7 @@ file: {
       path: 0
       path: 2
       path: 0
-      span: 105
+      span: 107
       span: 2
       span: 28
     }
@@ -25807,7 +25853,7 @@ file: {
       path: 2
       path: 0
       path: 1
-      span: 105
+      span: 107
       span: 2
       span: 23
     }
@@ -25817,7 +25863,7 @@ file: {
       path: 2
       path: 0
       path: 2
-      span: 105
+      span: 107
       span: 26
       span: 27
     }
@@ -25826,7 +25872,7 @@ file: {
       path: 0
       path: 2
       path: 1
-      span: 106
+      span: 108
       span: 2
       span: 22
     }
@@ -25836,7 +25882,7 @@ file: {
       path: 2
       path: 1
       path: 1
-      span: 106
+      span: 108
       span: 2
       span: 17
     }
@@ -25846,7 +25892,7 @@ file: {
       path: 2
       path: 1
       path: 2
-      span: 106
+      span: 108
       span: 20
       span: 21
     }
@@ -25855,7 +25901,7 @@ file: {
       path: 0
       path: 2
       path: 2
-      span: 107
+      span: 109
       span: 2
       span: 22
     }
@@ -25865,7 +25911,7 @@ file: {
       path: 2
       path: 2
       path: 1
-      span: 107
+      span: 109
       span: 2
       span: 17
     }
@@ -25875,7 +25921,7 @@ file: {
       path: 2
       path: 2
       path: 2
-      span: 107
+      span: 109
       span: 20
       span: 21
     }
@@ -25884,7 +25930,7 @@ file: {
       path: 0
       path: 2
       path: 3
-      span: 108
+      span: 110
       span: 2
       span: 21
     }
@@ -25894,7 +25940,7 @@ file: {
       path: 2
       path: 3
       path: 1
-      span: 108
+      span: 110
       span: 2
       span: 16
     }
@@ -25904,7 +25950,7 @@ file: {
       path: 2
       path: 3
       path: 2
-      span: 108
+      span: 110
       span: 19
       span: 20
     }
@@ -25913,7 +25959,7 @@ file: {
       path: 0
       path: 2
       path: 4
-      span: 109
+      span: 111
       span: 2
       span: 21
     }
@@ -25923,7 +25969,7 @@ file: {
       path: 2
       path: 4
       path: 1
-      span: 109
+      span: 111
       span: 2
       span: 16
     }
@@ -25933,7 +25979,7 @@ file: {
       path: 2
       path: 4
       path: 2
-      span: 109
+      span: 111
       span: 19
       span: 20
     }
@@ -25942,7 +25988,7 @@ file: {
       path: 0
       path: 2
       path: 5
-      span: 110
+      span: 112
       span: 2
       span: 22
     }
@@ -25952,7 +25998,7 @@ file: {
       path: 2
       path: 5
       path: 1
-      span: 110
+      span: 112
       span: 2
       span: 17
     }
@@ -25962,7 +26008,7 @@ file: {
       path: 2
       path: 5
       path: 2
-      span: 110
+      span: 112
       span: 20
       span: 21
     }
@@ -25971,7 +26017,7 @@ file: {
       path: 0
       path: 2
       path: 6
-      span: 111
+      span: 113
       span: 2
       span: 22
     }
@@ -25981,7 +26027,7 @@ file: {
       path: 2
       path: 6
       path: 1
-      span: 111
+      span: 113
       span: 2
       span: 17
     }
@@ -25991,16 +26037,16 @@ file: {
       path: 2
       path: 6
       path: 2
-      span: 111
+      span: 113
       span: 20
       span: 21
     }
     location: {
       path: 5
       path: 1
-      span: 116
-      span: 0
       span: 118
+      span: 0
+      span: 120
       span: 1
       leading_comments: " Capability defines optional features that can be negotiated between\n containerd and shims.\n"
     }
@@ -26008,7 +26054,7 @@ file: {
       path: 5
       path: 1
       path: 1
-      span: 116
+      span: 118
       span: 5
       span: 15
     }
@@ -26017,7 +26063,7 @@ file: {
       path: 1
       path: 2
       path: 0
-      span: 117
+      span: 119
       span: 2
       span: 29
     }
@@ -26027,7 +26073,7 @@ file: {
       path: 2
       path: 0
       path: 1
-      span: 117
+      span: 119
       span: 2
       span: 24
     }
@@ -26037,7 +26083,7 @@ file: {
       path: 2
       path: 0
       path: 2
-      span: 117
+      span: 119
       span: 27
       span: 28
     }
