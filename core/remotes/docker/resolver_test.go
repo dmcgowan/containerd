@@ -764,6 +764,199 @@ func TestRequestSanitize(t *testing.T) {
 	}
 }
 
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "fake timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+func TestIsTransientTransportErr(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{name: "net timeout", ctx: context.Background(), err: fakeTimeoutErr{}, want: true},
+		{name: "wrapped net timeout", ctx: context.Background(), err: fmt.Errorf("wrapped: %w", fakeTimeoutErr{}), want: true},
+		{name: "io.EOF", ctx: context.Background(), err: io.EOF, want: true},
+		{name: "io.ErrUnexpectedEOF", ctx: context.Background(), err: io.ErrUnexpectedEOF, want: true},
+		{name: "wrapped io.EOF", ctx: context.Background(), err: fmt.Errorf("wrapped: %w", io.EOF), want: true},
+		{name: "generic error not transient", ctx: context.Background(), err: errors.New("nope"), want: false},
+		{name: "context canceled not transient", ctx: context.Background(), err: context.Canceled, want: false},
+		{name: "context deadline exceeded not transient", ctx: context.Background(), err: context.DeadlineExceeded, want: false},
+		{name: "canceled ctx suppresses retry", ctx: canceledCtx, err: fakeTimeoutErr{}, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isTransientTransportErr(tc.ctx, tc.err)
+			if got != tc.want {
+				t.Errorf("isTransientTransportErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// rtFunc lets a test stub a single RoundTrip per call. The RoundTripper is
+// invoked once per attempt, so the slice length controls how many calls to
+// service before falling off the end.
+type rtFunc func(req *http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func newSequenceRT(t *testing.T, results []error, calls *int) http.RoundTripper {
+	t.Helper()
+	return rtFunc(func(req *http.Request) (*http.Response, error) {
+		i := *calls
+		(*calls)++
+		if i >= len(results) {
+			t.Fatalf("RoundTrip called %d times, only %d results queued", i+1, len(results))
+		}
+		if err := results[i]; err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     http.Header{},
+			Request:    req,
+		}, nil
+	})
+}
+
+func newTransportRetryRequest(rt http.RoundTripper) *request {
+	return &request{
+		method: http.MethodGet,
+		path:   "/v2/",
+		header: http.Header{},
+		host: RegistryHost{
+			Client: &http.Client{Transport: rt},
+			Host:   "example.test",
+			Scheme: "https",
+		},
+	}
+}
+
+func TestDoWithTransportRetries(t *testing.T) {
+	t.Run("success without retry", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		r := newTransportRetryRequest(newSequenceRT(t, []error{nil}, &calls))
+		resp, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+		if calls != 1 {
+			t.Errorf("expected 1 call, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("retries transient then succeeds", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}, nil}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		resp, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+		if calls != 2 {
+			t.Errorf("expected 2 calls, got %d", calls)
+		}
+		if attempts != 1 {
+			t.Errorf("expected 2 attempts consumed (1 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("gives up when attempts exhausted on transient", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}, fakeTimeoutErr{}, fakeTimeoutErr{}}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err == nil {
+			t.Fatal("expected error after attempts exhausted, got nil")
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("expected timeout error to be returned, got %v", err)
+		}
+		if calls != 3 {
+			t.Errorf("expected 3 calls, got %d", calls)
+		}
+		if attempts != 0 {
+			t.Errorf("expected attempts fully consumed, got %d remaining", attempts)
+		}
+	})
+
+	t.Run("non-transient error is not retried", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		nonTransient := errors.New("connection refused")
+		results := []error{nonTransient}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, true)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "connection refused") {
+			t.Errorf("expected wrapped %q, got %v", nonTransient, err)
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("non-last host skips retry", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+		_, err := r.doWithTransportRetries(context.Background(), &attempts, false)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call when not last host, got %d", calls)
+		}
+		if attempts != 2 {
+			t.Errorf("expected 1 attempt consumed (2 remaining), got %d", attempts)
+		}
+	})
+
+	t.Run("context cancellation during backoff", func(t *testing.T) {
+		var calls int
+		attempts := 3
+		results := []error{fakeTimeoutErr{}, nil}
+		r := newTransportRetryRequest(newSequenceRT(t, results, &calls))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel after the first attempt fails and the backoff sleep starts.
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		_, err := r.doWithTransportRetries(ctx, &attempts, true)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		if calls != 1 {
+			t.Errorf("expected 1 call before cancellation, got %d", calls)
+		}
+	})
+}
+
 func flipLocalhost(host string) string {
 	if strings.HasPrefix(host, "127.0.0.1") {
 		return "localhost" + host[9:]
