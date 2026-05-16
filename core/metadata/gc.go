@@ -55,6 +55,8 @@ const (
 	ResourceStream
 	// ResourceMount specifies a mount
 	ResourceMount
+	// ResourceContentIndex specifies an indexed-content blob
+	ResourceContentIndex
 )
 
 const (

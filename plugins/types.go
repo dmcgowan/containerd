@@ -85,6 +85,11 @@ const (
 	MountManagerPlugin plugin.Type = "io.containerd.mount-manager.v1"
 	// MountHandlerPlugin implements the mount handler interface
 	MountHandlerPlugin plugin.Type = "io.containerd.mount-handler.v1"
+	// ContentIndexPlugin implements an indexed content store
+	ContentIndexPlugin plugin.Type = "io.containerd.content.index.v1"
+	// ContentIndexProviderPlugin implements a byte provider for the
+	// indexed content store (local content, registry, external sources).
+	ContentIndexProviderPlugin plugin.Type = "io.containerd.content.index.provider.v1"
 )
 
 const (
