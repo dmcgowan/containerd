@@ -33,6 +33,7 @@ type convertOpts struct {
 	indexConvertFunc   ConvertFunc
 	platformMC         platforms.MatchComparer
 	updateManifestFunc UpdateManifestFunc
+	appendToIndex      bool
 }
 
 // Opt is an option for Convert()
@@ -81,6 +82,40 @@ func WithUpdateManifest(fn UpdateManifestFunc) Opt {
 	}
 }
 
+// WithAppendToIndex causes Convert to build a dual-format OCI image index
+// that contains both the original manifests and the newly converted ones,
+// rather than replacing the original manifests.
+//
+// The result satisfies the ordering requirement in the EROFS image spec:
+// original (tar-based) manifests appear first in the index, converted
+// (EROFS) manifests follow with os.features=["erofs"] on each platform
+// descriptor so non-EROFS-aware runtimes automatically select the first
+// matching tar manifest and ignore the EROFS entries.
+//
+// When the source image is a single manifest (not an index) the function
+// promotes it to an OCI image index that contains the original manifest
+// followed by the converted manifest.
+//
+// When the source image is already an index, original manifests are
+// retained in their original order and converted manifests are appended.
+// Manifests that do not match the platform filter (when WithPlatform is
+// also set) are kept in the original section but are not converted.
+//
+// WithAppendToIndex is typically combined with WithLayerConvertFunc and
+// WithUpdateManifest.  Example usage with EROFS chunked conversion:
+//
+//	converter.Convert(ctx, client, dstRef, srcRef,
+//	    converter.WithLayerConvertFunc(erofs.LayerConvertFuncChunked(idxStore, 0)),
+//	    converter.WithUpdateManifest(erofs.UpdateManifestPlatform),
+//	    converter.WithAppendToIndex(),
+//	)
+func WithAppendToIndex() Opt {
+	return func(copts *convertOpts) error {
+		copts.appendToIndex = true
+		return nil
+	}
+}
+
 // Client is implemented by *containerd.Client .
 type Client interface {
 	WithLease(ctx context.Context, opts ...leases.Opt) (context.Context, func(context.Context) error, error)
@@ -99,8 +134,18 @@ func Convert(ctx context.Context, client Client, dstRef, srcRef string, opts ...
 	if copts.platformMC == nil {
 		copts.platformMC = platforms.All
 	}
+
+	// appendToIndex and indexConvertFunc are mutually exclusive: if the caller
+	// already provided a custom indexConvertFunc, respect it.
 	if copts.indexConvertFunc == nil {
-		if copts.updateManifestFunc != nil {
+		if copts.appendToIndex {
+			copts.indexConvertFunc = AppendIndexConvertFunc(
+				copts.layerConvertFunc,
+				copts.docker2oci,
+				copts.platformMC,
+				copts.updateManifestFunc,
+			)
+		} else if copts.updateManifestFunc != nil {
 			c := &defaultConverter{
 				layerConvertFunc:   copts.layerConvertFunc,
 				docker2oci:         copts.docker2oci,
