@@ -19,20 +19,17 @@
 //
 // It stores chunk content as entries in containerd's existing content
 // store (one entry per chunk, keyed by the per-chunk hash from the chunk
-// index) and tracks blob → reachability mappings in a sidecar BoltDB
-// database. The sidecar is intentionally minimal: it holds only what the
-// GC collector and the blob-reconstruction path require. Everything else
-// — chunk offsets, lengths, on-blob ranges, weights, dm-verity parameters
-// — is re-read on demand from the raw chunk-index entry stored in the
-// content store.
+// index) and records blob metadata in buckets inside containerd's shared
+// metadata BoltDB.  Only what the GC collector and the blob-reconstruction
+// path require is stored here; everything else — chunk offsets, lengths,
+// on-blob ranges, dm-verity parameters — is re-read on demand from the
+// raw chunk-index entry stored in the content store.
 //
-// The layout where a "/" delineates a bucket is described below. Follow
+// The layout where a "/" delineates a bucket is described below.  Follow
 // the same conventions as core/metadata/buckets.go when adding fields.
 //
 // Conventions:
 //   - `╘══*...*` refers to maps with arbitrary keys
-//   - `version` is a key to a numeric value identifying the minor revisions
-//     of schema version; a namespace cannot be named "version"
 //   - All multi-byte integers use signed varint encoding
 //     (encoding/binary.PutVarint / binary.Varint)
 //   - Timestamps use time.Time.MarshalBinary / time.Time.UnmarshalBinary
@@ -40,43 +37,34 @@
 //     cursor iteration visits entries in ascending numeric (ingest) order
 //   - All <digest> values are UTF-8 strings, e.g. "sha256:<hex>"
 //
-// Schema
-// └──v1                                                  – Schema version bucket
-//    ├──version : <varint>                               – DB minor version; see migrations
-//    ╘══*namespace*
-//       ╘══blobs                                         – Indexed-content blobs
-//          ╘══*blob digest*
-//             ├──createdat : <binary time>               – Created at
-//             ├──updatedat : <binary time>               – Updated at
-//             ├──size      : <varint>                    – Total blob size in bytes
-//             ├──mediatype : <string>                    – OCI layer media type
-//             ├──provider  : <string>                    – Byte-provider name (optional)
-//             ├──index     : <digest>                    – Content-store digest of the chunk-index
-//             │                                            entry (24-byte header + N entries).
-//             │                                            Open this entry and parse it to get
-//             │                                            chunk offsets, lengths, weights, etc.
-//             │                                            Equals org.erofs.index.digest when
-//             │                                            SHA-256 is the index hash algorithm.
-//             ├──chunks                                  – GC reachability: per-chunk digests
-//             │  ╘══*seq* : <digest>                     – Per-chunk hash (= content-store digest),
-//             │                                            in chunk-index order. These are the only
-//             │                                            chunk fields stored in the sidecar; all
-//             │                                            other chunk metadata comes from the index
-//             │                                            entry above.
-//             ├──extras                                  – Non-chunk byte ranges needed to reproduce
-//             │  ╘══*seq*                                – the original blob byte-for-byte.
-//             │     ├──offset : <varint>                 – Byte offset in original blob
-//             │     ├──length : <varint>                 – Byte length in original blob
-//             │     ├──kind   : <string>                 – "index"   – chunk-index payload bytes
-//             │     │                                      "frame"   – zstd skippable-frame header
-//             │     │                                      "padding" – zero-alignment padding
-//             │     │                                      "hole"    – arbitrary inter-chunk gap
-//             │     ├──digest : <digest>                 – sha256(zstd(extra bytes)); absent when
-//             │     │                                      the extra is stored inline
-//             │     └──inline : <binary>                 – zstd-compressed payload; absent when
-//             │                                            digest is set (content-store entry used)
-//             └──labels                                  – Mutable operator labels
-//                ╘══*key* : <string>                     – Label value
+// Schema (shares the top-level "v1" bucket with core/metadata)
+// └──v1                              – shared schema-version bucket
+//    ├──indexed-content              – indexed-content config (not a ns)
+//    │  └──version : <varint>        – indexed-content schema version
+//    ╘══*namespace*                  – shared with core metadata namespaces
+//       ╘══indexed-content           – indexed-content data for this ns
+//          ╘══blobs
+//             ╘══*blob digest*
+//                ├──createdat : <binary time>
+//                ├──updatedat : <binary time>
+//                ├──size      : <varint>
+//                ├──mediatype : <string>
+//                ├──provider  : <string>
+//                ├──index     : <digest>   – content-store digest of the
+//                │                           chunk-index payload entry;
+//                │                           parse it to get chunk offsets,
+//                │                           lengths, per-chunk hashes, etc.
+//                ├──chunks              – GC reachability: per-chunk digests
+//                │  ╘══*seq* : <digest> – per-chunk hash in index order
+//                ├──extras              – non-chunk byte ranges for
+//                │  ╘══*seq*              byte-exact blob reproduction
+//                │     ├──offset : <varint>
+//                │     ├──length : <varint>
+//                │     ├──kind   : <string>  "index"|"frame"|"padding"|"hole"
+//                │     ├──digest : <digest>  absent when inline is set
+//                │     └──inline : <binary>  absent when digest is set
+//                └──labels
+//                   ╘══*key* : <string>
 package local
 
 import (
@@ -87,17 +75,24 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// Top-level schema version bucket and minor-version key.
+// Top-level schema version bucket, indexed-content config bucket, and
+// minor-version key.  The "v1" bucket is shared with core/metadata; the
+// "indexed-content" sub-bucket under it is owned exclusively by this package.
 const (
 	schemaVersion = "v1"
 	dbVersion     = 1
 )
 
 var (
-	bucketKeyVersion   = []byte(schemaVersion)
-	bucketKeyDBVersion = []byte("version")
+	// bucketKeyVersion is the shared top-level "v1" bucket, same as core/metadata.
+	bucketKeyVersion = []byte(schemaVersion)
+	// bucketKeyIndexedContent scopes all indexed-content data within "v1",
+	// both the config entry ("v1/indexed-content/version") and the per-namespace
+	// data ("v1/<ns>/indexed-content/blobs/...").
+	bucketKeyIndexedContent = []byte("indexed-content")
+	bucketKeyDBVersion      = []byte("version")
 
-	// Object-type buckets
+	// Object-type buckets (all nested under "v1/<ns>/indexed-content/")
 	bucketKeyObjectBlobs  = []byte("blobs")
 	bucketKeyObjectChunks = []byte("chunks")
 	bucketKeyObjectExtras = []byte("extras")
@@ -122,24 +117,32 @@ var (
 // ── Blob bucket helpers ───────────────────────────────────────────────────────
 
 // getBlobsBucket returns the blobs bucket for ns, or nil if absent.
+// Path: v1/<ns>/indexed-content/blobs
 func getBlobsBucket(tx *bolt.Tx, ns string) *bolt.Bucket {
-	return getBucket(tx, bucketKeyVersion, []byte(ns), bucketKeyObjectBlobs)
+	return getBucket(tx,
+		bucketKeyVersion, []byte(ns),
+		bucketKeyIndexedContent, bucketKeyObjectBlobs)
 }
 
 // createBlobsBucket creates (or opens) the blobs bucket for ns.
 func createBlobsBucket(tx *bolt.Tx, ns string) (*bolt.Bucket, error) {
-	return createBucketIfNotExists(tx, bucketKeyVersion, []byte(ns), bucketKeyObjectBlobs)
+	return createBucketIfNotExists(tx,
+		bucketKeyVersion, []byte(ns),
+		bucketKeyIndexedContent, bucketKeyObjectBlobs)
 }
 
 // getBlobBucket returns the per-blob bucket for dgst in ns, or nil if absent.
 func getBlobBucket(tx *bolt.Tx, ns string, dgst digest.Digest) *bolt.Bucket {
-	return getBucket(tx, bucketKeyVersion, []byte(ns), bucketKeyObjectBlobs, []byte(dgst))
+	return getBucket(tx,
+		bucketKeyVersion, []byte(ns),
+		bucketKeyIndexedContent, bucketKeyObjectBlobs, []byte(dgst))
 }
 
 // createBlobBucket creates (or opens) the per-blob bucket for dgst in ns.
 func createBlobBucket(tx *bolt.Tx, ns string, dgst digest.Digest) (*bolt.Bucket, error) {
 	return createBucketIfNotExists(tx,
-		bucketKeyVersion, []byte(ns), bucketKeyObjectBlobs, []byte(dgst))
+		bucketKeyVersion, []byte(ns),
+		bucketKeyIndexedContent, bucketKeyObjectBlobs, []byte(dgst))
 }
 
 // ── Sub-bucket helpers (operate on an already-opened blob bucket) ─────────────

@@ -19,6 +19,12 @@
 package diff
 
 var defaultDifferConfig = &config{
-	Order:  []string{"walking"},
+	// EROFS differ must precede walking: it handles native EROFS layers
+	// (application/vnd.erofs[+zstd]) via direct decompress+copy, and also
+	// handles tar layers via ConvertTarErofs. Without this ordering, the
+	// walking differ receives EROFS blobs and mis-handles them as tar streams.
+	// The EROFS differ returns ErrNotImplemented for truly unsupported types
+	// so the walking differ still handles non-EROFS cases on plain overlayfs.
+	Order:  []string{"erofs", "walking"},
 	SyncFs: false,
 }

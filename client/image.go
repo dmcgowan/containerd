@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"sync"
 
+	"golang.org/x/sync/semaphore"
+
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
@@ -36,7 +38,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"golang.org/x/sync/semaphore"
 )
 
 // Image describes an image used by containers
@@ -261,6 +262,11 @@ type UnpackConfig struct {
 	DuplicationSuppressor kmutex.KeyedLocker
 	// Limiter is used to limit concurrent unpacks
 	Limiter *semaphore.Weighted
+	// Applier overrides the default diff service for layer application.
+	// When set, this applier is used instead of the client's DiffService().
+	// Use this to select a specific differ (e.g. the EROFS differ for EROFS
+	// images) rather than the global default (walking differ on Linux).
+	Applier diff.Applier
 }
 
 // UnpackOpt provides configuration for unpack
@@ -298,6 +304,17 @@ func WithUnpackLimiter(limiter *semaphore.Weighted) UnpackOpt {
 	}
 }
 
+// WithUnpackApplier overrides the diff applier used during unpack.
+// The default is the client's DiffService() which uses the walking differ on
+// Linux. Use this to select a specific differ — for example, pass the EROFS
+// differ when unpacking images with application/vnd.erofs[+zstd] layers.
+func WithUnpackApplier(a diff.Applier) UnpackOpt {
+	return func(ctx context.Context, uc *UnpackConfig) error {
+		uc.Applier = a
+		return nil
+	}
+}
+
 func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...UnpackOpt) error {
 	ctx, done, err := i.client.WithLease(ctx)
 	if err != nil {
@@ -323,12 +340,16 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 	}
 
 	var (
-		a  = i.client.DiffService()
-		cs = i.client.ContentStore()
+		a  diff.Applier = i.client.DiffService()
+		cs              = i.client.ContentStore()
 
 		chain    []digest.Digest
 		unpacked bool
 	)
+	// Use caller-provided applier when set.
+	if config.Applier != nil {
+		a = config.Applier
+	}
 	snapshotterName, err = i.client.resolveSnapshotterName(ctx, snapshotterName)
 	if err != nil {
 		return err
@@ -342,6 +363,11 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		config.CheckPlatformSupported); err != nil {
 		return err
 	}
+
+	// Note: when "erofs" is in the diff service's Order (service_unix.go),
+	// the gRPC diff service will automatically dispatch EROFS layers to the
+	// EROFS differ (which decompresses zstd+EROFS blobs directly) and fall
+	// through to the walking differ for traditional tar layers.
 
 	for _, layer := range layers {
 		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
@@ -446,6 +472,8 @@ func (i *image) checkSnapshotterSupport(ctx context.Context, snapshotterName str
 func (i *image) ContentStore() content.Store {
 	return i.client.ContentStore()
 }
+
+
 
 func (i *image) Platform() platforms.MatchComparer {
 	return i.platform

@@ -63,7 +63,15 @@ func init() {
 		ID:     "erofs",
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
-			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
+			// Advertise the standard local platform and also the EROFS-featured
+		// variant so that images with os.features=["erofs"] are accepted by
+		// client.checkSnapshotterSupport and the transfer service platform
+		// matching logic.
+		localSpec := platforms.DefaultSpec()
+		ic.Meta.Platforms = append(ic.Meta.Platforms, localSpec)
+		erofsSpec := localSpec
+		erofsSpec.OSFeatures = append(append([]string{}, localSpec.OSFeatures...), "erofs")
+		ic.Meta.Platforms = append(ic.Meta.Platforms, erofsSpec)
 
 			config, ok := ic.Config.(*Config)
 			if !ok {

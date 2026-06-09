@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
@@ -33,6 +34,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsverity"
 	"github.com/containerd/containerd/v2/internal/userns"
+	blockplugin "github.com/containerd/containerd/v2/plugins/mount/block"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance
@@ -212,17 +214,73 @@ func (s *snapshotter) layerBlobPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "layer.erofs")
 }
 
+// layerIndexedPath returns the path for the lazy-ingest marker file.
+// When this file exists the snapshot was applied in lazy mode; the file
+// contains the blob digest that the mount manager's block handler uses.
+func (s *snapshotter) layerIndexedPath(id string) string {
+	return filepath.Join(s.root, "snapshots", id, "layer.indexed")
+}
+
+// readLayerIndexed returns the blob digest stored in the layer.indexed marker,
+// or ("", false) if the marker does not exist.
+func (s *snapshotter) readLayerIndexed(id string) (string, bool) {
+	data, err := os.ReadFile(s.layerIndexedPath(id))
+	if err != nil {
+		return "", false
+	}
+	dgst := strings.TrimSpace(string(data))
+	if dgst == "" {
+		return "", false
+	}
+	return dgst, true
+}
+
 func (s *snapshotter) fsMetaPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "fsmeta.erofs")
 }
 
+// rawDevicePath returns the path for a raw device blob stored inside a
+// snapshot directory.  index is the device slot (0-based position of the
+// device-role layer in the contiguous run of role=device layers preceding
+// the consuming EROFS metadata layer).
+//
+// Raw device blobs are produced for any layer carrying the descriptor
+// annotation org.erofs.role=device (erofs-image-spec §7, §10.2).  The
+// blob is the decompressed payload of the source layer (tar+zstd,
+// octet-stream, …) and the snapshotter passes its path to the
+// consuming EROFS mount via the device= option.
+func (s *snapshotter) rawDevicePath(id string, index int) string {
+	return filepath.Join(s.root, "snapshots", id, fmt.Sprintf("device.%d.raw", index))
+}
+
+// collectRawDevices returns the paths to all device.*.raw files in the
+// snapshot directory for id, in ascending index order.  The returned slice
+// is empty when no raw devices are present.
+func (s *snapshotter) collectRawDevices(id string) []string {
+	var devs []string
+	for i := 0; ; i++ {
+		p := s.rawDevicePath(id, i)
+		if _, err := os.Stat(p); err != nil {
+			break
+		}
+		devs = append(devs, p)
+	}
+	return devs
+}
+
 func (s *snapshotter) lowerPath(id string) (string, error) {
 	layerBlob := s.layerBlobPath(id)
-	if _, err := os.Stat(layerBlob); err != nil {
-		return "", fmt.Errorf("failed to find valid erofs layer blob: %w", err)
+	if _, err := os.Stat(layerBlob); err == nil {
+		return layerBlob, nil
 	}
-
-	return layerBlob, nil
+	// Also accept a layer that was lazily ingested (no layer.erofs file present).
+	if _, ok := s.readLayerIndexed(id); ok {
+		// Return a sentinel so callers know a blob path is available
+		// indirectly. Callers that need the actual path call
+		// readLayerIndexed directly.
+		return s.layerIndexedPath(id), nil
+	}
+	return "", fmt.Errorf("failed to find valid erofs layer blob or lazy index for snapshot %s", id)
 }
 
 func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
@@ -261,9 +319,21 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 		Type:    "erofs",
 		Options: []string{"ro", "loop"},
 	}
+	// Add all preceding layers as data devices.  Traverse from bottom (oldest)
+	// ancestor to the specified id so that device IDs match layers[] order.
+	// A parent contributes either its layer.erofs file (regular EROFS layer)
+	// or its device.*.raw files (any layer carrying org.erofs.role=device —
+	// see erofs-image-spec §7 and §10.2) as device= options.
 	for j := len(snap.ParentIDs) - 1; j >= id; j-- {
-		path := s.layerBlobPath(snap.ParentIDs[j])
-		m.Options = append(m.Options, "device="+path)
+		pid := snap.ParentIDs[j]
+		rawDevs := s.collectRawDevices(pid)
+		if len(rawDevs) > 0 {
+			for _, db := range rawDevs {
+				m.Options = append(m.Options, "device="+db)
+			}
+		} else {
+			m.Options = append(m.Options, "device="+s.layerBlobPath(pid))
+		}
 	}
 	return m, true
 }
@@ -308,13 +378,21 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 
 // createErofsMount creates a mount specification for an EROFS layer.
 // Applies dmverityMode policy and passes it to the mount handler.
-func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
+// extraDevices are optional paths to additional files that are supplied as
+// EROFS data devices via device= mount options.  Sources include
+// device.<N>.raw blobs in the snapshot tree, produced from layers
+// carrying the org.erofs.role=device annotation.
+func (s *snapshotter) createErofsMount(layerBlob string, extraDevices ...string) (mount.Mount, error) {
 	options := []string{"ro", "loop"}
 
 	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
 		return mount.Mount{}, err
 	} else if dmverityOpt != "" {
 		options = append(options, dmverityOpt)
+	}
+
+	for _, db := range extraDevices {
+		options = append(options, "device="+db)
 	}
 
 	return mount.Mount{
@@ -328,6 +406,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	var options []string
 
 	if len(snap.ParentIDs) == 0 {
+		// Check for a lazy-ingest blob (layer.indexed marker).
+		if blobDigest, ok := s.readLayerIndexed(snap.ID); ok {
+			if snap.Kind != snapshots.KindView {
+				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot")
+			}
+			// Return a block mount; the mount manager's block handler will
+			// attach the cache, fill all chunks, and mount EROFS over loop.
+			return []mount.Mount{blockplugin.NewBlockMount(blobDigest)}, nil
+		}
 		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
 			if snap.Kind != snapshots.KindView {
 				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
@@ -337,7 +424,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 					return nil, err
 				}
 			}
-			m, err := s.createErofsMount(layerBlob)
+			// Include any role=device blobs stored alongside this snapshot.
+			rawDevs := s.collectRawDevices(snap.ID)
+			m, err := s.createErofsMount(layerBlob, rawDevs...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 			}
@@ -423,7 +512,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		if err != nil {
 			return nil, err
 		}
-		m, err := s.createErofsMount(layerBlob)
+		// Attach any role=device blobs stored alongside this parent.
+		rawDevs := s.collectRawDevices(snap.ParentIDs[0])
+		m, err := s.createErofsMount(layerBlob, rawDevs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 		}
@@ -445,7 +536,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 			return nil, err
 		}
 
-		m, err := s.createErofsMount(layerBlob)
+		// Attach role=device blobs for this parent snapshot.
+		rawDevs := s.collectRawDevices(snap.ParentIDs[i])
+		m, err := s.createErofsMount(layerBlob, rawDevs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount for parent %s: %w", snap.ParentIDs[i], err)
 		}

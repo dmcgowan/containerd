@@ -77,21 +77,53 @@ the converted manifests are appended after them in a new OCI image index.
 			Name:  "erofs-mkfs-options",
 			Usage: "Extra mkfs options applied when converting EROFS layers. (e.g. '-Efragments,dedupe')",
 		},
-		// index-append flag: keeps originals, adds EROFS variants
+		// split-data flags
 		&cli.BoolFlag{
-			Name: "append-to-index",
-			Usage: "Build a dual-format OCI image index that contains both the original " +
-				"manifests and the converted ones. Original (tar-based) manifests are " +
-				"listed first for backward compatibility; converted EROFS manifests " +
-				"follow with os.features=[\"erofs\"] on each platform descriptor. " +
-				"Non-EROFS-aware runtimes automatically pick the first matching manifest. " +
-				"Use with --erofs-chunked (or --erofs zstd).",
+			Name: "erofs-split-data",
+			Usage: "Convert each layer into a pair of regular EROFS layers laid out for " +
+			"cross-image deduplication (erofs-image-spec §9.1): " +
+			"(1) a data-bearing EROFS layer holding file payloads in a " +
+			"content-hash-friendly order, and " +
+			"(2) a consuming EROFS layer whose inodes reference the data-bearing " +
+			"layer's blocks via multi-device addressing. " +
+			"Both outputs use the canonical application/vnd.erofs media type.",
+		},
+		&cli.IntFlag{
+			Name:  "erofs-split-inline-threshold",
+			Value: 4096,
+			Usage: "Files whose (inode + content) size is below this threshold stay inline " +
+				"in the metadata layer rather than going to the data layer (default: 4096 = one block).",
+		},
+		// dm-verity flag
+		&cli.BoolFlag{
+			Name: "erofs-dmverity",
+			Usage: "Append a dm-verity merkle tree to each EROFS layer (single-file " +
+				"dm-verity layout). Sets org.erofs.dmverity.* annotations on the " +
+				"layer descriptor. Requires veritysetup(8) to be installed.",
+		},
+		// merge flag: collapse all layers into a single merged EROFS layer
+		&cli.BoolFlag{
+			Name: "erofs-merge",
+			Usage: "Collapse all image layers into a single merged EROFS layer " +
+				"(application/vnd.erofs+zstd). Whiteouts and deletions are " +
+				"resolved so the output represents the final filesystem state. " +
+				"Must be combined with --erofs zstd.",
+		},
+		// EROFS conversions append to the image index by default, keeping the
+		// original tar-based manifests first for backward compatibility.
+		// Use --erofs-replace to replace the index instead.
+		&cli.BoolFlag{
+			Name: "erofs-replace",
+			Usage: "Replace the entire image index with the EROFS-only result. " +
+				"By default EROFS conversions produce a dual-format index: " +
+				"original (tar-based) manifests first, EROFS manifests appended. " +
+				"Non-EROFS-aware runtimes transparently fall back to the tar variant.",
 		},
 		// erofs chunked index flags
 		&cli.BoolFlag{
 			Name: "erofs-chunked",
 			Usage: "Convert layers to EROFS chunked+zstd format with an appended chunk index " +
-				"(application/vnd.erofs.layer.v1+zstd with org.erofs.index.* annotations). " +
+				"(application/vnd.erofs+zstd with org.erofs.chunk-index.* annotations). " +
 				"Produces a blob compatible with the EROFS image spec for lazy loading. " +
 				"The whole blob is stored in the content store so it can be exported and pushed. " +
 				"Use --erofs-chunk-size to control the uncompressed chunk size (default 4 MiB).",
@@ -111,6 +143,12 @@ the converted manifests are appended after them in a new OCI image index.
 			Name:  "all-platforms",
 			Usage: "Exports content from all platforms",
 		},
+		// concurrency flag
+		&cli.IntFlag{
+			Name:  "parallelism",
+			Value: 0,
+			Usage: "Maximum number of manifests to convert concurrently (0 = unbounded)",
+		},
 	},
 	Action: func(cliContext *cli.Context) error {
 		var convertOpts []converter.Opt
@@ -120,6 +158,20 @@ the converted manifests are appended after them in a new OCI image index.
 			return errors.New("src and target image need to be specified")
 		}
 
+		// Wire --parallelism.
+		if p := cliContext.Int("parallelism"); p > 0 {
+			convertOpts = append(convertOpts, converter.WithParallelism(p))
+		}
+
+		// Determine whether this is an EROFS conversion. EROFS conversions
+		// default to all platforms (non-Linux are skipped automatically by the
+		// converter's OS guard); other conversions default to the local platform.
+		// Exception: --erofs-replace with --erofs-merge and no explicit --platform
+		// defaults to the local platform only — merging all platforms concurrently
+		// is memory-intensive and replace mode is typically used for single-platform
+		// images. Use --all-platforms or --platform to override.
+		isEROFS := cliContext.IsSet("erofs") || cliContext.Bool("erofs-split-data")
+		isMergeReplace := cliContext.IsSet("erofs") && cliContext.Bool("erofs-merge") && cliContext.Bool("erofs-replace")
 		if !cliContext.Bool("all-platforms") {
 			if pss := cliContext.StringSlice("platform"); len(pss) > 0 {
 				all, err := platforms.ParseAll(pss)
@@ -127,13 +179,46 @@ the converted manifests are appended after them in a new OCI image index.
 					return err
 				}
 				convertOpts = append(convertOpts, converter.WithPlatform(platforms.Ordered(all...)))
-			} else {
+			} else if !isEROFS || isMergeReplace {
+				// Non-EROFS and merge-replace default to the local platform only.
 				convertOpts = append(convertOpts, converter.WithPlatform(platforms.DefaultStrict()))
 			}
+			// EROFS append/non-replace with no explicit --platform: no restriction;
+			// converter.Convert defaults to platforms.All, and convertManifest
+			// skips non-Linux platforms automatically.
 		}
 
 		if cliContext.Bool("uncompress") {
 			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(uncompress.LayerConvertFunc))
+		}
+
+		if cliContext.Bool("erofs-split-data") {
+			threshold := cliContext.Int("erofs-split-inline-threshold")
+			var erofsOpts []erofs.ConvertOpt
+			if compressors := cliContext.String("erofs-compressors"); compressors != "" {
+				erofsOpts = append(erofsOpts, erofs.WithCompressors(compressors))
+			}
+			if mkfsOptsStr := cliContext.String("erofs-mkfs-options"); mkfsOptsStr != "" {
+				erofsOpts = append(erofsOpts, erofs.WithMkfsOptions(strings.Fields(mkfsOptsStr)))
+			}
+			convertOpts = append(convertOpts,
+				converter.WithMultiLayerConvertFunc(erofs.LayerConvertFuncSplitData(threshold, erofsOpts...)),
+				converter.WithUpdateManifest(erofs.UpdateManifestPlatform),
+			)
+			if !cliContext.Bool("erofs-replace") {
+				convertOpts = append(convertOpts, converter.WithAppendToIndex())
+			}
+			client, ctx, cancel, err := commands.NewClient(cliContext)
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			newImg, err := converter.Convert(ctx, client, targetRef, srcRef, convertOpts...)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cliContext.App.Writer, newImg.Target.Digest.String())
+			return nil
 		}
 
 		if cliContext.IsSet("erofs") {
@@ -152,19 +237,33 @@ the converted manifests are appended after them in a new OCI image index.
 				mkfsOpts := strings.Fields(mkfsOptsStr)
 				erofsOpts = append(erofsOpts, erofs.WithMkfsOptions(mkfsOpts))
 			}
-			convertOpts = append(convertOpts, converter.WithLayerConvertFunc(erofs.LayerConvertFunc(erofsOpts...)))
-			convertOpts = append(convertOpts, converter.WithUpdateManifest(erofs.UpdateManifestPlatform))
-			if cliContext.Bool("append-to-index") {
+			if cliContext.Bool("erofs-dmverity") {
+				erofsOpts = append(erofsOpts, erofs.WithDmVerity())
+			}
+			if cliContext.Bool("erofs-merge") {
+				// Merge mode: skip the per-layer pass entirely — MergeManifestFunc
+				// reads the original tar layers directly and builds the merged
+				// EROFS image from scratch. No intermediate per-layer EROFS blobs
+				// are written to the content store. convertManifest calls
+				// updateManifestFunc with (desc, desc) when modified==false, which
+				// is correct: MergeManifestFunc reads originalDesc for source layers.
+				convertOpts = append(convertOpts, converter.WithUpdateManifest(erofs.MergeManifestFunc(erofsOpts...)))
+			} else {
+				convertOpts = append(convertOpts, converter.WithLayerConvertFunc(erofs.LayerConvertFunc(erofsOpts...)))
+				convertOpts = append(convertOpts, converter.WithUpdateManifest(erofs.UpdateManifestPlatform))
+			}
+			// Default: keep original manifests first, append EROFS variants.
+			// Use --erofs-replace to produce an EROFS-only index.
+			if !cliContext.Bool("erofs-replace") {
 				convertOpts = append(convertOpts, converter.WithAppendToIndex())
 			}
 		}
 
 		if cliContext.Bool("erofs-chunked") {
-			// Create a temporary indexed content store sidecar backed by the
-			// daemon's content store.  The sidecar persists only for the
-			// lifetime of this ctr invocation; the whole blobs remain in the
-			// daemon's content store after ctr exits, so they can be exported
-			// or pushed normally.
+			// Create a temporary indexed content store backed by an ephemeral
+			// bolt.DB for the lifetime of this ctr invocation.  The whole blobs
+			// remain in the daemon's content store after ctr exits, so they can
+			// be exported or pushed normally.
 			//
 			// Operators who want persistent indexed store integration should
 			// use the daemon's "io.containerd.content.index.v1" plugin
@@ -206,7 +305,7 @@ the converted manifests are appended after them in a new OCI image index.
 				converter.WithLayerConvertFunc(erofs.LayerConvertFuncChunked(idxStore, chunkSize, erofsOpts...)),
 				converter.WithUpdateManifest(erofs.UpdateManifestPlatform),
 			)
-			if cliContext.Bool("append-to-index") {
+			if !cliContext.Bool("erofs-replace") {
 				convertOpts = append(convertOpts, converter.WithAppendToIndex())
 			}
 

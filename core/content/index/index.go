@@ -19,12 +19,12 @@
 // over their bytes.
 //
 // The indexed content store is a peer of the existing content store: it
-// reuses the content store as its byte-storage primitive but adds a sidecar
-// metadata database that records, for each indexed-content blob, the minimal
-// reachability metadata the GC needs plus the extras required for byte-exact
-// blob reproduction.
+// reuses the content store as its byte-storage primitive and records, for
+// each indexed-content blob, the minimal reachability metadata the GC needs
+// plus the extras required for byte-exact blob reproduction, in buckets
+// inside containerd's shared metadata BoltDB.
 //
-// Specifically the sidecar tracks:
+// Specifically the metadata record tracks:
 //
 //   - The content-store digest of the chunk-index entry (IndexDigest): opening
 //     this entry and parsing it yields all chunk offsets, lengths, on-blob
@@ -42,11 +42,11 @@
 //     the chunks, cover every byte of the original blob. Extras are stored
 //     either inline (zstd-compressed, when small) or as content-store entries
 //     (zstd-compressed, when large). Together, chunks + extras let the store
-//     reproduce the original blob byte-for-byte from the sidecar alone.
+//     reproduce the original blob byte-for-byte from the metadata record alone.
 //
 // dm-verity parameters (hash offset, root digest, block size) live on the
-// layer descriptor's org.erofs.dmverity.* annotations and are never duplicated
-// in the sidecar. Callers that need dm-verity information pass the descriptor.
+// layer descriptor's org.erofs.dmverity.* annotations and are not stored in
+// the metadata record. Callers that need dm-verity information pass the descriptor.
 //
 // This package defines the abstract interface only. A local implementation
 // is provided in the local/ subpackage and registered as the
@@ -59,6 +59,7 @@ package index
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -75,10 +76,13 @@ import (
 //     content.Writer; on Commit the store extracts the chunk-index entry
 //     and all chunks into the content store, identifies any extra byte
 //     ranges needed for exact reproduction, and records the sidecar record.
+//     Pass WriterOpt(WithLazyProvider(p)) to perform a lazy ingest: only
+//     the chunk-index section is fetched; chunk bytes are deferred.
 //   - Once an ingest is complete, Provider is used to read the blob
 //     (sequentially, by reassembling chunks + extras) or to obtain Mounts()
 //     specs.
 //   - Manager is used to inspect, list, label, and delete entries.
+//   - MissingChunks and FillChunk support the lazy-loading path.
 //
 // Cross-store references from core containerd objects (Image, Manifest,
 // Snapshot, Container, Active Mount) are annotation-only: a label of the
@@ -94,6 +98,41 @@ type Store interface {
 	Manager
 	Provider
 	Ingester
+	LazyProvider
+}
+
+// LazyProvider exposes the lazy-loading API over an indexed-content blob
+// whose chunk bytes may not yet be present in the content store.
+type LazyProvider interface {
+	// AllChunks returns all ChunkRefs for the blob in chunk-index order,
+	// regardless of whether each chunk's bytes are present in the content store.
+	// This gives the cache the full layout needed to build the sparse file.
+	AllChunks(ctx context.Context, dgst digest.Digest) ([]ChunkRef, error)
+
+	// MissingChunks returns the ChunkRefs whose bytes are not yet present
+	// in the content store, in chunk-index order. A nil or empty slice
+	// means the blob is fully hydrated.
+	//
+	// MissingChunks is cheap: it reads the ordered per-chunk digest list
+	// from the metadata record and probes the content store for each
+	// digest without opening the chunk-index entry.
+	MissingChunks(ctx context.Context, dgst digest.Digest) ([]ChunkRef, error)
+
+	// FillChunk fetches one chunk through provider p and writes its bytes
+	// to the content store under the chunk's per-chunk hash.
+	//
+	// priority is forwarded verbatim to p.Fetch. Use PriorityForeground for
+	// reads that have a waiting consumer, PriorityBackground for prefetch.
+	//
+	// Concurrent FillChunk calls for the same (dgst, chunkIdx) are
+	// coalesced: the second caller waits until the first call's
+	// content-store write is complete, then returns without issuing a
+	// second fetch.
+	//
+	// FillChunk verifies the fetched bytes against the chunk's per-chunk
+	// hash before writing to the content store; a mismatch returns an error
+	// and leaves the content-store entry absent.
+	FillChunk(ctx context.Context, dgst digest.Digest, chunkIdx int, p ByteProvider, priority Priority) error
 }
 
 // Manager provides methods for inspecting, listing, and removing
@@ -118,7 +157,7 @@ type Manager interface {
 // InfoProvider returns metadata for a stored entry.
 type InfoProvider interface {
 	// Info returns metadata about an indexed-content blob. The returned
-	// Info contains only what is stored in the sidecar (digest, size,
+	// Info contains only what is stored in the metadata record (digest, size,
 	// media type, IndexDigest, provider, labels, timestamps). Chunk
 	// offsets and lengths are not included; open and parse the chunk-index
 	// content-store entry (keyed by IndexDigest) to get them.
@@ -165,7 +204,7 @@ type Ingester interface {
 	//   5. Identifies extra byte ranges (skippable-frame headers, padding,
 	//      the chunk-index payload itself) that are needed for byte-exact
 	//      reproduction; stores them compressed, inline when small.
-	//   6. Records the sidecar entry: IndexDigest, ordered chunk-digest
+	//   6. Records the metadata entry: IndexDigest, ordered chunk-digest
 	//      list, and extras list.
 	//
 	// Writer requires that the descriptor:
@@ -175,29 +214,60 @@ type Ingester interface {
 	Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error)
 }
 
+// Priority indicates the urgency of a chunk fetch issued by FillChunk or
+// passed to ByteProvider.Fetch.
+type Priority int
+
+const (
+	// PriorityForeground is used when a consumer goroutine is blocked
+	// waiting for the chunk. Foreground requests are always dispatched
+	// ahead of background requests.
+	PriorityForeground Priority = iota
+
+	// PriorityBackground is used for speculative prefetch. Background
+	// requests fill remaining provider concurrency slots after all
+	// pending foreground requests are served.
+	PriorityBackground
+)
+
 // ByteProvider sources the bytes of an indexed-content blob from a
 // non-local location (registry, cloud volume, peer-to-peer source).
 // Providers are registered as "io.containerd.content.index.provider.v1"
 // plugins.
 //
-// Providers do not cache: their job is to expose a ReaderAt over a blob
-// the store can use to drive ingest or to lazily fetch missing chunks.
-// Caching, hash verification, and chunk extraction are handled by the
-// indexed content store itself.
+// Providers do not cache: their job is to expose bytes the store can use to
+// drive ingest or to lazily fetch missing chunks. Caching, hash verification,
+// and chunk extraction are handled by the indexed content store itself.
 type ByteProvider interface {
 	// Name returns a stable identifier used in operator-visible records
 	// (Info.Provider) and in plugin registration logs.
 	Name() string
 
 	// Open returns a ReaderAt over the bytes of the named blob, plus the
-	// blob's total size. Returns errdefs.ErrNotFound if the provider does
-	// not know how to source the blob.
+	// blob's total size. Used for eager (pull-then-run) ingest.
+	// Returns errdefs.ErrNotFound if the provider does not know how to
+	// source the blob.
 	Open(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error)
+
+	// Fetch returns the raw on-blob bytes for chunk c of blob desc.
+	//
+	// The returned ReadCloser yields exactly the bytes in the half-open
+	// interval [c.OnBlobStart, c.OnBlobEnd) of the original blob — the
+	// compressed zstd frame for +zstd layers, or the raw bytes for raw
+	// layers. The caller decompresses and verifies the returned bytes
+	// before writing them to the content store.
+	//
+	// priority governs queue ordering: PriorityForeground requests bypass
+	// any background prefetch queue and are dispatched immediately within
+	// the concurrency budget.
+	//
+	// Implementations MUST honour ctx cancellation and return promptly.
+	Fetch(ctx context.Context, desc ocispec.Descriptor, chunk ChunkRef, priority Priority) (io.ReadCloser, error)
 }
 
-// Info holds the sidecar metadata for an indexed-content blob.
+// Info holds the metadata record for an indexed-content blob.
 //
-// Only what is stored in the sidecar is surfaced here. Chunk offsets,
+// Only what is stored in the metadata record is surfaced here. Chunk offsets,
 // lengths, on-blob ranges, weights, and dm-verity parameters are NOT
 // included. To access them:
 //
@@ -239,7 +309,7 @@ type Info struct {
 
 // ChunkRef identifies a parsed chunk from the chunk-index entry. It is
 // returned by callers that open and parse the chunk-index content-store
-// entry; it is not stored in the sidecar.
+// entry; it is not stored in the metadata record.
 type ChunkRef struct {
 	// Digest is the chunk's content-store digest, equal to the chunk's
 	// per-chunk checksum from the chunk index. Two blobs that share a
@@ -267,7 +337,7 @@ type ChunkRef struct {
 // DmVerityInfo carries the dm-verity merkle tree parameters per
 // erofs-image-spec §7. This type is provided for callers that need to
 // parse dm-verity annotations from a descriptor; it is NOT stored in the
-// sidecar. Use parseDmVerity (in local/erofs_index.go) to populate it
+// the metadata record. Use parseDmVerity (in local/erofs_index.go) to populate it
 // from a descriptor's org.erofs.dmverity.* annotations.
 type DmVerityInfo struct {
 	// RootDigest is the merkle tree's root digest.

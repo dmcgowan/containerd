@@ -19,6 +19,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/metadata"
@@ -42,20 +43,19 @@ import (
 // ActiveWithBackRefs. For every active indexed-content blob the method emits
 // back-reference edges from the blob node to each content-store entry it owns:
 //
-//   - The chunk-index entry                    (blobs/*blob*/index)
-//   - Every per-chunk entry                    (blobs/*blob*/chunks/*)
-//   - Every non-inline extra entry             (blobs/*blob*/extras/*/digest)
+//   - The chunk-index entry                    (indexed-content/blobs/*blob*/index)
+//   - Every per-chunk entry                    (indexed-content/blobs/*blob*/chunks/*)
+//   - Every non-inline extra entry             (indexed-content/blobs/*blob*/extras/*/digest)
 //
 // When the core GC traversal reaches a reachable ResourceContentIndex node, it
 // follows these back-references to the corresponding ResourceContent nodes,
 // keeping those content-store entries alive as long as the blob is reachable.
-// Inline extras live entirely within the sidecar record and therefore need no
-// content-store pinning.
+// Inline extras have no content-store entry to pin.
 //
 // # Lifecycle
 //
 // When containerd's GC marks a blob unreachable (Remove is called), the blob's
-// sidecar record is deleted in Finish().  The chunks it referenced become
+// metadata record is deleted in Finish().  The chunks it referenced become
 // unreferenced in the content store and are collected by the next
 // content-store GC pass, subject to whether any other indexed-content blob
 // still lists the same digest.
@@ -71,45 +71,101 @@ func (c *collector) ReferenceLabel() string {
 	return contentindex.GCRefLabel
 }
 
+// StartCollection opens a stable read view of the indexed-content metadata
+// buckets for the duration of the GC pass.
+//
+// Because the Transactor interface exposes only View/Update callbacks (not a
+// raw Begin), the read transaction is held open by a background goroutine that
+// blocks inside a db.View call.  The goroutine is unblocked when Cancel or
+// Finish signals via the txDone channel.
 func (c *collector) StartCollection(ctx context.Context) (metadata.CollectionContext, error) {
-	tx, err := c.store.db.Begin(false)
-	if err != nil {
-		return nil, fmt.Errorf("content/index: open gc tx: %w", err)
+	type openResult struct {
+		coll *collection
+		err  error
 	}
-	return &collection{
-		store: c.store,
-		tx:    tx,
-	}, nil
+	ch := make(chan openResult, 1)
+
+	coll := &collection{
+		store:  c.store,
+		ctx:    ctx,
+		txDone: make(chan struct{}),
+	}
+
+	go func() {
+		viewErr := c.store.db.View(func(tx *bolt.Tx) error {
+			coll.tx = tx
+			ch <- openResult{coll: coll}
+			<-coll.txDone // block until Cancel/Finish releases us
+			return nil
+		})
+		// db.View failed before the callback could send to ch.
+		if viewErr != nil {
+			select {
+			case ch <- openResult{err: viewErr}:
+			default:
+			}
+		}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("content/index: open gc view tx: %w", r.err)
+		}
+		return r.coll, nil
+	case <-ctx.Done():
+		coll.releaseTx()
+		return nil, ctx.Err()
+	}
 }
 
 // collection implements metadata.CollectionContext (and the unexported
 // metadata.collectionWithBackRefs interface) for a single GC pass.
 //
-// The read transaction opened in StartCollection is used for All/Active.
+// The read transaction opened in StartCollection is used by All/ActiveWithBackRefs.
 // Removals are collected in memory; actual deletes happen in Finish under a
-// fresh write transaction so that Cancel can roll back cheaply.
+// fresh write transaction so that Cancel can abandon cheaply.
 type collection struct {
-	store   *Store
-	tx      *bolt.Tx  // read-only; held for the GC pass duration
-	removed []gc.Node
+	store     *Store
+	ctx       context.Context // stored from StartCollection
+	tx        *bolt.Tx        // read-only; held for the GC pass duration
+	txDone    chan struct{}
+	closeOnce sync.Once
+	removed   []gc.Node
+}
+
+// releaseTx signals the goroutine holding the view transaction to return,
+// releasing the read lock.  Safe to call more than once.
+func (c *collection) releaseTx() {
+	c.closeOnce.Do(func() { close(c.txDone) })
 }
 
 // All enumerates every indexed-content blob in every namespace so the core GC
 // can determine which are reachable via annotations and which are orphaned.
+//
+// It walks v1/<ns>/indexed-content/blobs, skipping any non-namespace entry
+// at the v1 level (e.g. the "indexed-content" config bucket or the "version"
+// plain-key entry written by core/metadata).
 func (c *collection) All(fn func(gc.Node)) {
 	v := c.tx.Bucket(bucketKeyVersion)
 	if v == nil {
 		return
 	}
 	_ = v.ForEach(func(nsKey, val []byte) error {
-		if val != nil {
-			return nil // skip plain k/v (e.g. the "version" key)
+		// Skip plain k/v entries (e.g. core/metadata's "version" key)
+		// and the "indexed-content" config bucket itself.
+		if val != nil || string(nsKey) == string(bucketKeyIndexedContent) {
+			return nil
 		}
 		nb := v.Bucket(nsKey)
 		if nb == nil {
 			return nil
 		}
-		bb := nb.Bucket(bucketKeyObjectBlobs)
+		icBkt := nb.Bucket(bucketKeyIndexedContent)
+		if icBkt == nil {
+			return nil
+		}
+		bb := icBkt.Bucket(bucketKeyObjectBlobs)
 		if bb == nil {
 			return nil
 		}
@@ -162,7 +218,7 @@ func (c *collection) Active(_ string, _ func(gc.Node)) {}
 // reachable.  Inline extras are omitted because they have no content-store
 // entry to pin.
 func (c *collection) ActiveWithBackRefs(ns string, _ func(gc.Node), bref func(gc.Node, gc.Node)) {
-	bb := getBlobsBucket(c.tx, ns)
+	bb := getBlobsBucket(c.tx, ns) // v1/<ns>/indexed-content/blobs
 	if bb == nil {
 		return
 	}
@@ -240,26 +296,21 @@ func (c *collection) Remove(n gc.Node) {
 	c.removed = append(c.removed, n)
 }
 
+// Cancel releases the read transaction without applying any removals.
 func (c *collection) Cancel() error {
-	if c.tx != nil {
-		err := c.tx.Rollback()
-		c.tx = nil
-		return err
-	}
+	c.releaseTx()
 	return nil
 }
 
-// Finish closes the read transaction and deletes any blobs queued by Remove
-// in a single write transaction.
+// Finish releases the read transaction and then deletes any blobs queued by
+// Remove in a separate write transaction.  The read tx is released first so
+// the write transaction does not contend with it.
 func (c *collection) Finish() error {
-	if c.tx != nil {
-		_ = c.tx.Rollback()
-		c.tx = nil
-	}
+	c.releaseTx()
 	if len(c.removed) == 0 {
 		return nil
 	}
-	return c.store.db.Update(func(tx *bolt.Tx) error {
+	return update(c.ctx, c.store.db, func(tx *bolt.Tx) error {
 		for _, n := range c.removed {
 			if n.Type != metadata.ResourceContentIndex {
 				continue
@@ -276,7 +327,8 @@ func (c *collection) Finish() error {
 				continue
 			}
 			if err := bb.DeleteBucket([]byte(dgst)); err != nil {
-				return fmt.Errorf("content/index: gc remove %s/%s: %w", n.Namespace, n.Key, err)
+				return fmt.Errorf("content/index: gc remove %s/%s: %w",
+					n.Namespace, n.Key, err)
 			}
 		}
 		return nil

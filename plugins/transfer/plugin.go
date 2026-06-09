@@ -19,6 +19,7 @@ package transfer
 import (
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -247,10 +248,21 @@ type unpackConfiguration struct {
 }
 
 func defaultConfig() *transferConfig {
+	// Default to all available CPUs for concurrent unpacks. EROFS layers
+	// require full decompression (zstd → raw EROFS image) before the kernel
+	// can mount them; running decompression in parallel across layers
+	// significantly reduces total unpack time for multi-layer images.
+	// Each concurrent unpack uses ~2× the uncompressed layer size in memory
+	// (read buffer + write buffer), so cap at NumCPU to avoid OOM on small
+	// machines while still getting full parallelism on typical servers.
+	maxUnpacks := runtime.NumCPU()
+	if maxUnpacks < 2 {
+		maxUnpacks = 2
+	}
 	return &transferConfig{
 		MaxConcurrentDownloads:      3,
 		MaxConcurrentUploadedLayers: 3,
-		MaxConcurrentUnpacks:        1,
+		MaxConcurrentUnpacks:        maxUnpacks,
 		CheckPlatformSupported:      false,
 	}
 }

@@ -29,7 +29,7 @@ import (
 )
 
 // ContentAdapter implements content.Store by delegating to an indexed content
-// store for blobs that carry org.erofs.index.* annotations, and to the regular
+// store for blobs that carry org.erofs.chunk-index.* annotations, and to the regular
 // content store for everything else.
 //
 // This allows the erofs differ and other consumers that accept a content.Store
@@ -56,7 +56,7 @@ func NewContentAdapter(idxStore contentindex.Store, cs content.Store) *ContentAd
 }
 
 // ReaderAt returns a content.ReaderAt for desc.  If desc carries
-// org.erofs.index.range annotations and is known to the indexed store, the
+// org.erofs.chunk-index.range annotations and is known to the indexed store, the
 // assembled reader (reassembles the blob byte-for-byte from chunks + extras)
 // is returned.  Otherwise the regular content store's ReaderAt is used.
 func (a *ContentAdapter) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
@@ -79,7 +79,7 @@ func hasIndexAnnotation(desc ocispec.Descriptor) bool {
 	if desc.Annotations == nil {
 		return false
 	}
-	_, ok := desc.Annotations[contentindex.AnnotationIndexRange]
+	_, ok := desc.Annotations[contentindex.AnnotationChunkIndexRange]
 	return ok
 }
 

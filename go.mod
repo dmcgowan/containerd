@@ -13,7 +13,7 @@ require (
 	github.com/containerd/cgroups/v3 v3.1.3
 	github.com/containerd/console v1.0.5
 	github.com/containerd/containerd/api v1.11.0
-	github.com/containerd/continuity v0.5.0
+	github.com/containerd/continuity v0.4.6-0.20260602070455-57676842cd80
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/fifo v1.1.0
@@ -37,7 +37,7 @@ require (
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c
 	github.com/docker/go-metrics v0.0.1
 	github.com/docker/go-units v0.5.0
-	github.com/erofs/go-erofs v0.3.0
+	github.com/erofs/go-erofs v0.3.1-0.20260531080512-069dc32d83e6
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/certtostore v1.0.6
 	github.com/google/go-cmp v0.7.0
@@ -78,7 +78,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.43.0
 	golang.org/x/mod v0.35.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.44.0
+	golang.org/x/term v0.43.0
 	golang.org/x/time v0.15.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260406210006-6f92a3bedf2d
 	google.golang.org/grpc v1.80.0
@@ -151,7 +152,6 @@ require (
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect

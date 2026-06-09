@@ -59,11 +59,7 @@ func TestRoundTrip_ConvertPushPullUnpack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idxStore, err := NewStore(Config{Root: t.TempDir(), Content: cs})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { idxStore.Close() })
+	idxStore := newTestStore(t, cs)
 
 	// ── Step 1: Build the chunked blob ────────────────────────────────────
 	// Simulate "image data" as random bytes (would normally be an EROFS image).
@@ -83,7 +79,7 @@ func TestRoundTrip_ConvertPushPullUnpack(t *testing.T) {
 	result, err := chunked.Build(
 		bytes.NewReader(imageData),
 		int64(len(imageData)),
-		contentindex.MediaTypeEROFSLayerZstd,
+		contentindex.MediaTypeEROFSZstd,
 		chunkSize,
 	)
 	if err != nil {
@@ -183,7 +179,7 @@ func TestRoundTrip_ConvertPushPullUnpack(t *testing.T) {
 	}
 
 	// Use the registry provider to download the layer blob.
-	provider := registry.New(fetcher, "registry:"+host+"/"+repo)
+	provider := registry.New(fetcher, "registry:"+host+"/"+repo, registry.Config{})
 
 	// Open the blob via the provider (downloads it to memory).
 	layerRA, err := provider.Open(ctx, layerDesc)
@@ -277,11 +273,7 @@ func TestRoundTrip_UnpackSequentialStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idxStore, err := NewStore(Config{Root: t.TempDir(), Content: cs})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { idxStore.Close() })
+	idxStore := newTestStore(t, cs)
 
 	// Build a blob with mixed chunk sizes.
 	imageData := make([]byte, 4*1024+16*1024+64*1024)
@@ -291,7 +283,7 @@ func TestRoundTrip_UnpackSequentialStream(t *testing.T) {
 	result, err := chunked.Build(
 		bytes.NewReader(imageData),
 		int64(len(imageData)),
-		contentindex.MediaTypeEROFSLayerZstd,
+		contentindex.MediaTypeEROFSZstd,
 		4*1024,
 	)
 	if err != nil {

@@ -19,7 +19,6 @@ package local
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -32,29 +31,34 @@ import (
 
 // EROFS chunk-index v1 binary layout (designs/erofs-image-spec/spec.md §3.4).
 //
-// Header (24 bytes, little-endian):
+// Header (32 bytes, little-endian):
 //
-//   0:4   Magic            = 0xCD 0xE4 0xEC 0x67
-//   4:8   Version          = 1
-//   8:16  UncompressedSize uint64
-//   16:20 ChunkSize        uint32   (0 = variable-size mode)
-//   20    HashAlgo         uint8    (0 = none, 1 = SHA-2)
-//   21    HashSize         uint8    (32 = SHA-256, 64 = SHA-512)
-//   22    Flags            uint8    (bit 0 = per-entry Weight present)
-//   23    Reserved         uint8    (must be 0)
+//	 0:4   Magic            uint32   = 0xCD 0xE4 0xEC 0x67
+//	 4     Version          uint8    = 1
+//	 5     CompressionType  uint8    (0=none, 1=zstd)
+//	 6:8   Flags            uint16   reserved; MUST be 0 in v1
+//	 8:16  UncompressedSize uint64
+//	16:20  NumChunks        uint32
+//	20     HashAlgo         uint8    (0=none, 1=SHA-2)
+//	21     HashSize         uint8    (32=SHA-256, 64=SHA-512)
+//	22:32  Reserved         [10]byte MUST be all zero
 //
-// Entry (size depends on media type, mode, and flags):
-//   BlockOffset        uint64  (always for +zstd; raw only when ChunkSize=0)
-//   UncompressedOffset uint64  (only +zstd && ChunkSize=0)
-//   Weight             int8    (only when Flags bit 0 set)
-//   Checksum           [N]byte (only when HashAlgo != 0; N = HashSize)
+// Entry (uniform shape, 16 + HashSize bytes):
+//
+//	 0:8   BlockOffset        uint64
+//	 8:16  UncompressedOffset uint64
+//	16:+H  Checksum           [H]byte  (only when HashAlgo != 0)
 const (
 	chunkIndexMagic        uint32 = 0x67ECE4CD
-	chunkIndexHeaderSize          = 24
+	chunkIndexHeaderSize          = 32
 	chunkIndexVersion             = 1
-	chunkIndexFlagWeight   uint8  = 0x01
-	chunkIndexHashAlgoNone uint8  = 0
-	chunkIndexHashAlgoSHA2 uint8  = 1
+
+	// CompressionType values (header byte 5).
+	chunkIndexCompressionNone uint8 = 0 // raw byte ranges
+	chunkIndexCompressionZstd uint8 = 1 // one zstd frame per chunk
+
+	chunkIndexHashAlgoNone uint8 = 0
+	chunkIndexHashAlgoSHA2 uint8 = 1
 
 	zstdSkippableFrameHeaderSize = 8
 	// zstdSkippableMagicBase is the lowest magic number for zstd skippable
@@ -62,13 +66,14 @@ const (
 	zstdSkippableMagicBase uint32 = 0x184D2A50
 )
 
-// chunkIndexHeader is the parsed form of the 24-byte header.
+// chunkIndexHeader is the parsed form of the 32-byte header.
 type chunkIndexHeader struct {
 	UncompressedSize uint64
-	ChunkSize        uint32
+	NumChunks        uint32
 	HashAlgo         uint8
 	HashSize         uint8
-	Flags            uint8
+	Flags            uint16
+	CompressionType  uint8
 }
 
 // indexLocation describes the chunk index's position within the original
@@ -77,7 +82,7 @@ type indexLocation struct {
 	// Offset is the absolute byte offset of the start of the chunk-index
 	// section in the blob. For +zstd this is the first byte of the
 	// enclosing skippable frame; for raw this is the first byte of the
-	// header (the Magic).
+	// 32-byte header (the Magic).
 	Offset int64
 
 	// End is one past the last byte of the chunk-index section, or 0 if
@@ -88,22 +93,23 @@ type indexLocation struct {
 	Digest digest.Digest
 
 	// MediaType is the chunk-index media type, defaulting to
-	// ChunkIndexMediaTypeEROFSv1.
+	// ChunkIndexMediaTypeEROFSV1.
 	MediaType string
 
 	// HeaderOffset is the absolute offset of the chunk-index header
-	// (the 24-byte header). For raw layers HeaderOffset == Offset; for
+	// (the 32-byte header). For raw layers HeaderOffset == Offset; for
 	// +zstd layers it is Offset + 8 (after the skippable-frame header).
 	HeaderOffset int64
 }
 
-// parseIndexLocation reads org.erofs.index.* annotations from a descriptor
-// and returns the resolved chunk-index location. Returns an error when the
-// descriptor does not declare a chunk index.
+// parseIndexLocation reads org.erofs.chunk-index.* annotations from a
+// descriptor and returns the resolved chunk-index location. Returns an error
+// when the descriptor does not declare a chunk index.
 func parseIndexLocation(desc ocispec.Descriptor) (*indexLocation, error) {
-	rawRange, ok := desc.Annotations[contentindex.AnnotationIndexRange]
+	rawRange, ok := desc.Annotations[contentindex.AnnotationChunkIndexRange]
 	if !ok {
-		return nil, fmt.Errorf("content/index: descriptor missing %s annotation", contentindex.AnnotationIndexRange)
+		return nil, fmt.Errorf("content/index: descriptor missing %s annotation",
+			contentindex.AnnotationChunkIndexRange)
 	}
 	off, end, err := parseRange(rawRange)
 	if err != nil {
@@ -112,24 +118,24 @@ func parseIndexLocation(desc ocispec.Descriptor) (*indexLocation, error) {
 	loc := &indexLocation{
 		Offset:    off,
 		End:       end,
-		MediaType: desc.Annotations[contentindex.AnnotationIndexMediaType],
+		MediaType: desc.Annotations[contentindex.AnnotationChunkIndexMediaType],
 	}
 	if loc.MediaType == "" {
-		loc.MediaType = contentindex.ChunkIndexMediaTypeEROFSv1
+		loc.MediaType = contentindex.ChunkIndexMediaTypeEROFSV1
 	}
-	if d, ok := desc.Annotations[contentindex.AnnotationIndexDigest]; ok && d != "" {
+	if d, ok := desc.Annotations[contentindex.AnnotationChunkIndexDigest]; ok && d != "" {
 		dgst, err := digest.Parse(d)
 		if err != nil {
-			return nil, fmt.Errorf("content/index: invalid %s annotation: %w", contentindex.AnnotationIndexDigest, err)
+			return nil, fmt.Errorf("content/index: invalid %s annotation: %w",
+				contentindex.AnnotationChunkIndexDigest, err)
 		}
 		loc.Digest = dgst
 	}
-	switch desc.MediaType {
-	case contentindex.MediaTypeEROFSLayerZstd,
-		contentindex.MediaTypeEROFSLayerMergedZstd,
-		contentindex.MediaTypeEROFSLayerDataZstd:
+	// For +zstd layers the chunk index is wrapped in a zstd skippable
+	// frame; the 32-byte header begins 8 bytes after the section start.
+	if isZstdMediaType(desc.MediaType) {
 		loc.HeaderOffset = off + zstdSkippableFrameHeaderSize
-	default:
+	} else {
 		loc.HeaderOffset = off
 	}
 	return loc, nil
@@ -162,8 +168,9 @@ func parseRange(s string) (int64, int64, error) {
 // parseDmVerity reads org.erofs.dmverity.* annotations from a descriptor.
 // Returns nil and a nil error when no dm-verity annotations are present.
 //
-// dm-verity parameters are NOT stored in the sidecar; callers that need them
-// (e.g. mount activation) call this function directly with the descriptor.
+// dm-verity parameters are NOT stored in the metadata record; callers that
+// need them (e.g. mount activation) call this function directly with the
+// descriptor.
 func parseDmVerity(desc ocispec.Descriptor) (*contentindex.DmVerityInfo, error) {
 	rawOffset, hasOffset := desc.Annotations[contentindex.AnnotationDmVerityHashOffset]
 	rawDigest, hasDigest := desc.Annotations[contentindex.AnnotationDmVerityRootDigest]
@@ -171,26 +178,33 @@ func parseDmVerity(desc ocispec.Descriptor) (*contentindex.DmVerityInfo, error) 
 		return nil, nil
 	}
 	if !hasOffset || !hasDigest {
-		return nil, fmt.Errorf("content/index: dm-verity annotations must be all-or-nothing (have offset=%v digest=%v)", hasOffset, hasDigest)
+		return nil, fmt.Errorf(
+			"content/index: dm-verity annotations must be all-or-nothing (have offset=%v digest=%v)",
+			hasOffset, hasDigest)
 	}
 	offset, err := strconv.ParseInt(rawOffset, 10, 64)
 	if err != nil || offset < 0 {
-		return nil, fmt.Errorf("content/index: invalid %s value %q", contentindex.AnnotationDmVerityHashOffset, rawOffset)
+		return nil, fmt.Errorf("content/index: invalid %s value %q",
+			contentindex.AnnotationDmVerityHashOffset, rawOffset)
 	}
 	dgst, err := digest.Parse(rawDigest)
 	if err != nil {
-		return nil, fmt.Errorf("content/index: invalid %s value: %w", contentindex.AnnotationDmVerityRootDigest, err)
+		return nil, fmt.Errorf("content/index: invalid %s value: %w",
+			contentindex.AnnotationDmVerityRootDigest, err)
 	}
 	bs := contentindex.DefaultDmVerityBlockSize
 	if rawBs, ok := desc.Annotations[contentindex.AnnotationDmVerityBlockSize]; ok && rawBs != "" {
 		v, err := strconv.ParseUint(rawBs, 10, 32)
 		if err != nil || v == 0 {
-			return nil, fmt.Errorf("content/index: invalid %s value %q", contentindex.AnnotationDmVerityBlockSize, rawBs)
+			return nil, fmt.Errorf("content/index: invalid %s value %q",
+				contentindex.AnnotationDmVerityBlockSize, rawBs)
 		}
 		bs = uint32(v)
 	}
 	if int64(bs) > 0 && offset%int64(bs) != 0 {
-		return nil, fmt.Errorf("content/index: dm-verity hash_offset %d not a multiple of block_size %d", offset, bs)
+		return nil, fmt.Errorf(
+			"content/index: dm-verity hash_offset %d not a multiple of block_size %d",
+			offset, bs)
 	}
 	return &contentindex.DmVerityInfo{
 		RootDigest: dgst,
@@ -199,38 +213,19 @@ func parseDmVerity(desc ocispec.Descriptor) (*contentindex.DmVerityInfo, error) 
 	}, nil
 }
 
-// chunkIndexEntrySize returns the byte size of a single chunk entry given
-// the layer media type, header chunk-mode (variable when ChunkSize == 0),
-// and flags.
-func chunkIndexEntrySize(mediaType string, hdr *chunkIndexHeader) (int, error) {
+// chunkIndexEntrySize returns the byte size of a single chunk entry.
+// The entry layout is uniform: BlockOffset(8) + UncompressedOffset(8) +
+// Checksum(HashSize).
+func chunkIndexEntrySize(hdr *chunkIndexHeader) (int, error) {
 	if hdr.HashAlgo != chunkIndexHashAlgoNone && hdr.HashAlgo != chunkIndexHashAlgoSHA2 {
 		return 0, fmt.Errorf("content/index: unsupported HashAlgo %d", hdr.HashAlgo)
 	}
-	zstd := isZstdMediaType(mediaType)
-	variable := hdr.ChunkSize == 0
-	size := 0
-	switch {
-	case zstd && variable:
-		size = 16 // BlockOffset + UncompressedOffset
-	case zstd && !variable:
-		size = 8 // BlockOffset
-	case !zstd && variable:
-		size = 8 // BlockOffset only
-	case !zstd && !variable:
-		size = 0
-	}
-	if hdr.Flags&chunkIndexFlagWeight != 0 {
-		size++
-	}
-	if hdr.HashAlgo != chunkIndexHashAlgoNone {
-		size += int(hdr.HashSize)
-	}
-	return size, nil
+	return 16 + int(hdr.HashSize), nil
 }
 
 // parseChunkIndex reads and decodes the chunk index from r at the position
-// given by loc.HeaderOffset.  The returned slice is sorted by chunk-index
-// entry order (which is also OnBlobStart order).
+// given by loc.HeaderOffset.  The returned slice is in chunk-index entry
+// order (which is also ascending UncompressedOffset order).
 //
 // Each ChunkRef has its Digest populated only when the index carries
 // per-chunk checksums (HashAlgo != 0).
@@ -239,57 +234,48 @@ func parseChunkIndex(r io.ReaderAt, loc *indexLocation, mediaType string) ([]con
 	if err != nil {
 		return nil, nil, err
 	}
-	entrySize, err := chunkIndexEntrySize(mediaType, hdr)
+	// Validate CompressionType against the carrying layer's media type.
+	if err := validateCompressionType(hdr.CompressionType, mediaType); err != nil {
+		return nil, nil, err
+	}
+	entrySize, err := chunkIndexEntrySize(hdr)
 	if err != nil {
 		return nil, nil, err
 	}
-	n, err := chunkCount(loc, hdr, mediaType, entrySize)
-	if err != nil {
-		return nil, nil, err
-	}
+	n := int(hdr.NumChunks)
 	if n == 0 {
 		return nil, hdr, nil
 	}
+
+	// Validate that the payload length is exactly what NumChunks implies.
+	if err := validatePayloadLength(loc, hdr, mediaType, n, entrySize); err != nil {
+		return nil, nil, err
+	}
+
 	entriesOffset := loc.HeaderOffset + chunkIndexHeaderSize
 	buf := make([]byte, int64(n)*int64(entrySize))
 	if _, err := r.ReadAt(buf, entriesOffset); err != nil {
 		return nil, nil, fmt.Errorf("content/index: read chunk entries: %w", err)
 	}
-	zstd := isZstdMediaType(mediaType)
-	variable := hdr.ChunkSize == 0
-	hasWeight := hdr.Flags&chunkIndexFlagWeight != 0
+
+	zstd := hdr.CompressionType == chunkIndexCompressionZstd
 	hashed := hdr.HashAlgo != chunkIndexHashAlgoNone
 	chunks := make([]contentindex.ChunkRef, n)
+
 	for i := 0; i < n; i++ {
 		entry := buf[i*entrySize : (i+1)*entrySize]
-		var blockOff, uncompOff int64
-		pos := 0
-		switch {
-		case zstd && variable:
-			blockOff = int64(binary.LittleEndian.Uint64(entry[0:8]))
-			uncompOff = int64(binary.LittleEndian.Uint64(entry[8:16]))
-			pos = 16
-		case zstd && !variable:
-			blockOff = int64(binary.LittleEndian.Uint64(entry[0:8]))
-			uncompOff = int64(i) * int64(hdr.ChunkSize)
-			pos = 8
-		case !zstd && variable:
-			blockOff = int64(binary.LittleEndian.Uint64(entry[0:8]))
-			uncompOff = blockOff
-			pos = 8
-		default: // raw fixed-size
-			blockOff = int64(i) * int64(hdr.ChunkSize)
-			uncompOff = blockOff
-		}
-		if hasWeight {
-			pos++
-		}
+		blockOff := int64(binary.LittleEndian.Uint64(entry[0:8]))
+		uncompOff := int64(binary.LittleEndian.Uint64(entry[8:16]))
+		pos := 16
+
 		var chunkDigest digest.Digest
 		if hashed {
 			sum := entry[pos : pos+int(hdr.HashSize)]
 			alg := digestAlgorithmForHash(hdr.HashAlgo, hdr.HashSize)
 			if alg == "" {
-				return nil, nil, fmt.Errorf("content/index: unsupported HashAlgo=%d HashSize=%d", hdr.HashAlgo, hdr.HashSize)
+				return nil, nil, fmt.Errorf(
+					"content/index: unsupported HashAlgo=%d HashSize=%d",
+					hdr.HashAlgo, hdr.HashSize)
 			}
 			chunkDigest = digest.NewDigestFromBytes(alg, sum)
 		}
@@ -299,46 +285,44 @@ func parseChunkIndex(r io.ReaderAt, loc *indexLocation, mediaType string) ([]con
 			OnBlobStart: blockOff,
 		}
 	}
+
 	// Compute on-blob lengths and logical lengths.
 	chunkIndexStart := loc.Offset
 	totalImageData := int64(hdr.UncompressedSize)
-	if !zstd && !variable { // raw fixed-size: BlockOffset is implicit
-		for i := range chunks {
-			start := int64(i) * int64(hdr.ChunkSize)
-			end := start + int64(hdr.ChunkSize)
-			if end > totalImageData {
-				end = totalImageData
-			}
-			chunks[i].OnBlobStart = start
-			chunks[i].OnBlobEnd = end
-			chunks[i].Length = end - start
+
+	for i := range chunks {
+		// Logical length: distance to next UncompressedOffset (or end).
+		var nextLogical int64
+		if i+1 < len(chunks) {
+			nextLogical = chunks[i+1].Offset
+		} else {
+			nextLogical = totalImageData
 		}
-	} else {
-		for i := range chunks {
-			var endOnBlob int64
+		chunks[i].Length = nextLogical - chunks[i].Offset
+
+		// On-blob length depends on compression.
+		var endOnBlob int64
+		if zstd {
 			if i+1 < len(chunks) {
 				endOnBlob = chunks[i+1].OnBlobStart
 			} else {
 				endOnBlob = chunkIndexStart
 			}
-			chunks[i].OnBlobEnd = endOnBlob
-			var nextLogical int64
-			if i+1 < len(chunks) {
-				nextLogical = chunks[i+1].Offset
-			} else {
-				nextLogical = totalImageData
-			}
-			chunks[i].Length = nextLogical - chunks[i].Offset
+		} else {
+			// CompressionType=0: raw bytes; on-blob length == logical length.
+			endOnBlob = chunks[i].OnBlobStart + chunks[i].Length
 		}
+		chunks[i].OnBlobEnd = endOnBlob
 	}
-	if err := validateChunks(chunks, hdr, totalImageData, chunkIndexStart, zstd); err != nil {
+
+	if err := validateChunks(chunks, totalImageData, chunkIndexStart, zstd); err != nil {
 		return nil, nil, err
 	}
 	return chunks, hdr, nil
 }
 
 // parseChunkIndexPayload parses a chunk-index from its raw payload bytes —
-// the 24-byte header followed by N chunk entries, without any surrounding
+// the 32-byte header followed by N chunk entries, without any surrounding
 // zstd skippable-frame header.
 //
 // This is used when the chunk-index is read back from its content-store entry
@@ -352,25 +336,18 @@ func parseChunkIndexPayload(payload []byte, blobSectionOffset int64, mediaType s
 	// Synthesise an indexLocation that makes parseChunkIndex work correctly
 	// when reading from a bytes.Reader over the raw payload.
 	//
-	// parseChunkIndex uses loc.HeaderOffset for reading the header and
-	// entries (set to 0: the payload starts with the header), and uses
-	// loc.Offset as chunkIndexStart for on-blob range validation (set to
-	// blobSectionOffset: the original position in the blob).
-	//
-	// For variable-size chunk count, chunkCount() computes:
-	//   payload_len = loc.End - loc.Offset [- 8 for +zstd]
-	//   N = (payload_len - 24) / entrySize
-	//
-	// We need payload_len == len(payload), so:
-	//   +zstd: loc.End = loc.Offset + len(payload) + 8
-	//   raw:   loc.End = loc.Offset + len(payload)
+	// HeaderOffset = 0: the payload starts with the 32-byte header.
+	// Offset = blobSectionOffset: used as chunkIndexStart for on-blob
+	//   range validation and payload-length checking.
+	// End: for the payload-length validation in validatePayloadLength we
+	//   need a consistent End. For +zstd the skippable-frame header is
+	//   not present in the payload, so we set End = Offset + len(payload) + 8
+	//   to account for the 8 bytes that validatePayloadLength subtracts.
+	//   For raw, End = Offset + len(payload).
 	var end int64
-	switch mediaType {
-	case contentindex.MediaTypeEROFSLayerZstd,
-		contentindex.MediaTypeEROFSLayerMergedZstd,
-		contentindex.MediaTypeEROFSLayerDataZstd:
+	if isZstdMediaType(mediaType) {
 		end = blobSectionOffset + int64(len(payload)) + zstdSkippableFrameHeaderSize
-	default:
+	} else {
 		end = blobSectionOffset + int64(len(payload))
 	}
 	loc := &indexLocation{
@@ -382,7 +359,7 @@ func parseChunkIndexPayload(payload []byte, blobSectionOffset int64, mediaType s
 	return parseChunkIndex(bytes.NewReader(payload), loc, mediaType)
 }
 
-// readChunkIndexHeader reads and validates the 24-byte header at headerOffset.
+// readChunkIndexHeader reads and validates the 32-byte header at headerOffset.
 func readChunkIndexHeader(r io.ReaderAt, headerOffset int64) (*chunkIndexHeader, error) {
 	var raw [chunkIndexHeaderSize]byte
 	if _, err := r.ReadAt(raw[:], headerOffset); err != nil {
@@ -392,79 +369,114 @@ func readChunkIndexHeader(r io.ReaderAt, headerOffset int64) (*chunkIndexHeader,
 	if magic != chunkIndexMagic {
 		return nil, fmt.Errorf("content/index: bad chunk index magic 0x%08x", magic)
 	}
-	version := binary.LittleEndian.Uint32(raw[4:8])
+	version := raw[4]
 	if version != chunkIndexVersion {
 		return nil, fmt.Errorf("content/index: unsupported chunk index version %d", version)
 	}
+	compressionType := raw[5]
+	flags := binary.LittleEndian.Uint16(raw[6:8])
+	if flags != 0 {
+		return nil, fmt.Errorf(
+			"content/index: unsupported Flags 0x%04x; falling back to sequential reads",
+			flags)
+	}
 	hdr := &chunkIndexHeader{
+		CompressionType:  compressionType,
+		Flags:            flags,
 		UncompressedSize: binary.LittleEndian.Uint64(raw[8:16]),
-		ChunkSize:        binary.LittleEndian.Uint32(raw[16:20]),
+		NumChunks:        binary.LittleEndian.Uint32(raw[16:20]),
 		HashAlgo:         raw[20],
 		HashSize:         raw[21],
-		Flags:            raw[22],
 	}
-	if hdr.Flags&^chunkIndexFlagWeight != 0 {
-		return nil, fmt.Errorf("content/index: reserved flags bits set: 0x%02x", hdr.Flags)
+	// Validate reserved bytes 22-31 are all zero.
+	for i := 22; i < 32; i++ {
+		if raw[i] != 0 {
+			return nil, fmt.Errorf(
+				"content/index: non-zero reserved header byte at offset %d: 0x%02x",
+				i, raw[i])
+		}
 	}
-	if raw[23] != 0 {
-		return nil, fmt.Errorf("content/index: reserved header byte non-zero: 0x%02x", raw[23])
+	switch hdr.CompressionType {
+	case chunkIndexCompressionNone, chunkIndexCompressionZstd:
+		// recognized
+	default:
+		return nil, fmt.Errorf(
+			"content/index: unsupported CompressionType %d", hdr.CompressionType)
 	}
 	if hdr.HashAlgo == chunkIndexHashAlgoNone && hdr.HashSize != 0 {
-		return nil, errors.New("content/index: HashSize must be 0 when HashAlgo is 0")
+		return nil, fmt.Errorf("content/index: HashSize must be 0 when HashAlgo is 0")
 	}
 	return hdr, nil
 }
 
-// chunkCount returns the number of chunk entries described by the header.
-func chunkCount(loc *indexLocation, hdr *chunkIndexHeader, mediaType string, entrySize int) (int, error) {
-	if hdr.ChunkSize > 0 {
-		if hdr.UncompressedSize == 0 {
-			return 0, nil
+// validateCompressionType checks that the header's CompressionType is
+// consistent with the carrying layer's media type.
+func validateCompressionType(compressionType uint8, mediaType string) error {
+	zstd := isZstdMediaType(mediaType)
+	switch compressionType {
+	case chunkIndexCompressionZstd:
+		if !zstd {
+			return fmt.Errorf(
+				"content/index: CompressionType=zstd but layer media type %q is not +zstd",
+				mediaType)
 		}
-		n := (int64(hdr.UncompressedSize) + int64(hdr.ChunkSize) - 1) / int64(hdr.ChunkSize)
-		return int(n), nil
+	case chunkIndexCompressionNone:
+		if zstd {
+			return fmt.Errorf(
+				"content/index: CompressionType=none but layer media type %q is +zstd",
+				mediaType)
+		}
 	}
+	return nil
+}
+
+// validatePayloadLength verifies that the payload accommodates exactly
+// NumChunks entries.
+func validatePayloadLength(loc *indexLocation, hdr *chunkIndexHeader, mediaType string, n, entrySize int) error {
 	if loc.End == 0 {
-		return 0, fmt.Errorf("content/index: variable-size chunk index requires end offset in %s annotation", contentindex.AnnotationIndexRange)
+		// End unknown (omitted annotation or standalone layer with no bound set
+		// other than the blob size) — skip the check.
+		return nil
 	}
-	payload := loc.End - loc.Offset
-	switch mediaType {
-	case contentindex.MediaTypeEROFSLayerZstd,
-		contentindex.MediaTypeEROFSLayerMergedZstd,
-		contentindex.MediaTypeEROFSLayerDataZstd:
-		payload -= zstdSkippableFrameHeaderSize
+	sectionLen := loc.End - loc.Offset
+	if isZstdMediaType(mediaType) {
+		sectionLen -= zstdSkippableFrameHeaderSize
 	}
-	payload -= chunkIndexHeaderSize
-	if payload < 0 {
-		return 0, fmt.Errorf("content/index: chunk index payload negative (range too small)")
+	expectedPayload := int64(chunkIndexHeaderSize) + int64(n)*int64(entrySize)
+	if sectionLen != expectedPayload {
+		return fmt.Errorf(
+			"content/index: chunk index payload length %d != expected %d (NumChunks=%d entrySize=%d)",
+			sectionLen, expectedPayload, n, entrySize)
 	}
-	if entrySize == 0 {
-		return 0, fmt.Errorf("content/index: variable-size mode requires non-zero entry size")
-	}
-	if payload%int64(entrySize) != 0 {
-		return 0, fmt.Errorf("content/index: chunk index payload %d not a multiple of entry size %d", payload, entrySize)
-	}
-	return int(payload / int64(entrySize)), nil
+	return nil
 }
 
 // validateChunks performs sanity checks on the parsed chunk slice.
-func validateChunks(chunks []contentindex.ChunkRef, hdr *chunkIndexHeader, imageDataSize, chunkIndexStart int64, zstd bool) error {
+func validateChunks(chunks []contentindex.ChunkRef, imageDataSize, chunkIndexStart int64, zstd bool) error {
 	for i, c := range chunks {
 		if c.OnBlobStart < 0 || c.OnBlobEnd < c.OnBlobStart {
-			return fmt.Errorf("content/index: chunk %d has invalid on-blob range [%d, %d)", i, c.OnBlobStart, c.OnBlobEnd)
+			return fmt.Errorf(
+				"content/index: chunk %d has invalid on-blob range [%d, %d)",
+				i, c.OnBlobStart, c.OnBlobEnd)
 		}
 		if zstd {
 			if c.OnBlobEnd > chunkIndexStart {
-				return fmt.Errorf("content/index: chunk %d on-blob end %d overlaps chunk index at %d", i, c.OnBlobEnd, chunkIndexStart)
+				return fmt.Errorf(
+					"content/index: chunk %d on-blob end %d overlaps chunk index at %d",
+					i, c.OnBlobEnd, chunkIndexStart)
 			}
 		} else if c.OnBlobEnd > imageDataSize {
-			return fmt.Errorf("content/index: chunk %d on-blob end %d exceeds image data size %d", i, c.OnBlobEnd, imageDataSize)
+			return fmt.Errorf(
+				"content/index: chunk %d on-blob end %d exceeds image data size %d",
+				i, c.OnBlobEnd, imageDataSize)
 		}
 		if c.Length < 0 {
-			return fmt.Errorf("content/index: chunk %d has negative logical length %d", i, c.Length)
+			return fmt.Errorf(
+				"content/index: chunk %d has negative logical length %d", i, c.Length)
 		}
 		if i > 0 && chunks[i].OnBlobStart < chunks[i-1].OnBlobEnd {
-			return fmt.Errorf("content/index: chunk %d on-blob range overlaps previous chunk", i)
+			return fmt.Errorf(
+				"content/index: chunk %d on-blob range overlaps previous chunk", i)
 		}
 	}
 	return nil
@@ -486,11 +498,12 @@ func digestAlgorithmForHash(algo, size uint8) digest.Algorithm {
 }
 
 // isZstdMediaType reports whether mediaType identifies a +zstd layer variant.
+// Recognises both canonical (application/vnd.erofs+zstd) and legacy
+// (application/vnd.erofs.layer.v1+zstd) media types.
 func isZstdMediaType(mediaType string) bool {
 	switch mediaType {
-	case contentindex.MediaTypeEROFSLayerZstd,
-		contentindex.MediaTypeEROFSLayerMergedZstd,
-		contentindex.MediaTypeEROFSLayerDataZstd:
+	case contentindex.MediaTypeEROFSZstd,
+		contentindex.MediaTypeEROFSLayerZstd:
 		return true
 	}
 	return false

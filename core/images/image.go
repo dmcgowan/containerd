@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
@@ -406,10 +407,13 @@ func validateMediaType(b []byte, mt string) error {
 	return nil
 }
 
-// RootFS returns the unpacked diffids that make up and images rootfs.
+// RootFS returns the unpacked diffids that make up an image's rootfs.
 //
 // These are used to verify that a set of layers unpacked to the expected
-// values.
+// values.  When rootfs.diff_ids is absent or empty in the image configuration,
+// an empty (nil) slice is returned; callers that have access to the manifest
+// layers should use RootFSFromManifest, which additionally consults the
+// org.erofs.uncompressed-digest annotation on each layer descriptor.
 func RootFS(ctx context.Context, provider content.Provider, configDesc ocispec.Descriptor) ([]digest.Digest, error) {
 	p, err := content.ReadBlob(ctx, provider, configDesc)
 	if err != nil {
@@ -421,6 +425,63 @@ func RootFS(ctx context.Context, provider content.Provider, configDesc ocispec.D
 		return nil, err
 	}
 	return config.RootFS.DiffIDs, nil
+}
+
+// RootFSFromManifest returns the per-layer DiffIDs for the layers in
+// manifest.  For each layer, it consults sources in priority order:
+//
+//  1. The org.erofs.uncompressed-digest annotation on the layer descriptor
+//     (preferred; rootfs.diff_ids MAY be ignored when this is present).
+//  2. rootfs.diff_ids in the image configuration (legacy fallback).
+//  3. The content-store label containerd.io/uncompressed or live decompression
+//     (via UncompressedDigestFromDescriptor).
+//
+// cs MAY be nil only when every layer is guaranteed to carry the annotation
+// or be an uncompressed type; it is needed for the content-store fallback.
+func RootFSFromManifest(ctx context.Context, provider content.Provider, cs content.Store, configDesc ocispec.Descriptor, manifest ocispec.Manifest) ([]digest.Digest, error) {
+	// Load rootfs.diff_ids as a legacy fallback for layers that lack the
+	// annotation.  Errors reading the config are non-fatal here if all
+	// layers carry the annotation.
+	var legacyDiffIDs []digest.Digest
+	if p, err := content.ReadBlob(ctx, provider, configDesc); err == nil {
+		var cfg ocispec.Image
+		if jsonErr := json.Unmarshal(p, &cfg); jsonErr == nil {
+			legacyDiffIDs = cfg.RootFS.DiffIDs
+			if len(legacyDiffIDs) > 0 && len(legacyDiffIDs) != len(manifest.Layers) {
+				return nil, fmt.Errorf("number of layers %d does not match number of diff IDs %d",
+					len(manifest.Layers), len(legacyDiffIDs))
+			}
+		}
+	}
+
+	// For each layer, prefer the annotation; fall back to legacy diff_ids
+	// or live decompression.
+	derived := make([]digest.Digest, len(manifest.Layers))
+	for i, layerDesc := range manifest.Layers {
+		// Source 1: annotation.
+		if v, ok := layerDesc.Annotations[contentindex.AnnotationUncompressedDigest]; ok && v != "" {
+			if d, err := digest.Parse(v); err == nil {
+				derived[i] = d
+				continue
+			}
+		}
+		// Source 2: legacy rootfs.diff_ids.
+		if i < len(legacyDiffIDs) && legacyDiffIDs[i] != "" {
+			derived[i] = legacyDiffIDs[i]
+			continue
+		}
+		// Source 3: content-store label / live decompression.
+		if cs == nil {
+			return nil, fmt.Errorf("content store required to derive diff-id for layer %d (%s)",
+				i, layerDesc.Digest)
+		}
+		d, err := UncompressedDigestFromDescriptor(ctx, cs, layerDesc)
+		if err != nil {
+			return nil, fmt.Errorf("deriving diff-id for layer %d (%s): %w", i, layerDesc.Digest, err)
+		}
+		derived[i] = d
+	}
+	return derived, nil
 }
 
 // ConfigPlatform returns a normalized platform from an image manifest config.

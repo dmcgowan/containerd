@@ -26,6 +26,9 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/containerd/containerd/v2/core/content"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
+	"github.com/containerd/containerd/v2/core/content/index/provider"
+	"github.com/containerd/containerd/v2/core/content/index/registry"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/remotes"
@@ -180,8 +183,30 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		})
 	}
 
+	// Determine if any unpack configuration requests lazy EROFS ingest.
+	// LazyEROFS is set on transfer.UnpackConfiguration; we check those
+	// before they're converted to unpack.Platform.
+	lazyEROFS := false
+	if ts.config.IndexStore != nil {
+		if iu, ok := is.(transfer.ImageUnpacker); ok {
+			for _, uc := range iu.UnpackPlatforms() {
+				if uc.LazyEROFS {
+					lazyEROFS = true
+					break
+				}
+			}
+		}
+	}
+
+	var layerFetchHandler images.Handler
+	if lazyEROFS {
+		layerFetchHandler = lazyErofsHandler(store, fetcher, ts.config.IndexStore, progressTracker)
+	} else {
+		layerFetchHandler = fetchHandler(store, fetcher, progressTracker)
+	}
+
 	handler = images.Handlers(append(baseHandlers,
-		fetchHandler(store, fetcher, progressTracker),
+		layerFetchHandler,
 		checkNeedsFix,
 		childrenHandler, // List children to track hierarchy
 		appendDistSrcLabelHandler,
@@ -295,6 +320,67 @@ func fetchHandler(ingester content.Ingester, fetcher remotes.Fetcher, pt *Progre
 			return nil, nil
 		}
 		return nil, err
+	}
+}
+
+// lazyEligible returns true if desc is an EROFS layer with a chunk-index annotation.
+// When true, the layer can be lazily ingested through the indexed content store.
+func lazyEligible(desc ocispec.Descriptor) bool {
+	if desc.Annotations == nil {
+		return false
+	}
+	if desc.Annotations[contentindex.AnnotationChunkIndexRange] == "" {
+		return false
+	}
+	mt := desc.MediaType
+	return mt == contentindex.MediaTypeEROFS ||
+		mt == contentindex.MediaTypeEROFSZstd ||
+		mt == contentindex.MediaTypeEROFSLayer ||
+		mt == contentindex.MediaTypeEROFSLayerZstd
+}
+
+// lazyErofsHandler returns a handler that lazily ingests EROFS layers with a
+// chunk-index annotation via the indexed content store (indexStore), and falls
+// back to normal eager fetch for all other content.
+//
+// The handler creates a registry ByteProvider from the fetcher for this pull
+// and registers it in the global provider registry so the cache layer can find
+// it later by name (provider name = "registry:<imageName>").
+func lazyErofsHandler(
+	ingester content.Ingester,
+	fetcher remotes.Fetcher,
+	indexStore lazyIndexStore,
+	pt *ProgressTracker,
+) images.HandlerFunc {
+	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		if !lazyEligible(desc) {
+			// Not a lazy-eligible layer — fall through to normal fetch.
+			return fetchHandler(ingester, fetcher, pt)(ctx, desc)
+		}
+
+		// Build a provider for this pull and register it globally.
+		// The name includes the image context so multiple concurrent pulls
+		// don't collide.
+		providerName := fmt.Sprintf("registry:%s", desc.Digest)
+		p := registry.New(fetcher, providerName, registry.Config{})
+		provider.Global.Register(p)
+
+		// Lazy-ingest: download only the chunk-index section.
+		ref := fmt.Sprintf("lazy-erofs-%s", desc.Digest)
+		if err := indexStore.WriteLazy(ctx, ref, desc, p); err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				if pt != nil {
+					pt.MarkExists(desc)
+				}
+				return nil, nil
+			}
+			return nil, fmt.Errorf("lazy erofs ingest %s: %w", desc.Digest, err)
+		}
+		log.G(ctx).WithFields(log.Fields{
+			"digest":   desc.Digest,
+			"provider": providerName,
+		}).Debug("lazy EROFS layer ingested (chunk-index only)")
+		return nil, nil
 	}
 }
 

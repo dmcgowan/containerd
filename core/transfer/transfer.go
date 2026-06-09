@@ -148,6 +148,17 @@ type ImagePlatformsGetter interface {
 type UnpackConfiguration struct {
 	Platform    ocispec.Platform
 	Snapshotter string
+
+	// LazyEROFS enables lazy ingest for EROFS layers that carry a chunk-index
+	// annotation (org.erofs.chunk-index.range). When set, the transfer service
+	// routes such layers through the indexed content store's lazy-ingest path
+	// (only the chunk-index section is downloaded) instead of downloading the
+	// full blob. Chunk bytes are fetched on demand when the container first
+	// reads them.
+	//
+	// Requires the indexed content store plugin to be active and the EROFS
+	// snapshotter to be the target snapshotter.
+	LazyEROFS bool
 }
 
 type ProgressFunc func(Progress)

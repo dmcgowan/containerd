@@ -59,8 +59,19 @@ const (
 	MediaTypeImageLayerEncrypted     = ocispec.MediaTypeImageLayer + "+encrypted"
 	MediaTypeImageLayerGzipEncrypted = ocispec.MediaTypeImageLayerGzip + "+encrypted"
 
-	// EROFS media type
+	// EROFS media types (canonical; erofs-image-spec §2.1)
+	MediaTypeErofs     = "application/vnd.erofs"
+	MediaTypeErofsZstd = "application/vnd.erofs+zstd"
+
+	// MediaTypeErofsLayer is the legacy EROFS layer media type.
+	// Deprecated: new producers should emit MediaTypeErofs.
+	// Consumers treat this as equivalent to MediaTypeErofs; when not the
+	// top layer in manifest.layers[] it implies overlay-lower role.
 	MediaTypeErofsLayer = "application/vnd.erofs.layer.v1"
+
+	// MediaTypeErofsChunkIndex is the chunk-index media type used both
+	// as an annotation value and as a standalone layer media type.
+	MediaTypeErofsChunkIndex = "application/vnd.erofs.chunk-index.v1"
 
 	// In-toto attestation
 	MediaTypeInToto = "application/vnd.in-toto+json"
@@ -102,6 +113,12 @@ func DiffCompression(ctx context.Context, mediaType string) (string, error) {
 			case "zstd":
 				return "zstd", nil
 			}
+		}
+		return "", nil
+	case MediaTypeErofs, MediaTypeErofsLayer:
+		// Raw (uncompressed) EROFS: the blob is not tar-compressed.
+		if len(ext) > 0 && ext[len(ext)-1] == "zstd" {
+			return "zstd", nil
 		}
 		return "", nil
 	default:
@@ -148,7 +165,8 @@ func IsLayerType(mt string) bool {
 		MediaTypeDockerSchema2LayerForeign, MediaTypeDockerSchema2LayerForeignGzip, MediaTypeDockerSchema2LayerZstd:
 		return true
 	// Allow EROFS native layers for efficient container image distribution.
-	case MediaTypeErofsLayer:
+	// Recognise canonical types and the legacy layer.v1 alias.
+	case MediaTypeErofs, MediaTypeErofsZstd, MediaTypeErofsLayer:
 		return true
 	}
 	return false

@@ -42,7 +42,7 @@ import (
 //     containerd.io/gc.ref.content.index label pointing at the blob digest.
 //  3. Run GC — all chunks must survive.
 //  4. Delete the image (removing the pin).
-//  5. Run GC — the indexed-content sidecar record must be gone, and all
+//  5. Run GC — the indexed-content metadata record must be gone, and all
 //     chunk content-store entries must have been removed.
 func TestGC_ChunksCollectedWhenBlobUnreferenced(t *testing.T) {
 	ctx := namespaces.WithNamespace(context.Background(), "test")
@@ -66,12 +66,15 @@ func TestGC_ChunksCollectedWhenBlobUnreferenced(t *testing.T) {
 	// in the metadata BoltDB namespace and are visible to the GC traversal.
 	cs := mdb.ContentStore()
 
-	// ── Open the indexed content store using the namespaced CS ─────────────
-	idxStore, err := NewStore(Config{Root: t.TempDir(), Content: cs})
+	// ── Open the indexed content store backed by the shared metadata DB ────
+	idxStore, err := NewStore(Config{
+		Root:    t.TempDir(),
+		DB:      mdb,
+		Content: cs,
+	})
 	if err != nil {
 		t.Fatalf("new indexed store: %v", err)
 	}
-	t.Cleanup(func() { idxStore.Close() })
 	mdb.RegisterCollectibleResource(metadata.ResourceContentIndex, idxStore.Collector())
 
 	// ── Build and ingest a chunked blob ────────────────────────────────────
@@ -133,7 +136,7 @@ func TestGC_ChunksCollectedWhenBlobUnreferenced(t *testing.T) {
 		}
 	}
 	if _, err := idxStore.Info(ctx, desc.Digest); err != nil {
-		t.Fatalf("GC pass 1 removed sidecar record (should be pinned): %v", err)
+		t.Fatalf("GC pass 1 removed metadata record (should be pinned): %v", err)
 	}
 	t.Log("GC pass 1: all pinned entries survived ✓")
 
@@ -146,16 +149,16 @@ func TestGC_ChunksCollectedWhenBlobUnreferenced(t *testing.T) {
 		t.Fatalf("delete manifest: %v", err)
 	}
 
-	// ── GC pass 2: blob is unpinned, sidecar record must be removed ───────
+	// ── GC pass 2: blob is unpinned, metadata record must be removed ───────
 	if _, err := mdb.GarbageCollect(ctx); err != nil {
 		t.Fatalf("GC pass 2: %v", err)
 	}
 
 	// Sidecar record must be gone.
 	if _, err := idxStore.Info(ctx, desc.Digest); err == nil {
-		t.Error("GC pass 2: sidecar record still present (should have been removed)")
+		t.Error("GC pass 2: metadata record still present (should have been removed)")
 	} else {
-		t.Log("GC pass 2: sidecar record removed ✓")
+		t.Log("GC pass 2: metadata record removed ✓")
 	}
 
 	// Every chunk/index/extra entry must be gone after content GC.
@@ -192,11 +195,14 @@ func TestGC_ChunksSurviveWhileSecondBlobPinsThem(t *testing.T) {
 	}
 	cs := mdb.ContentStore()
 
-	idxStore, err := NewStore(Config{Root: t.TempDir(), Content: cs})
+	idxStore, err := NewStore(Config{
+		Root:    t.TempDir(),
+		DB:      mdb,
+		Content: cs,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { idxStore.Close() })
 	mdb.RegisterCollectibleResource(metadata.ResourceContentIndex, idxStore.Collector())
 	imgStore := metadata.NewImageStore(mdb)
 
@@ -250,7 +256,7 @@ func TestGC_ChunksSurviveWhileSecondBlobPinsThem(t *testing.T) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// listChunkDigests reads the sidecar to enumerate every content-store digest
+// listChunkDigests reads the indexed-content metadata to enumerate every content-store digest
 // the indexed-content blob is responsible for.
 func listChunkDigests(t *testing.T, ctx context.Context, s *Store, blobDigest digest.Digest) []digest.Digest {
 	t.Helper()

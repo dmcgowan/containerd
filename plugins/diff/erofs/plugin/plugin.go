@@ -25,22 +25,23 @@ import (
 
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/internal/dmverity"
-	"github.com/containerd/containerd/v2/internal/erofsutils"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/erofs"
 )
 
-// Config represents configuration for the erofs plugin.
+// Config represents configuration for the erofs differ plugin.
 type Config struct {
-	// MkfsOptions are extra options used for the applier
+	// MkfsOptions is retained for configuration-file compatibility but is
+	// now a no-op: the EROFS differ uses a pure-Go implementation and does
+	// not invoke mkfs.erofs.
 	MkfsOptions []string `toml:"mkfs_options"`
 
-	// EnableTarIndex enables the tar index mode where the index is generated
-	// for tar content without extracting the tar
+	// EnableTarIndex enables the tar index mode where only filesystem
+	// metadata is stored inline and file content is referenced by position
+	// in the original tar stream.
 	EnableTarIndex bool `toml:"enable_tar_index"`
 
-	// EnableDmverity enables dm-verity formatting for EROFS layers
-	// Linux only
+	// EnableDmverity enables dm-verity formatting for EROFS layers (Linux only).
 	EnableDmverity bool `toml:"enable_dmverity"`
 }
 
@@ -53,14 +54,8 @@ func init() {
 		},
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
-			tarModeSupported, err := erofsutils.SupportGenerateFromTar()
-			if err != nil {
-				return nil, fmt.Errorf("failed to check mkfs.erofs availability: %v: %w", err, plugin.ErrSkipPlugin)
-			}
-			if !tarModeSupported {
-				return nil, fmt.Errorf("mkfs.erofs does not support tar mode (--tar option), disabling erofs differ: %w", plugin.ErrSkipPlugin)
-			}
-
+			// The EROFS differ now uses pure-Go implementations (go-erofs +
+			// continuity/tarconv).  No mkfs.erofs binary is required.
 			md, err := ic.GetSingle(plugins.MetadataPlugin)
 			if err != nil {
 				return nil, err
@@ -69,17 +64,13 @@ func init() {
 			p := platforms.DefaultSpec()
 			p.OS = "linux"
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
-			// Select this differ for EROFS native images by default
+			// Select this differ for EROFS native images by default.
 			p.OSFeatures = []string{"erofs"}
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 			cs := md.(*metadata.DB).ContentStore()
 			config := ic.Config.(*Config)
 
 			var opts []erofs.DifferOpt
-
-			if len(config.MkfsOptions) > 0 {
-				opts = append(opts, erofs.WithMkfsOptions(config.MkfsOptions))
-			}
 
 			if config.EnableTarIndex {
 				opts = append(opts, erofs.WithTarIndexMode())
@@ -100,3 +91,6 @@ func init() {
 		},
 	})
 }
+
+// Ensure fmt import is used (ErrSkipPlugin wrapping uses it).
+var _ = fmt.Sprintf

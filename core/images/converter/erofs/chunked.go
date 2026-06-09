@@ -21,26 +21,27 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 
+	goerofs "github.com/erofs/go-erofs"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/content/index/chunked"
-	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/converter"
 	"github.com/containerd/containerd/v2/core/images/converter/uncompress"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	"github.com/containerd/continuity/tarconv"
 	"github.com/containerd/errdefs"
-	"github.com/google/uuid"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
-	"os"
 )
 
 // LayerConvertFuncChunked returns a converter.ConvertFunc that:
 //   - Converts a tar or tar+gzip layer to an EROFS image (via mkfs.erofs).
 //   - Splits the EROFS image into zstd-compressed chunks.
 //   - Appends a binary chunk index (erofs-image-spec §3.4) as a zstd skippable
-//     frame to produce a application/vnd.erofs.layer.v1+zstd blob.
+//     frame to produce a application/vnd.erofs+zstd blob.
 //   - Stores the whole blob in the regular content store so it can be exported
 //     or pushed via the standard OCI pusher.
 //   - When idxStore is non-nil, also ingests the blob into the indexed content
@@ -50,11 +51,11 @@ import (
 // the correct choice for the ctr image convert workflow where the goal is
 // producing a redistributable OCI blob, not enabling on-host chunk addressing.
 //
-// chunkSize controls the uncompressed chunk size.  Pass 0 to use the default
-// (chunked.DefaultChunkSize = 4 MiB).
-func LayerConvertFuncChunked(idxStore contentindex.Store, chunkSize int, opts ...ConvertOpt) converter.ConvertFunc {
-	if chunkSize <= 0 {
-		chunkSize = chunked.DefaultChunkSize
+// targetFrameSize controls the target compressed output frame size. Pass 0
+// to use the default (chunked.TargetFrameSize = 4 MiB).
+func LayerConvertFuncChunked(idxStore contentindex.Store, targetFrameSize int, opts ...ConvertOpt) converter.ConvertFunc {
+	if targetFrameSize <= 0 {
+		targetFrameSize = chunked.TargetFrameSize
 	}
 	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
 		var copts convertOptions
@@ -83,36 +84,36 @@ func LayerConvertFuncChunked(idxStore contentindex.Store, chunkSize int, opts ..
 			}
 		}
 
-		// ── Step 2: Convert the uncompressed tar to EROFS ────────────────
+		// ── Step 2: Convert the uncompressed tar to EROFS via tarconv ────
 		ra, err := cs.ReaderAt(ctx, *uncompressedDesc)
 		if err != nil {
 			return nil, fmt.Errorf("chunked converter: open uncompressed reader: %w", err)
 		}
 		defer ra.Close()
 
-		blobFile, err := os.CreateTemp("", "chunked-erofs-*.erofs")
+		erofsFile, err := os.CreateTemp("", "chunked-erofs-*.erofs")
 		if err != nil {
 			return nil, fmt.Errorf("chunked converter: create temp file: %w", err)
 		}
-		blobPath := blobFile.Name()
-		blobFile.Close()
-		defer os.Remove(blobPath)
+		defer os.Remove(erofsFile.Name())
 
-		var mkfsArgs []string
-		if copts.compressors != "" {
-			mkfsArgs = append(mkfsArgs, "-z"+copts.compressors)
-			mkfsArgs = append(mkfsArgs, "-C", "65536")
+		w := goerofs.Create(erofsFile)
+		if err := tarconv.Apply(w, newSectionReadReader(ra, ra.Size())); err != nil {
+			erofsFile.Close()
+			return nil, fmt.Errorf("chunked converter: tarconv: %w", err)
 		}
-		mkfsArgs = append(mkfsArgs, copts.mkfsExtraOpts...)
-		mkfsArgs = erofsutils.AddDefaultMkfsOpts(mkfsArgs)
-
-		u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
-		if err := erofsutils.ConvertTarErofs(ctx, newSectionReadReader(ra, ra.Size()), blobPath, u.String(), mkfsArgs); err != nil {
-			return nil, fmt.Errorf("chunked converter: mkfs.erofs: %w", err)
+		if err := w.Close(); err != nil {
+			erofsFile.Close()
+			return nil, fmt.Errorf("chunked converter: finalize EROFS: %w", err)
+		}
+		if _, err := erofsFile.Seek(0, io.SeekStart); err != nil {
+			erofsFile.Close()
+			return nil, fmt.Errorf("chunked converter: seek: %w", err)
 		}
 
-		// ── Step 3: Open the EROFS image and build the chunked blob ──────
-		erofsData, err := os.ReadFile(blobPath)
+		// ── Step 3: Read EROFS bytes and build the chunked blob ───────────
+		erofsData, err := io.ReadAll(erofsFile)
+		erofsFile.Close()
 		if err != nil {
 			return nil, fmt.Errorf("chunked converter: read erofs file: %w", err)
 		}
@@ -120,8 +121,8 @@ func LayerConvertFuncChunked(idxStore contentindex.Store, chunkSize int, opts ..
 		result, err := chunked.Build(
 			bytes.NewReader(erofsData),
 			int64(len(erofsData)),
-			contentindex.MediaTypeEROFSLayerZstd,
-			chunkSize,
+			contentindex.MediaTypeEROFSZstd,
+			targetFrameSize,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("chunked converter: build chunked blob: %w", err)
@@ -177,7 +178,16 @@ func LayerConvertFuncChunked(idxStore contentindex.Store, chunkSize int, opts ..
 			}
 		}
 
+		// Annotate the descriptor with the DiffID of the layer —
+		// the digest of the raw EROFS image bytes (erofsData), which is
+		// what the +zstd layer decompresses to.  This allows consumers to
+		// derive ChainIDs without rootfs.diff_ids in the image config.
+		diffID := digest.FromBytes(erofsData)
 		newDesc := result.Descriptor
+		if newDesc.Annotations == nil {
+			newDesc.Annotations = make(map[string]string)
+		}
+		newDesc.Annotations[contentindex.AnnotationUncompressedDigest] = diffID.String()
 		return &newDesc, nil
 	}
 }

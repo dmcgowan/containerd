@@ -25,15 +25,28 @@ import (
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
+// MultiLayerConvertFunc is a per-layer convert function that may return
+// multiple output descriptors for a single input layer — for example, a
+// split-data conversion that produces [dataLayerDesc, metaLayerDesc] per
+// source layer.  The returned slice must be in the left-to-right layers[]
+// order that the manifest should contain.
+//
+// A nil return value (with nil error) is treated the same as ConvertFunc
+// returning nil: the source layer is kept unchanged in the output manifest.
+type MultiLayerConvertFunc func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) ([]ocispec.Descriptor, error)
+
 type convertOpts struct {
-	layerConvertFunc   ConvertFunc
-	docker2oci         bool
-	indexConvertFunc   ConvertFunc
-	platformMC         platforms.MatchComparer
-	updateManifestFunc UpdateManifestFunc
-	appendToIndex      bool
+	layerConvertFunc      ConvertFunc
+	multiLayerConvertFunc MultiLayerConvertFunc
+	docker2oci            bool
+	indexConvertFunc      ConvertFunc
+	platformMC            platforms.MatchComparer
+	updateManifestFunc    UpdateManifestFunc
+	appendToIndex         bool
+	parallelism           int // 0 = unbounded
 }
 
 // Opt is an option for Convert()
@@ -69,6 +82,16 @@ func WithPlatform(p platforms.MatchComparer) Opt {
 func WithIndexConvertFunc(fn ConvertFunc) Opt {
 	return func(copts *convertOpts) error {
 		copts.indexConvertFunc = fn
+		return nil
+	}
+}
+
+// WithMultiLayerConvertFunc specifies a per-layer convert function that may
+// return multiple output descriptors per input layer (e.g. split-data mode).
+// When set, it takes precedence over WithLayerConvertFunc for per-layer work.
+func WithMultiLayerConvertFunc(fn MultiLayerConvertFunc) Opt {
+	return func(copts *convertOpts) error {
+		copts.multiLayerConvertFunc = fn
 		return nil
 	}
 }
@@ -116,6 +139,18 @@ func WithAppendToIndex() Opt {
 	}
 }
 
+// WithParallelism limits the number of manifests converted concurrently.
+// A value of 0 (the default) means no limit. Values < 0 are treated as 1.
+func WithParallelism(n int) Opt {
+	return func(copts *convertOpts) error {
+		if n < 0 {
+			n = 1
+		}
+		copts.parallelism = n
+		return nil
+	}
+}
+
 // Client is implemented by *containerd.Client .
 type Client interface {
 	WithLease(ctx context.Context, opts ...leases.Opt) (context.Context, func(context.Context) error, error)
@@ -144,18 +179,21 @@ func Convert(ctx context.Context, client Client, dstRef, srcRef string, opts ...
 				copts.docker2oci,
 				copts.platformMC,
 				copts.updateManifestFunc,
+				copts.parallelism,
 			)
-		} else if copts.updateManifestFunc != nil {
+		} else if copts.multiLayerConvertFunc != nil || copts.updateManifestFunc != nil {
 			c := &defaultConverter{
-				layerConvertFunc:   copts.layerConvertFunc,
-				docker2oci:         copts.docker2oci,
-				platformMC:         copts.platformMC,
-				diffIDMap:          make(map[digest.Digest]digest.Digest),
-				updateManifestFunc: copts.updateManifestFunc,
+				layerConvertFunc:      copts.layerConvertFunc,
+				multiLayerConvertFunc: copts.multiLayerConvertFunc,
+				docker2oci:            copts.docker2oci,
+				platformMC:            copts.platformMC,
+				diffIDMap:             make(map[digest.Digest]digest.Digest),
+				updateManifestFunc:    copts.updateManifestFunc,
+				parallelism:           copts.parallelism,
 			}
 			copts.indexConvertFunc = c.convert
 		} else {
-			copts.indexConvertFunc = DefaultIndexConvertFunc(copts.layerConvertFunc, copts.docker2oci, copts.platformMC)
+			copts.indexConvertFunc = DefaultIndexConvertFunc(copts.layerConvertFunc, copts.docker2oci, copts.platformMC, copts.parallelism)
 		}
 	}
 

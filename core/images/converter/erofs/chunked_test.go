@@ -62,7 +62,7 @@ func TestChunkedBlob_BackwardsCompatibility(t *testing.T) {
 	result, err := chunked.Build(
 		bytes.NewReader(imageData),
 		int64(len(imageData)),
-		contentindex.MediaTypeEROFSLayerZstd,
+		contentindex.MediaTypeEROFSZstd,
 		chunkSize,
 	)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestChunkedBlob_VariousChunkSizes(t *testing.T) {
 			}
 
 			result, err := chunked.Build(bytes.NewReader(imageData), int64(imageSize),
-				contentindex.MediaTypeEROFSLayerZstd, chunkSize)
+				contentindex.MediaTypeEROFSZstd, chunkSize)
 			if err != nil {
 				t.Fatalf("Build(%d): %v", chunkSize, err)
 			}
@@ -148,7 +148,7 @@ func TestExportImport_RoundTrip(t *testing.T) {
 	result, err := chunked.Build(
 		bytes.NewReader(imageData),
 		int64(len(imageData)),
-		contentindex.MediaTypeEROFSLayerZstd,
+		contentindex.MediaTypeEROFSZstd,
 		chunkSize,
 	)
 	if err != nil {
@@ -256,9 +256,9 @@ func TestExportImport_RoundTrip(t *testing.T) {
 		t.Fatal("imported layer descriptor has no annotations")
 	}
 	for _, key := range []string{
-		contentindex.AnnotationIndexRange,
-		contentindex.AnnotationIndexDigest,
-		contentindex.AnnotationIndexMediaType,
+		contentindex.AnnotationChunkIndexRange,
+		contentindex.AnnotationChunkIndexDigest,
+		contentindex.AnnotationChunkIndexMediaType,
 	} {
 		if v := importedLayerDesc.Annotations[key]; v == "" {
 			t.Errorf("annotation %s missing or empty after import", key)
@@ -267,17 +267,17 @@ func TestExportImport_RoundTrip(t *testing.T) {
 		}
 	}
 	// Verify the chunk-index range annotation survives unchanged.
-	if importedLayerDesc.Annotations[contentindex.AnnotationIndexRange] !=
-		layerDesc.Annotations[contentindex.AnnotationIndexRange] {
-		t.Errorf("AnnotationIndexRange changed: got %q want %q",
-			importedLayerDesc.Annotations[contentindex.AnnotationIndexRange],
-			layerDesc.Annotations[contentindex.AnnotationIndexRange])
+	if importedLayerDesc.Annotations[contentindex.AnnotationChunkIndexRange] !=
+		layerDesc.Annotations[contentindex.AnnotationChunkIndexRange] {
+		t.Errorf("AnnotationChunkIndexRange changed: got %q want %q",
+			importedLayerDesc.Annotations[contentindex.AnnotationChunkIndexRange],
+			layerDesc.Annotations[contentindex.AnnotationChunkIndexRange])
 	}
 }
 
 // TestExportImport_OrchestratedManifest tests that a chunked EROFS layer
 // exported in an OCI tar is importable and that the layer's media type is
-// preserved as application/vnd.erofs.layer.v1+zstd.
+// preserved as application/vnd.erofs+zstd.
 func TestExportImport_MediaTypePreserved(t *testing.T) {
 	ctx := namespaces.WithNamespace(context.Background(), "test")
 
@@ -287,7 +287,7 @@ func TestExportImport_MediaTypePreserved(t *testing.T) {
 	}
 	result, err := chunked.Build(
 		bytes.NewReader(imageData), int64(len(imageData)),
-		contentindex.MediaTypeEROFSLayerZstd, 4*1024,
+		contentindex.MediaTypeEROFSZstd, 4*1024,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -336,8 +336,8 @@ func TestExportImport_MediaTypePreserved(t *testing.T) {
 	}
 
 	_, layerDesc := findLayerFromIndex(t, ctx, dstCS, idxDesc)
-	if layerDesc.MediaType != contentindex.MediaTypeEROFSLayerZstd {
-		t.Errorf("media type: got %q want %q", layerDesc.MediaType, contentindex.MediaTypeEROFSLayerZstd)
+	if layerDesc.MediaType != contentindex.MediaTypeEROFSZstd {
+		t.Errorf("media type: got %q want %q", layerDesc.MediaType, contentindex.MediaTypeEROFSZstd)
 	} else {
 		t.Logf("media type preserved: %s ✓", layerDesc.MediaType)
 	}
@@ -363,7 +363,7 @@ func TestTarLayer_ToChunkedBlob_BackwardsCompat(t *testing.T) {
 	result, err := chunked.Build(
 		bytes.NewReader(tarData),
 		int64(len(tarData)),
-		contentindex.MediaTypeEROFSLayerZstd,
+		contentindex.MediaTypeEROFSZstd,
 		4*1024, // chunk size larger than the tar; produces a single chunk
 	)
 	if err != nil {

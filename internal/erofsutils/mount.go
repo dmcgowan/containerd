@@ -17,14 +17,12 @@
 package erofsutils
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/containerd/errdefs"
@@ -34,8 +32,10 @@ import (
 )
 
 // IsErofsMediaType returns true if the media type is an EROFS layer type.
+// Recognises both the canonical application/vnd.erofs[+zstd] types and the
+// legacy application/vnd.erofs.layer.v1[+zstd] aliases.
 func IsErofsMediaType(mt string) bool {
-	return strings.HasPrefix(mt, "application/vnd.erofs.layer")
+	return strings.HasPrefix(mt, "application/vnd.erofs")
 }
 
 func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string, mkfsExtraOpts []string) error {
@@ -109,22 +109,13 @@ func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath, u
 	return nil
 }
 
-// AddDefaultMkfsOpts adds default options for mkfs.erofs
+// AddDefaultMkfsOpts is retained for API compatibility but is now a no-op:
+// the pure-Go EROFS implementations do not invoke mkfs.erofs and the
+// Darwin block-size workaround is not required.
+//
+// Deprecated: no replacement needed; remove call sites.
 func AddDefaultMkfsOpts(mkfsExtraOpts []string) []string {
-	if runtime.GOOS != "darwin" {
-		return mkfsExtraOpts
-	}
-
-	// Check if -b argument is already present
-	for _, opt := range mkfsExtraOpts {
-		if strings.HasPrefix(opt, "-b") {
-			return mkfsExtraOpts
-		}
-	}
-
-	// Add -b4096 as the first option to prevent unusable block
-	// size from being used on macOS.
-	return append([]string{"-b4096"}, mkfsExtraOpts...)
+	return mkfsExtraOpts
 }
 
 func ConvertErofs(ctx context.Context, layerPath string, srcDir string, mkfsExtraOpts []string) error {
@@ -188,14 +179,12 @@ func MountsToLayer(mounts []mount.Mount) (string, error) {
 	return layer, nil
 }
 
-// SupportGenerateFromTar checks if the installed version of mkfs.erofs supports
-// the tar mode (--tar option).
+// SupportGenerateFromTar reports whether EROFS tar-mode conversion is
+// available.  It always returns (true, nil) now that the EROFS differ uses a
+// pure-Go implementation that does not depend on the mkfs.erofs binary.
+//
+// Deprecated: the function is retained for API compatibility only.  Callers
+// should remove the check; tar-mode is always supported.
 func SupportGenerateFromTar() (bool, error) {
-	cmd := exec.Command("mkfs.erofs", "--help")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return false, fmt.Errorf("failed to run mkfs.erofs --help: %w", err)
-	}
-
-	return bytes.Contains(output, []byte("--tar=")), nil
+	return true, nil
 }

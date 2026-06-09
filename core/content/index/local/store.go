@@ -20,12 +20,14 @@
 // The store keeps chunk content in containerd's existing content store
 // (one content store entry per chunk, keyed by the chunk's per-chunk
 // hash from the chunk index) and tracks blob → reachability metadata in
-// a sidecar BoltDB database.  See buckets.go for the schema.
+// buckets inside the shared metadata BoltDB.  See buckets.go for the
+// schema.
 //
-// The sidecar is intentionally minimal (GC + blob-reproduction only);
-// all other chunk metadata (offsets, lengths, weights, etc.) is re-read
-// on demand by opening the chunk-index content-store entry (keyed by
-// Info.IndexDigest) and parsing it.
+// Metadata writes join any bolt.Tx already on the context via
+// boltutil.WithTransaction, falling back to opening their own transaction
+// when none is present.  Callers that want to batch multiple writes into
+// a single fsync push a writable transaction onto the context before
+// calling into the store (see bolt.go for the view/update helpers).
 package local
 
 import (
@@ -53,10 +55,14 @@ import (
 
 // Config configures the local store at construction time.
 type Config struct {
-	// Root is the directory the store owns; it holds the sidecar BoltDB
-	// file and any temporary ingest scratch files. Created with mode 0700
-	// if absent.
+	// Root is the directory used for temporary ingest scratch files.
+	// Created with mode 0700 if absent.
 	Root string
+
+	// DB is the shared metadata transactor.  In production this is the
+	// containerd metadata.DB; in tests a plain *bolt.DB is sufficient
+	// (it satisfies the Transactor interface directly).  Required.
+	DB Transactor
 
 	// Content is the content store the indexed content store delegates
 	// chunk, chunk-index, and extra byte-range storage to. Required.
@@ -69,12 +75,12 @@ type Config struct {
 
 // Store is the local implementation of index.Store.
 type Store struct {
-	cfg    Config
-	dbPath string
-	db     *bolt.DB
+	cfg Config
+	db  Transactor
 
-	mu      sync.Mutex
-	ingests map[string]*ingestState // active ingests, keyed by ref
+	mu        sync.Mutex
+	ingests   map[string]*ingestState  // active ingests, keyed by ref
+	fillGates map[fillChunkKey]*fillGate // in-flight FillChunk coalescing
 }
 
 // ingestState tracks an in-flight ingest so concurrent calls to Writer
@@ -85,9 +91,16 @@ type ingestState struct {
 	startedAt time.Time
 }
 
-// NewStore opens (or creates) the local indexed content store rooted at
-// cfg.Root.
+// NewStore initialises the local indexed content store.
+//
+// cfg.DB must be set to the shared metadata Transactor (the containerd
+// metadata.DB in production, a plain *bolt.DB in tests).  The store writes
+// its metadata into the shared BoltDB under the "indexed-content" bucket
+// path; it does not open or own any database file itself.
 func NewStore(cfg Config) (*Store, error) {
+	if cfg.DB == nil {
+		return nil, fmt.Errorf("content/index: Config.DB is required")
+	}
 	if cfg.Content == nil {
 		return nil, fmt.Errorf("content/index: Config.Content is required")
 	}
@@ -100,40 +113,31 @@ func NewStore(cfg Config) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(cfg.Root, "ingest"), 0700); err != nil {
 		return nil, fmt.Errorf("content/index: create ingest dir: %w", err)
 	}
-	dbPath := filepath.Join(cfg.Root, "meta.db")
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return nil, fmt.Errorf("content/index: open sidecar db: %w", err)
-	}
-	// Ensure the DB version key is written on first open.
-	if err := db.Update(initDBVersion); err != nil {
-		db.Close()
+	// Ensure the indexed-content schema version key is written.
+	if err := cfg.DB.Update(initDBVersion); err != nil {
 		return nil, fmt.Errorf("content/index: init db version: %w", err)
 	}
 	return &Store{
 		cfg:     cfg,
-		dbPath:  dbPath,
-		db:      db,
+		db:      cfg.DB,
 		ingests: map[string]*ingestState{},
 	}, nil
 }
 
-// Close releases the sidecar database handle.
-func (s *Store) Close() error {
-	if s.db == nil {
-		return nil
-	}
-	err := s.db.Close()
-	s.db = nil
-	return err
-}
+// Compile-time assertion: Store implements contentindex.Store.
+var _ contentindex.Store = (*Store)(nil)
+
+// Close is a no-op: the store does not own the database it was given.
+// It exists for interface compatibility and to allow callers to defer
+// store.Close() without special-casing.
+func (s *Store) Close() error { return nil }
 
 // ContentStore returns the underlying content store.
 func (s *Store) ContentStore() content.Store { return s.cfg.Content }
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
-// Info returns the sidecar metadata for a blob.  Chunk offsets and lengths
+// Info returns the metadata record for a blob.  Chunk offsets and lengths
 // are NOT included; open and parse the chunk-index content-store entry (keyed
 // by the returned Info.IndexDigest) to get them.
 func (s *Store) Info(ctx context.Context, dgst digest.Digest) (contentindex.Info, error) {
@@ -142,7 +146,7 @@ func (s *Store) Info(ctx context.Context, dgst digest.Digest) (contentindex.Info
 		return contentindex.Info{}, err
 	}
 	var info contentindex.Info
-	err = s.db.View(func(tx *bolt.Tx) error {
+	err = view(ctx, s.db, func(tx *bolt.Tx) error {
 		blobBkt := getBlobBucket(tx, ns, dgst)
 		if blobBkt == nil {
 			return blobNotFound(dgst)
@@ -171,7 +175,7 @@ func (s *Store) Update(ctx context.Context, info contentindex.Info, fieldpaths .
 		return contentindex.Info{}, err
 	}
 	var out contentindex.Info
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err = update(ctx, s.db, func(tx *bolt.Tx) error {
 		blobBkt := getBlobBucket(tx, ns, info.Digest)
 		if blobBkt == nil {
 			return blobNotFound(info.Digest)
@@ -210,7 +214,7 @@ func (s *Store) Walk(ctx context.Context, fn contentindex.WalkFunc, filterString
 	if err != nil {
 		return err
 	}
-	return s.db.View(func(tx *bolt.Tx) error {
+	return view(ctx, s.db, func(tx *bolt.Tx) error {
 		bb := getBlobsBucket(tx, ns)
 		if bb == nil {
 			return nil
@@ -244,7 +248,7 @@ func (s *Store) Walk(ctx context.Context, fn contentindex.WalkFunc, filterString
 	})
 }
 
-// Delete removes a blob from the sidecar database.  Chunks and extras the
+// Delete removes the metadata record for a blob.  Chunks and extras the
 // blob referenced are no longer pinned by this entry; whether they are
 // reclaimed depends on whether any other indexed-content blob still names them.
 func (s *Store) Delete(ctx context.Context, dgst digest.Digest) error {
@@ -252,7 +256,7 @@ func (s *Store) Delete(ctx context.Context, dgst digest.Digest) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return update(ctx, s.db, func(tx *bolt.Tx) error {
 		bb := getBlobsBucket(tx, ns)
 		if bb == nil {
 			return blobNotFound(dgst)
@@ -272,7 +276,7 @@ func (s *Store) Delete(ctx context.Context, dgst digest.Digest) error {
 // The descriptor must carry org.erofs.index.* annotations so the reader can
 // locate the chunk-index section within the blob.  Only desc.Digest and
 // desc.Annotations are required; desc.Size is used for the reader's Size()
-// method (falling back to the sidecar's recorded size if zero).
+// method (falling back to the metadata-recorded size if zero).
 func (s *Store) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
@@ -285,12 +289,12 @@ func (s *Store) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.
 		return nil, err
 	}
 
-	// Read sidecar: IndexDigest, blob size, extras.
+	// Read metadata record: IndexDigest, blob size, extras.
 	var (
 		meta   blobMeta
 		extras []extra
 	)
-	if err := s.db.View(func(tx *bolt.Tx) error {
+	if err := view(ctx, s.db, func(tx *bolt.Tx) error {
 		blobBkt := getBlobBucket(tx, ns, desc.Digest)
 		if blobBkt == nil {
 			return blobNotFound(desc.Digest)
@@ -385,7 +389,7 @@ type segment struct {
 	// (or raw bytes for a raw layer).
 	chunkDigest digest.Digest
 
-	// For segExtra: compressed bytes (either inline from the sidecar or
+	// For segExtra: compressed bytes (either inline from the metadata record or
 	// loaded once from the content store) and their decompressed form
 	// (populated lazily on first access).
 	extraDigest  digest.Digest // non-empty → content-store entry
@@ -436,7 +440,7 @@ func (seg *segment) decompressedExtra(ctx context.Context, cs content.Store) ([]
 	return seg.extraDec, seg.extraDecErr
 }
 
-// buildSegments merges the parsed chunks and sidecar extras into a single
+// buildSegments merges the parsed chunks and stored extras into a single
 // list of segments sorted by start offset, covering [0, blobSize).
 //
 // Chunks own their on-blob byte ranges.  Extras fill everything else.

@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"path/filepath"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/content"
@@ -33,7 +34,30 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	bolt "go.etcd.io/bbolt"
 )
+
+// newTestStore opens a plain bolt.DB (which satisfies Transactor directly)
+// and creates an indexed content store backed by it.  The DB is closed
+// automatically when the test ends.
+func newTestStore(t *testing.T, cs content.Store) *Store {
+	t.Helper()
+	bdb, err := bolt.Open(
+		filepath.Join(t.TempDir(), "meta.db"), 0644, nil)
+	if err != nil {
+		t.Fatalf("open bolt db: %v", err)
+	}
+	t.Cleanup(func() { bdb.Close() })
+	store, err := NewStore(Config{
+		Root:    t.TempDir(),
+		DB:      bdb,
+		Content: cs,
+	})
+	if err != nil {
+		t.Fatalf("new indexed store: %v", err)
+	}
+	return store
+}
 
 // TestRoundTrip_ZstdChunkedBlob creates a synthetic +zstd chunked blob whose
 // format matches the erofs-image-spec exactly, ingests it into the local
@@ -57,12 +81,7 @@ func TestRoundTrip_ZstdChunkedBlob(t *testing.T) {
 	}
 
 	// Build the indexed content store.
-	idxRoot := t.TempDir()
-	store, err := NewStore(Config{Root: idxRoot, Content: cs})
-	if err != nil {
-		t.Fatalf("new indexed store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
+	store := newTestStore(t, cs)
 
 	// ── Build a chunked blob ───────────────────────────────────────────────
 	// Chunk sizes (uncompressed). Kept small for test speed; real layers
@@ -97,7 +116,7 @@ func TestRoundTrip_ZstdChunkedBlob(t *testing.T) {
 		t.Fatalf("Info: %v", err)
 	}
 	if info.IndexDigest == "" {
-		t.Fatal("IndexDigest not recorded in sidecar")
+		t.Fatal("IndexDigest not recorded in metadata")
 	}
 	if _, err := cs.Info(ctx, info.IndexDigest); err != nil {
 		t.Fatalf("chunk-index entry %s not found in content store: %v", info.IndexDigest, err)
@@ -198,8 +217,8 @@ func TestRoundTrip_ZstdChunkedBlob(t *testing.T) {
 	if info.Size != int64(len(blob)) {
 		t.Errorf("Info.Size = %d, want %d", info.Size, len(blob))
 	}
-	if info.MediaType != contentindex.MediaTypeEROFSLayerZstd {
-		t.Errorf("Info.MediaType = %q, want %q", info.MediaType, contentindex.MediaTypeEROFSLayerZstd)
+	if info.MediaType != contentindex.MediaTypeEROFSZstd {
+		t.Errorf("Info.MediaType = %q, want %q", info.MediaType, contentindex.MediaTypeEROFSZstd)
 	}
 	t.Logf("Info: size=%d mediaType=%s indexDigest=%s", info.Size, info.MediaType, info.IndexDigest)
 }
@@ -213,11 +232,7 @@ func TestReingestDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewStore(Config{Root: t.TempDir(), Content: cs})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
+	store := newTestStore(t, cs)
 
 	blob, desc := buildZstdChunkedBlob(t, []int{8 * 1024, 16 * 1024})
 	ingest := func() error {
@@ -257,20 +272,16 @@ func TestReingestDedup(t *testing.T) {
 	t.Logf("content-store entries: before=%d after=%d", countBefore, countAfter)
 }
 
-// TestDeleteRemovesSidecar verifies that Delete removes the sidecar record
+// TestDeleteRemovesMetadataRecord verifies that Delete removes the metadata record
 // and that a subsequent Info returns ErrNotFound.
-func TestDeleteRemovesSidecar(t *testing.T) {
+func TestDeleteRemovesMetadataRecord(t *testing.T) {
 	ctx := namespaces.WithNamespace(context.Background(), "test")
 
 	cs, err := localcs.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewStore(Config{Root: t.TempDir(), Content: cs})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { store.Close() })
+	store := newTestStore(t, cs)
 
 	blob, desc := buildZstdChunkedBlob(t, []int{4 * 1024})
 	w, err := store.Writer(ctx,
@@ -291,7 +302,7 @@ func TestDeleteRemovesSidecar(t *testing.T) {
 	if _, err := store.Info(ctx, desc.Digest); err == nil {
 		t.Fatal("expected ErrNotFound after Delete, got nil")
 	}
-	t.Log("Delete: sidecar record removed correctly")
+	t.Log("Delete: metadata record removed correctly")
 }
 
 // ── Blob builder ─────────────────────────────────────────────────────────────
@@ -345,48 +356,41 @@ func buildZstdChunkedBlob(t *testing.T, chunkSizes []int) ([]byte, ocispec.Descr
 		uncompTotal += int64(sz)
 	}
 
-	// ── Build the chunk-index payload (24-byte header + N × 8-byte entry) ──
+	// ── Build the chunk-index payload (32-byte header + N × 48-byte entry) ──
 	//
-	// Using +zstd fixed-size mode: ChunkSize = first chunk size (all same
-	// in our test), HashAlgo = SHA-256, HashSize = 32, no Weight.
-	// Entry shape: BlockOffset(8) + Checksum(32) = 40 bytes each.
-	//
-	// For simplicity (and because the test has chunks of different sizes),
-	// we use variable-size mode (ChunkSize = 0) so each entry carries an
-	// explicit BlockOffset. Entry shape: BlockOffset(8) + Checksum(32) = 40 bytes.
+	// Variable-mode entry shape: BlockOffset(8) + UncompressedOffset(8) +
+	// SHA-256 Checksum(32) = 48 bytes each (erofs-image-spec §3.4).
 	const (
 		hashAlgoSHA2 = uint8(1)
 		hashSize     = uint8(32)
+		testEntrySize = 8 + 8 + int(hashSize) // 48 bytes
 	)
-	entrySize := 8 + int(hashSize) // BlockOffset + Checksum (no Weight, variable+zstd = +UncompressedOffset too)
-	// For +zstd variable-size: BlockOffset(8) + UncompressedOffset(8) + Checksum(32) = 48 bytes
-	entrySize = 8 + 8 + int(hashSize) // = 48
 
 	var idxBuf bytes.Buffer
 
-	// Header (24 bytes, little-endian)
-	var hdr [24]byte
+	// Header (32 bytes, little-endian; erofs-image-spec §3.4.1).
+	var hdr [32]byte
 	binary.LittleEndian.PutUint32(hdr[0:4], chunkIndexMagic)
-	binary.LittleEndian.PutUint32(hdr[4:8], chunkIndexVersion)
+	hdr[4] = 1 // Version = 1
+	hdr[5] = 1 // CompressionType = zstd
+	// hdr[6:8] Flags = 0 (reserved uint16)
 	binary.LittleEndian.PutUint64(hdr[8:16], uint64(uncompTotal))
-	binary.LittleEndian.PutUint32(hdr[16:20], 0) // ChunkSize = 0 (variable)
+	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(chunks)))
 	hdr[20] = hashAlgoSHA2
 	hdr[21] = hashSize
-	hdr[22] = 0 // Flags: no weight
-	hdr[23] = 0 // Reserved
+	// hdr[22:32] Reserved = 0
 	idxBuf.Write(hdr[:])
 
 	// Entries: one per chunk.
 	for _, c := range chunks {
-		var entry [48]byte
-		binary.LittleEndian.PutUint64(entry[0:8], uint64(c.blobStart))       // BlockOffset
-		binary.LittleEndian.PutUint64(entry[8:16], uint64(c.uncompOffset))   // UncompressedOffset
-		copy(entry[16:48], c.hash)                                             // Checksum (SHA-256)
-		idxBuf.Write(entry[:entrySize])
+		var entry [testEntrySize]byte
+		binary.LittleEndian.PutUint64(entry[0:8], uint64(c.blobStart))     // BlockOffset
+		binary.LittleEndian.PutUint64(entry[8:16], uint64(c.uncompOffset)) // UncompressedOffset
+		copy(entry[16:48], c.hash)                                          // Checksum (SHA-256)
+		idxBuf.Write(entry[:])
 	}
 
 	idxPayload := idxBuf.Bytes()
-	_ = entrySize // used above
 
 	// ── Wrap chunk-index in a zstd skippable frame ────────────────────────
 	// Magic must be in [0x184D2A50, 0x184D2A5F].
@@ -414,13 +418,13 @@ func buildZstdChunkedBlob(t *testing.T, chunkSizes []int) ([]byte, ocispec.Descr
 	rangeAnnotation := fmt.Sprintf("%d:%d", chunkIndexSectionOffset, chunkIndexEnd)
 
 	desc := ocispec.Descriptor{
-		MediaType: contentindex.MediaTypeEROFSLayerZstd,
+		MediaType: contentindex.MediaTypeEROFSZstd,
 		Digest:    blobDigest,
 		Size:      int64(len(blob)),
 		Annotations: map[string]string{
-			contentindex.AnnotationIndexRange:     rangeAnnotation,
-			contentindex.AnnotationIndexDigest:    idxDigest.String(),
-			contentindex.AnnotationIndexMediaType: contentindex.ChunkIndexMediaTypeEROFSv1,
+			contentindex.AnnotationChunkIndexRange:     rangeAnnotation,
+			contentindex.AnnotationChunkIndexDigest:    idxDigest.String(),
+			contentindex.AnnotationChunkIndexMediaType: contentindex.ChunkIndexMediaTypeEROFSV1,
 		},
 	}
 

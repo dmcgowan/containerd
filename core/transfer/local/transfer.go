@@ -28,12 +28,20 @@ import (
 	"github.com/containerd/errdefs"
 
 	"github.com/containerd/containerd/v2/core/content"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/pkg/imageverifier"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// lazyIndexStore is the minimal interface the transfer service needs to
+// perform a lazy ingest. Implemented by local.Store.
+type lazyIndexStore interface {
+	WriteLazy(ctx context.Context, ref string, desc ocispec.Descriptor, p contentindex.ByteProvider) error
+}
 
 type localTransferService struct {
 	content content.Store
@@ -59,6 +67,9 @@ func NewTransferService(cs content.Store, is images.Store, tc TransferConfig) tr
 	if tc.MaxConcurrentDownloads > 0 {
 		ts.limiterD = semaphore.NewWeighted(int64(tc.MaxConcurrentDownloads))
 	}
+	// MaxConcurrentUnpacks > 1 enables parallel layer unpack. Value of 0 or 1
+	// means sequential (no semaphore). Parallel unpack requires the snapshotter
+	// to support the "rebase" capability.
 	if tc.MaxConcurrentUnpacks > 1 {
 		ts.limiterP = semaphore.NewWeighted(int64(tc.MaxConcurrentUnpacks))
 	}
@@ -207,4 +218,10 @@ type TransferConfig struct {
 
 	// RegistryConfigPath is a path to the root directory containing registry-specific configurations
 	RegistryConfigPath string
+
+	// IndexStore is the optional indexed content store used for lazy EROFS
+	// layer ingest. When set and an UnpackConfiguration has LazyEROFS=true,
+	// EROFS layers carrying org.erofs.chunk-index.range are ingested lazily
+	// (only the chunk-index section is downloaded) via this store.
+	IndexStore lazyIndexStore
 }

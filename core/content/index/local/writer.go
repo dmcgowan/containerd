@@ -53,7 +53,7 @@ import (
 //     any zero-padding, and the chunk-index payload itself) are
 //     identified, zstd-compressed, and stored inline (when compressed
 //     size < inlineThreshold) or as content-store entries.
-//  6. The sidecar record is written: scalar metadata, ordered chunk-digest
+//  6. The metadata record is written: scalar metadata, ordered chunk-digest
 //     list (for GC), and extras list (for byte-exact reproduction).
 //
 // The descriptor passed via content.WithDescriptor is required and must
@@ -188,7 +188,7 @@ func (w *writer) Close() error {
 }
 
 // Commit verifies the blob, extracts all content-store entries and extras,
-// and writes the sidecar record.  Always closes the writer, even on error.
+// and writes the metadata record.  Always closes the writer, even on error.
 func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
 	defer w.Close()
 	if w.closed {
@@ -270,7 +270,7 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 		return err
 	}
 
-	// ── 6. Write sidecar record ──────────────────────────────────────────
+	// ── 6. Write metadata record ──────────────────────────────────────────
 	now := time.Now().UTC()
 	m := blobMeta{
 		Size:        blobSize,
@@ -281,7 +281,7 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 	}
 	infoLabels := extractOptLabels(opts...)
 
-	return w.store.db.Update(func(tx *bolt.Tx) error {
+	return update(ctx, w.store.db, func(tx *bolt.Tx) error {
 		blobBkt, err := createBlobBucket(tx, w.ns, actual)
 		if err != nil {
 			return err

@@ -95,7 +95,8 @@ func cleanupUpper(upper string) error {
 }
 
 func convertDirToErofs(ctx context.Context, layerBlob, upperDir string) error {
-	err := erofsutils.ConvertErofs(ctx, layerBlob, upperDir, nil)
+	// Pure-Go implementation via go-erofs (no mkfs.erofs subprocess).
+	err := erofsutils.ConvertDirErofsGo(ctx, layerBlob, upperDir)
 	if err != nil {
 		return err
 	}

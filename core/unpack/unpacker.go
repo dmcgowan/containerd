@@ -319,9 +319,22 @@ func (u *Unpacker) unpack(
 		return fmt.Errorf("unmarshal image config: %w", err)
 	}
 
-	diffIDs := i.RootFS.DiffIDs
-	if len(layers) != len(diffIDs) {
-		return fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(diffIDs))
+	// Build the per-layer DiffID list. For each layer, the annotation
+	// org.erofs.uncompressed-digest is preferred; when absent,
+	// UncompressedDigestFromDescriptor falls back to the content-store
+	// label and live decompression (erofs-image-spec §5.2).
+	// rootfs.diff_ids is retained only for the length-consistency check
+	// and as a last-resort fallback inside UncompressedDigestFromDescriptor.
+	if legacy := i.RootFS.DiffIDs; len(legacy) > 0 && len(legacy) != len(layers) {
+		return fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(legacy))
+	}
+	diffIDs := make([]digest.Digest, len(layers))
+	for idx, layerDesc := range layers {
+		d, err := images.UncompressedDigestFromDescriptor(ctx, u.content, layerDesc)
+		if err != nil {
+			return fmt.Errorf("deriving diff-id for layer %d (%s): %w", idx, layerDesc.Digest, err)
+		}
+		diffIDs[idx] = d
 	}
 
 	// TODO: Support multiple unpacks rather than just first match

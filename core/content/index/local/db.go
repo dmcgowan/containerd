@@ -191,7 +191,7 @@ type extraKind string
 
 const (
 	// extraKindIndex is the chunk-index payload (24-byte header + N entries).
-	// Its content-store entry digest equals the sidecar's `index` key.
+	// Its content-store entry digest equals the metadata record's `index` key.
 	extraKindIndex extraKind = "index"
 
 	// extraKindFrame is the 8-byte zstd skippable-frame header that precedes
@@ -225,7 +225,7 @@ type extra struct {
 }
 
 // inlineThreshold is the maximum compressed-extra size that is stored inline
-// in the sidecar rather than as a separate content-store entry.
+// in the metadata record rather than as a separate content-store entry.
 const inlineThreshold = 4096
 
 // writeExtras writes the ordered extras list into the extras sub-bucket.
@@ -323,7 +323,7 @@ func readExtra(exBkt *bolt.Bucket) (extra, error) {
 
 // ── Info conversion ───────────────────────────────────────────────────────────
 
-// metaToInfo converts the sidecar fields into the public Info type.
+// metaToInfo converts the stored metadata fields into the public Info type.
 func metaToInfo(dgst digest.Digest, m blobMeta, lbls map[string]string) contentindex.Info {
 	return contentindex.Info{
 		Digest:      dgst,
@@ -339,10 +339,13 @@ func metaToInfo(dgst digest.Digest, m blobMeta, lbls map[string]string) contenti
 
 // ── DB version ────────────────────────────────────────────────────────────────
 
-// initDBVersion writes the dbVersion varint under bucketKeyDBVersion in the
-// schema-version bucket if it is not already set.
+// initDBVersion writes the dbVersion varint at
+// v1/indexed-content/version if it is not already set.
+// This path is distinct from core/metadata's v1/version key,
+// avoiding any collision when sharing the metadata BoltDB.
 func initDBVersion(tx *bolt.Tx) error {
-	bkt, err := tx.CreateBucketIfNotExists(bucketKeyVersion)
+	bkt, err := createBucketIfNotExists(tx,
+		bucketKeyVersion, bucketKeyIndexedContent)
 	if err != nil {
 		return err
 	}
