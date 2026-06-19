@@ -1,0 +1,95 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+syntax = "proto3";
+
+package containerd.services.blockcache.v1;
+
+option go_package = "github.com/containerd/containerd/api/services/blockcache/v1;blockcache";
+
+// BlockCache provides on-demand filling of sparse block files backing
+// mounted filesystem images.  The service is intended to be consumed by shims
+// that handle "block" mount types: the shim opens a Fill stream, and the
+// daemon fills the sparse backing file from its content store on demand.
+//
+// The stream remains open for the lifetime of the mount.  The daemon's
+// cache.Handle for the block is reference-counted by the stream: the first
+// FillMessage must be a Hello identifying the block; the stream is released
+// when closed by either side.
+service BlockCache {
+  // Fill is a long-lived bidirectional stream.
+  //
+  //   Shim → daemon: Hello{blockid} once, then Fill{range} messages.
+  //   Daemon → shim: Filled{ranges} messages (not necessarily 1:1 with Fill).
+  //
+  // The shim tracks which pages are resident using its own page-level bitmap
+  // and uses the Filled ranges to set bits.  When all pages are resident the
+  // stream may be closed.
+  //
+  // Filled messages may arrive spontaneously (e.g., background prefetch)
+  // or in response to a Fill request.  The daemon may coalesce multiple Fill
+  // requests into a single Filled response.
+  rpc Fill(stream FillMessage) returns (stream FillMessage);
+}
+
+// FillMessage is the single message type on both sides of the Fill stream.
+message FillMessage {
+  oneof msg {
+    // Hello: first message from shim → daemon.  Identifies the block.
+    Hello hello = 1;
+    // Fill: shim → daemon.  Request that [offset, offset+length) be filled.
+    FillRequest fill = 2;
+    // Filled: daemon → shim.  Ranges that are now resident in the backing file.
+    Filled filled = 3;
+    // Error: daemon → shim.  A fill could not be completed; the shim should
+    // propagate an error to the waiting container read.
+    FillError error = 4;
+  }
+}
+
+// Hello identifies the block to fill.  Must be the first message on the stream.
+message Hello {
+  // blockid is an opaque identifier for the block, typically a content digest
+  // (e.g. "sha256:abc…") matching the blockid= option on the mount descriptor.
+  string blockid = 1;
+}
+
+// FillRequest asks the daemon to ensure [offset, offset+length) is resident.
+// The daemon will call EnsureRange on the cache and respond with Filled.
+message FillRequest {
+  int64 offset = 1;
+  int64 length = 2;
+}
+
+// Filled reports which byte ranges are now resident in the backing file.
+// Ranges are chunk-aligned and may extend beyond the requested range.
+// They are cumulative — the shim should OR them into its local bitmap.
+// A single Filled message may satisfy multiple pending FillRequests.
+message Filled {
+  repeated ByteRange ranges = 1;
+}
+
+// FillError signals that a fill request failed.  The shim should propagate
+// an I/O error to the container rather than retrying indefinitely.
+message FillError {
+  string message = 1;
+}
+
+// ByteRange is a [offset, offset+length) byte span.
+message ByteRange {
+  int64 offset = 1;
+  int64 length = 2;
+}

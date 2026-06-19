@@ -18,6 +18,7 @@ package builtins
 
 // register containerd builtins here
 import (
+	_ "github.com/containerd/containerd/v2/plugins/mount/fsview/block" // pure-ReaderAt fsview for type="block" sparse EROFS
 	_ "github.com/containerd/containerd/v2/plugins/mount/fsview/erofs"
 
 	_ "github.com/containerd/containerd/v2/core/runtime/v2"
@@ -35,6 +36,7 @@ import (
 	_ "github.com/containerd/containerd/v2/plugins/server/grpc"
 	_ "github.com/containerd/containerd/v2/plugins/server/metrics"
 	_ "github.com/containerd/containerd/v2/plugins/server/ttrpc"
+	_ "github.com/containerd/containerd/v2/plugins/services/blockcache"
 	_ "github.com/containerd/containerd/v2/plugins/services/containers"
 	_ "github.com/containerd/containerd/v2/plugins/services/content"
 	_ "github.com/containerd/containerd/v2/plugins/services/diff"

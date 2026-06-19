@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	blockcachev1 "github.com/containerd/containerd/api/services/blockcache/v1"
 	v1 "github.com/containerd/containerd/api/services/ttrpc/events/v1"
 	"github.com/containerd/containerd/v2/pkg/dialer"
 	"github.com/containerd/ttrpc"
@@ -94,6 +95,17 @@ func (c *Client) EventsService() (v1.TTRPCEventsService, error) {
 		return nil, err
 	}
 	return v1.NewTTRPCEventsClient(client), nil
+}
+
+// BlockCacheService creates a BlockCacheService client for on-demand block fills.
+// Shims that handle "block" mount types use this to stream fill requests to
+// the daemon's BlockCache service.
+func (c *Client) BlockCacheService() (blockcachev1.TTRPCBlockCacheClient, error) {
+	client, err := c.Client()
+	if err != nil {
+		return nil, err
+	}
+	return blockcachev1.NewTTRPCBlockCacheClient(client), nil
 }
 
 // Client returns the underlying TTRPC client object

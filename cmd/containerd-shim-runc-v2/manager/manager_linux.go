@@ -383,6 +383,23 @@ func (m manager) Info(ctx context.Context, optionsR io.Reader) (*types.RuntimeIn
 			return nil, fmt.Errorf("failed to marshal %T: %w", features, err)
 		}
 	}
+
+	// Advertise the mount types this shim handles natively.
+	// "format/*" and "mkfs/*" are the existing transform prefixes handled by
+	// the mount manager running inside the shim.
+	//
+	// "block" is only advertised when the shim can set up loop devices
+	// (requires CAP_SYS_ADMIN / root).  When omitted, the daemon's mount
+	// manager activates block mounts itself — using erofs-fuse as a
+	// privilege-free alternative to loop — before the shim starts.
+	allowedMounts := "format/*,mkfs/*"
+	if canUseLoopDevices() {
+		allowedMounts = "block," + allowedMounts
+	}
+	info.Annotations = map[string]string{
+		"containerd.io/runtime-allow-mounts": allowedMounts,
+	}
+
 	return info, nil
 }
 
@@ -399,4 +416,18 @@ func (m manager) features(ctx context.Context, absBinary string, opts *options.O
 		return nil, err
 	}
 	return &feat, nil
+}
+
+// canUseLoopDevices reports whether the current process can set up loop
+// devices.  It probes /dev/loop-control with O_RDWR, which is the resource
+// gated by CAP_SYS_ADMIN for LOOP_CTL_GET_FREE.  When this returns false the
+// shim omits "block" from its advertised mount types so the daemon falls back
+// to privilege-free FUSE mounting.
+func canUseLoopDevices() bool {
+	f, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
 }

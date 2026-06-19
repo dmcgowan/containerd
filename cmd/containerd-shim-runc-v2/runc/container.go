@@ -37,11 +37,29 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 
+	apitypes "github.com/containerd/containerd/api/types"
+
+	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/internal/blockmount"
 	"github.com/containerd/containerd/v2/cmd/containerd-shim-runc-v2/process"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 )
+
+// blockHandler is the shim-side block mount handler, shared across all
+// containers in this shim instance.  Initialised lazily on first use.
+var (
+	blockHandlerOnce sync.Once
+	blockHandlerInst *blockmount.Handler
+)
+
+func getBlockHandler() *blockmount.Handler {
+	blockHandlerOnce.Do(func() {
+		ttrpcAddr := os.Getenv("TTRPC_ADDRESS")
+		blockHandlerInst = blockmount.NewHandler(ttrpcAddr)
+	})
+	return blockHandlerInst
+}
 
 // NewContainer returns a new runc container
 func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTaskRequest) (_ *Container, retErr error) {
@@ -101,8 +119,40 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
 		return nil, err
 	}
 
-	var mounts []mount.Mount
+	// ── Block mount dispatch ──────────────────────────────────────────────────
+	// Block-type mounts are handled by the shim's block mount handler which
+	// manages the loop device, optional on-demand fill via the BlockCache
+	// ttrpc service, and (when supported) a fanotify supervisor.
+	//
+	// Non-block mounts are passed through to mount.All as before.
+	// This mirrors the nerdbox mountutil pattern: iterate and dispatch by type.
+	var apiMounts []*apitypes.Mount
 	for _, pm := range pmounts {
+		apiMounts = append(apiMounts, &apitypes.Mount{
+			Type:    pm.Type,
+			Source:  pm.Source,
+			Target:  pm.Target,
+			Options: pm.Options,
+		})
+	}
+
+	bh := getBlockHandler()
+	remainingAPIMounts, err := bh.MountAll(ctx, apiMounts, rootfs, filepath.Join(r.Bundle, "work"))
+	if err != nil {
+		return nil, fmt.Errorf("block mount setup: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			// Unmount any block mounts we successfully activated.
+			if uerr := bh.Unmount(ctx, rootfs); uerr != nil {
+				log.G(ctx).WithError(uerr).Warn("failed to cleanup block mount on error")
+			}
+		}
+	}()
+
+	// Convert remaining non-block mounts back to mount.Mount for mount.All.
+	var mounts []mount.Mount
+	for _, pm := range remainingAPIMounts {
 		mounts = append(mounts, mount.Mount{
 			Type:    pm.Type,
 			Source:  pm.Source,
@@ -117,8 +167,10 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
 			}
 		}
 	}()
-	if err := mount.All(mounts, rootfs); err != nil {
-		return nil, fmt.Errorf("failed to mount rootfs component: %w", err)
+	if len(mounts) > 0 {
+		if err := mount.All(mounts, rootfs); err != nil {
+			return nil, fmt.Errorf("failed to mount rootfs component: %w", err)
+		}
 	}
 
 	p, err := newInit(

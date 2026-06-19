@@ -482,13 +482,14 @@ func (m *ShimManager) loadShimInfo(ctx context.Context, shim string) (*shimInfo,
 	if i, ok := m.shimInfos.Load(shim); ok {
 		return i.(*shimInfo), nil
 	}
-	// Avoid fetching info for default shims with known behavior
-	if shim == "io.containerd.runc.v2" || shim == "io.containerd.runhcs.v1" {
-		sinfo := &shimInfo{}
-		m.shimInfos.Store(shim, sinfo)
-		return sinfo, nil
-	}
 
+	// Query the shim binary for its Info() annotations.  The result is
+	// cached in shimInfos so the binary is only invoked once per shim type.
+	// NOTE: the previous short-circuit for io.containerd.runc.v2 and
+	// io.containerd.runhcs.v1 has been removed because those shims now
+	// advertise "containerd.io/runtime-allow-mounts" including "block",
+	// and the daemon must read that to know not to activate block mounts
+	// itself.
 	rinfo, err := getRuntimeInfo(ctx, m, &apitypes.RuntimeRequest{RuntimePath: shim})
 	if err != nil {
 		return nil, err
