@@ -135,3 +135,36 @@ type ActivationInfo struct {
 	System []Mount
 	Labels map[string]string
 }
+
+// labelsCtxKey is the unexported context-key under which the mount manager
+// propagates an activation's caller-supplied labels (ActivateOptions.Labels)
+// to the per-mount Handler.Mount invocation.  Handlers that need to know
+// downstream GC backreferences set by the task manager (e.g.
+// "containerd.io/gc.bref.container=<cid>") read them via LabelsFromContext.
+type labelsCtxKey struct{}
+
+// WithActivationLabels attaches a set of activation labels to ctx so a mount
+// Handler invoked downstream can read them via LabelsFromContext.  The
+// returned ctx is otherwise identical to its parent.
+//
+// The mount manager calls this before dispatching each handler so handlers
+// can opportunistically use bref labels (e.g. cache plugins recording a
+// container backreference on their per-blob GC resource).  Other code paths
+// that drive a mount.Handler directly (without going through the manager)
+// may call WithActivationLabels themselves to provide the same context.
+func WithActivationLabels(ctx context.Context, labels map[string]string) context.Context {
+	if len(labels) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, labelsCtxKey{}, labels)
+}
+
+// LabelsFromContext returns the activation labels attached by WithLabels,
+// or nil if no labels are present.  The returned map MUST NOT be mutated
+// (it is the caller's map by reference).
+func LabelsFromContext(ctx context.Context) map[string]string {
+	if v, ok := ctx.Value(labelsCtxKey{}).(map[string]string); ok {
+		return v
+	}
+	return nil
+}

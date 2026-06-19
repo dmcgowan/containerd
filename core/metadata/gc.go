@@ -55,6 +55,14 @@ const (
 	ResourceStream
 	// ResourceMount specifies a mount
 	ResourceMount
+	// ResourceContentIndex specifies an indexed-content blob held by the
+	// io.containerd.content.index.v1 store.  It is kept reachable by a
+	// forward reference (containerd.io/gc.ref.content-index) on the manifest
+	// that owns the lazily-ingested layer.  Its collector implements
+	// collectionWithReferences to forward-reference the content-store entries
+	// (chunk index, chunks, extras) the blob owns; those become unreferenced
+	// and are reclaimed once the blob itself is collected.
+	ResourceContentIndex
 )
 
 const (
@@ -70,10 +78,11 @@ var (
 	// from a parent object to a child object. The child object will
 	// remain referred to for the lifecycle of the parent object.
 
-	labelGCRef        = []byte("containerd.io/gc.ref.")
-	labelGCSnapRef    = []byte("containerd.io/gc.ref.snapshot.")
-	labelGCContentRef = []byte("containerd.io/gc.ref.content")
-	labelGCImageRef   = []byte("containerd.io/gc.ref.image")
+	labelGCRef             = []byte("containerd.io/gc.ref.")
+	labelGCSnapRef         = []byte("containerd.io/gc.ref.snapshot.")
+	labelGCContentRef      = []byte("containerd.io/gc.ref.content")
+	labelGCImageRef        = []byte("containerd.io/gc.ref.image")
+	labelGCContentIndexRef = []byte("containerd.io/gc.ref.content-index")
 
 	// Back reference labels are used to establish a reference relationship
 	// directly from a child object to a parent object. It allows a child
@@ -269,6 +278,22 @@ func startGCContext(ctx context.Context, collectors map[gc.ResourceType]Collecto
 					snapshotter = snapshotter[:i]
 				}
 				fn(gcnode(ResourceSnapshot, ns, fmt.Sprintf("%s/%s", snapshotter, v)))
+			},
+		},
+		{
+			// Note: order matters — labelGCContentIndexRef is registered
+			// before labelGCContentRef so the more specific prefix wins.
+			// The "content-index" suffix uses a hyphen so it is not
+			// mistakenly matched by the shorter "content" prefix scanner
+			// (which would interpret it as a ResourceContent reference).
+			key: labelGCContentIndexRef,
+			fn: func(ns string, k, v []byte, fn func(gc.Node)) {
+				if ks := string(k); ks != string(labelGCContentIndexRef) {
+					if ks[len(labelGCContentIndexRef)] != '.' && ks[len(labelGCContentIndexRef)] != '/' {
+						return
+					}
+				}
+				fn(gcnode(ResourceContentIndex, ns, string(v)))
 			},
 		},
 		{

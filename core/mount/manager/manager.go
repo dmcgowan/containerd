@@ -125,7 +125,6 @@ func (mm *mountManager) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	errs = append(errs, mm.db.Close())
 	return errors.Join(errs...)
 }
 
@@ -151,6 +150,14 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 	for _, opt := range opts {
 		opt(&config)
 	}
+
+	// Propagate the caller-supplied activation labels (typically
+	// containing GC back-reference labels like
+	// "containerd.io/gc.bref.container=<cid>" set by the task manager)
+	// down to per-mount handlers so they can record their own
+	// resource-level back-references at activation time.  See
+	// mount.LabelsFromContext.
+	ctx = mount.WithActivationLabels(ctx, config.Labels)
 
 	shouldTransform := func(p string, t string) bool {
 		p = p + "/*"
@@ -236,9 +243,16 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 		return mount.ActivationInfo{}, errdefs.ErrNotImplemented
 	}
 
-	// Get read lock to block GC context from starting
+	// Get read lock to prevent a GC collection context from starting
+	// until after the mount entry (with its lease) is committed to the
+	// DB.  Once committed, the blob is "referenced" from the GC's
+	// perspective, so it is safe to release the lock before the
+	// potentially-long h.Mount() call (e.g. EnsureAll for lazy blobs).
+	// Holding the lock across h.Mount() causes a deadlock when the GC
+	// fires concurrently: GC holds the metadata DB write-lock while
+	// waiting for this rwlock, and h.Mount() needs that write-lock to
+	// ingest chunks.
 	mm.rwlock.RLock()
-	defer mm.rwlock.RUnlock()
 
 	var mid uint64
 	var staleMID uint64
@@ -337,8 +351,13 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 
 		return nil
 	}); err != nil {
+		mm.rwlock.RUnlock()
 		return mount.ActivationInfo{}, err
 	}
+	// Mount entry committed with lease — release the lock now.
+	// The lease protects the referenced blob from GC for the rest of
+	// activation (including the long EnsureAll chunk-fill in h.Mount).
+	mm.rwlock.RUnlock()
 
 	// If a stale incomplete activation was found, clean up its target
 	// directory which may contain leftover mounts from before a crash.
@@ -459,9 +478,21 @@ func (mm *mountManager) Activate(ctx context.Context, name string, mounts []moun
 				return mount.ActivationInfo{}, err
 			}
 			mp := filepath.Join(mm.targets.Name(), targetName, mname)
-			if err := m.Mount(mp); err != nil {
+
+			// Rootless bind passthrough: bind-mounting a local directory
+			// requires CAP_SYS_ADMIN which is unavailable when the daemon
+			// runs unprivileged.  For plain directory bind mounts (used by
+			// the erofs snapshotter to expose the writable upper-dir path
+			// to the overlay template system) we use the source path
+			// directly as the "mountpoint".  Downstream FUSE filesystems
+			// such as fuse-overlayfs access directories by path and do not
+			// need a kernel bind mount.
+			if m.Type == "bind" && os.Getuid() != 0 && localDir(m.Source) {
+				mp = m.Source
+			} else if err := m.Mount(mp); err != nil {
 				return mount.ActivationInfo{}, fmt.Errorf("mount failed %v: %w", m, err)
 			}
+
 			t := time.Now()
 			active = mount.ActiveMount{
 				Mount:      m,
@@ -1212,4 +1243,12 @@ func unmountAll(ctx context.Context, root string, handlers map[string]mount.Hand
 	}
 
 	return os.RemoveAll(root)
+}
+
+// localDir reports whether path is a readable local directory.
+// Used to determine whether a bind mount can be replaced with a passthrough
+// when running unprivileged.
+func localDir(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }

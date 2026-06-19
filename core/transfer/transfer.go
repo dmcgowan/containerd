@@ -148,6 +148,20 @@ type ImagePlatformsGetter interface {
 type UnpackConfiguration struct {
 	Platform    ocispec.Platform
 	Snapshotter string
+
+	// OnDemand requests on-demand layer caching for this unpack target.
+	// Instead of downloading full layer bytes at pull time, only the metadata
+	// (chunk index) is fetched.  Actual content bytes are retrieved from the
+	// registry on first container access via the indexed content store and the
+	// shim-side block cache delivery path.
+	//
+	// The transfer service silently ignores this flag when the combination is
+	// not supported (non-Linux, unsupported snapshotter, or no indexed content
+	// store plugin active).
+	//
+	// Currently implemented for: Linux + EROFS snapshotter + layers carrying
+	// org.erofs.chunk-index.range annotations.
+	OnDemand bool
 }
 
 type ProgressFunc func(Progress)

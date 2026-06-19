@@ -49,6 +49,12 @@ message UnpackConfiguration {
 
   // snapshotter to unpack to, if not provided default for platform shoudl be used
   string snapshotter = 2;
+
+  // on_demand requests on-demand content caching: only metadata is fetched at
+  // pull time; actual content bytes are retrieved on first container access
+  // via the indexed content store and block cache delivery path.
+  // Silently ignored when unsupported by the platform or snapshotter.
+  bool on_demand = 3;
 }
 
 // ImageReference is used to create or find a reference for an image

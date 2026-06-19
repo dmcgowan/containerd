@@ -85,6 +85,17 @@ const (
 	MountManagerPlugin plugin.Type = "io.containerd.mount-manager.v1"
 	// MountHandlerPlugin implements the mount handler interface
 	MountHandlerPlugin plugin.Type = "io.containerd.mount-handler.v1"
+	// ContentIndexPlugin implements an indexed content store
+	ContentIndexPlugin plugin.Type = "io.containerd.content.index.v1"
+	// ContentIndexProviderPlugin implements a byte provider for the
+	// indexed content store (local content, registry, external sources).
+	ContentIndexProviderPlugin plugin.Type = "io.containerd.content.index.provider.v1"
+	// CachePlugin implements a sparse-file cache for indexed content.
+	// Consumers (block-mount handler, EROFS snapshotter, blockcache TTRPC
+	// service, transfer service's pull warmer) all resolve the cache via
+	// this plugin so they agree on the backing-file path and share a
+	// single LocalCache instance per host.
+	CachePlugin plugin.Type = "io.containerd.cache.v1"
 )
 
 const (
