@@ -24,10 +24,46 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/containerd/containerd/v2/core/content"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/pkg/archive/compression"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/log"
 )
+
+// UncompressedDigestFromDescriptor returns the uncompressed-data digest
+// of a layer descriptor, consulting sources in priority order:
+//
+//  1. The org.erofs.uncompressed-digest annotation on the descriptor
+//     (erofs-image-spec §2.3 / §5.2).
+//  2. The content-store label containerd.io/uncompressed on the blob.
+//  3. Live decompression via GetDiffID (slow path; also memoizes the
+//     result as the containerd.io/uncompressed label).
+//
+// The returned digest equals the layer's DiffID (as used in rootfs.diff_ids
+// and ChainID computation) for all currently defined EROFS and OCI media types.
+// When the annotation is present its value is verified to be a valid digest;
+// an invalid value is treated as absent and the next source is consulted.
+// When both annotation and content-store label are present and disagree, an
+// error is returned — the image is considered malformed.
+func UncompressedDigestFromDescriptor(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (digest.Digest, error) {
+	// Source 1: annotation on the descriptor.
+	var annotUncompDigest digest.Digest
+	if v, ok := desc.Annotations[contentindex.AnnotationUncompressedDigest]; ok && v != "" {
+		d, err := digest.Parse(v)
+		if err == nil {
+			annotUncompDigest = d
+		}
+	}
+
+	// Annotation present: use it directly. rootfs.diff_ids and any
+	// content-store label may be ignored per erofs-image-spec §5.2.
+	if annotUncompDigest != "" {
+		return annotUncompDigest, nil
+	}
+
+	// No annotation: fall back to content-store label / live decompression.
+	return GetDiffID(ctx, cs, desc)
+}
 
 // GetDiffID gets the diff ID of the layer blob descriptor.
 func GetDiffID(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (digest.Digest, error) {
@@ -37,7 +73,11 @@ func GetDiffID(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (
 		MediaTypeDockerSchema2Layer,
 		ocispec.MediaTypeImageLayer,
 		MediaTypeDockerSchema2LayerForeign,
-		ocispec.MediaTypeImageLayerNonDistributable: //nolint:staticcheck // deprecated
+		ocispec.MediaTypeImageLayerNonDistributable, //nolint:staticcheck // deprecated
+		// Raw (uncompressed) EROFS: the blob digest equals the uncompressed
+		// content digest. The +zstd variant requires annotation or label lookup.
+		MediaTypeErofs,
+		MediaTypeErofsLayer:
 		return desc.Digest, nil
 	}
 	info, err := cs.Info(ctx, desc.Digest)

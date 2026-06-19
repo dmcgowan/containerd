@@ -289,7 +289,7 @@ func Export(ctx context.Context, store content.InfoReaderProvider, writer io.Wri
 				var manifests []ocispec.Descriptor
 				for _, m := range index.Manifests {
 					if eo.platform != nil {
-						if m.Platform == nil || eo.platform.Match(*m.Platform) {
+						if m.Platform == nil || eo.platform.Match(*m.Platform) || matchIgnoringOSFeatures(eo.platform, *m.Platform) {
 							manifests = append(manifests, m)
 						} else if !eo.allPlatforms {
 							continue
@@ -656,4 +656,17 @@ func writeTar(ctx context.Context, tw *tar.Writer, recordsWithEmpty []tarRecord)
 		}
 	}
 	return nil
+}
+
+// matchIgnoringOSFeatures returns true when the platform matches after
+// stripping os.features from the candidate. This allows exporting EROFS
+// manifests (which carry os.features=["erofs"]) when the caller requests
+// a plain linux/amd64 platform.
+func matchIgnoringOSFeatures(mc platforms.MatchComparer, p ocispec.Platform) bool {
+	if len(p.OSFeatures) == 0 {
+		return false
+	}
+	stripped := p
+	stripped.OSFeatures = nil
+	return mc.Match(stripped)
 }

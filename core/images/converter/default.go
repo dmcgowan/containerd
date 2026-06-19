@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
 )
@@ -42,12 +43,17 @@ type ConvertFunc func(ctx context.Context, cs content.Store, desc ocispec.Descri
 type UpdateManifestFunc func(ctx context.Context, cs content.Store, originalDesc, convertedDesc ocispec.Descriptor) (*ocispec.Descriptor, error)
 
 // DefaultIndexConvertFunc is the default convert func used by Convert.
-func DefaultIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer) ConvertFunc {
+func DefaultIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer, parallelism ...int) ConvertFunc {
+	p := 0
+	if len(parallelism) > 0 {
+		p = parallelism[0]
+	}
 	c := &defaultConverter{
 		layerConvertFunc: layerConvertFunc,
 		docker2oci:       docker2oci,
 		platformMC:       platformMC,
 		diffIDMap:        make(map[digest.Digest]digest.Digest),
+		parallelism:      p,
 	}
 	return c.convert
 }
@@ -63,26 +69,238 @@ type ConvertHooks struct {
 }
 
 // IndexConvertFuncWithHook is the convert func used by Convert with hook functions support.
-func IndexConvertFuncWithHook(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer, hooks ConvertHooks) ConvertFunc {
+func IndexConvertFuncWithHook(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer, hooks ConvertHooks, parallelism ...int) ConvertFunc {
+	p := 0
+	if len(parallelism) > 0 {
+		p = parallelism[0]
+	}
 	c := &defaultConverter{
 		layerConvertFunc: layerConvertFunc,
 		docker2oci:       docker2oci,
 		platformMC:       platformMC,
 		diffIDMap:        make(map[digest.Digest]digest.Digest),
 		hooks:            hooks,
+		parallelism:      p,
 	}
 	return c.convert
 }
 
-type defaultConverter struct {
-	layerConvertFunc   ConvertFunc
-	docker2oci         bool
-	platformMC         platforms.MatchComparer
-	diffIDMap          map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
-	diffIDMapMu        sync.RWMutex
-	hooks              ConvertHooks
-	updateManifestFunc UpdateManifestFunc
+// AppendIndexConvertFunc returns a ConvertFunc that builds a dual-format OCI
+// image index.  Original manifests are kept unchanged at the front of the
+// index; converted manifests are appended after them.
+//
+// When the source descriptor is a manifest (not an index) the function wraps
+// both the original and the converted manifest in a new OCI image index.
+//
+// This is the underlying implementation of converter.WithAppendToIndex().
+func AppendIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer, updateManifestFunc UpdateManifestFunc, parallelism ...int) ConvertFunc {
+	p := 0
+	if len(parallelism) > 0 {
+		p = parallelism[0]
+	}
+	inner := &defaultConverter{
+		layerConvertFunc:   layerConvertFunc,
+		docker2oci:         docker2oci,
+		platformMC:         platformMC,
+		diffIDMap:          make(map[digest.Digest]digest.Digest),
+		updateManifestFunc: updateManifestFunc,
+		parallelism:        p,
+	}
+	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
+		switch {
+		case images.IsIndexType(desc.MediaType):
+			return appendConvertedToIndex(ctx, cs, desc, inner, platformMC)
+		case images.IsManifestType(desc.MediaType):
+			return promoteManifestToIndex(ctx, cs, desc, inner)
+		default:
+			// Non-manifest, non-index — delegate to the inner converter.
+			return inner.convert(ctx, cs, desc)
+		}
+	}
 }
+
+// appendConvertedToIndex reads the existing index, converts each matching
+// manifest, and returns a new index whose Manifests array is:
+//
+//	[ all original manifests ... ] [ all converted manifests ... ]
+//
+// The original manifests are never modified.  Manifests that do not match
+// platformMC are included in the original section but are not converted.
+func appendConvertedToIndex(ctx context.Context, cs content.Store, desc ocispec.Descriptor, inner *defaultConverter, platformMC platforms.MatchComparer) (*ocispec.Descriptor, error) {
+	var index ocispec.Index
+	labels, err := ReadJSON(ctx, cs, &index, desc)
+	if err != nil {
+		return nil, err
+	}
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	if images.IsDockerType(index.MediaType) && inner.docker2oci {
+		index.MediaType = ConvertDockerMediaTypeToOCI(index.MediaType)
+	}
+
+	origManifests := make([]ocispec.Descriptor, len(index.Manifests))
+	copy(origManifests, index.Manifests)
+
+	type result struct {
+		idx      int
+		newDesc  *ocispec.Descriptor
+	}
+	results := make([]result, len(origManifests))
+
+	var mu sync.Mutex
+	eg, ctx2 := errgroup.WithContext(ctx)
+	// sem limits concurrent manifest conversions; nil means unbounded.
+	var sem chan struct{}
+	if inner.parallelism > 0 {
+		sem = make(chan struct{}, inner.parallelism)
+	}
+	for i, mani := range origManifests {
+		eg.Go(func() error {
+			// Skip manifests that do not match the platform filter.
+			if mani.Platform != nil && !platformMC.Match(*mani.Platform) {
+				mu.Lock()
+				results[i] = result{idx: i, newDesc: nil}
+				mu.Unlock()
+				return nil
+			}
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx2.Done():
+					return ctx2.Err()
+				}
+			}
+			newMani, err := inner.convert(ctx2, cs, mani)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			results[i] = result{idx: i, newDesc: newMani}
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Build the appended list: original manifests first, then converted ones.
+	combined := make([]ocispec.Descriptor, 0, len(origManifests)*2)
+	combined = append(combined, origManifests...)
+	nextLabel := len(origManifests)
+	for _, r := range results {
+		if r.newDesc == nil {
+			continue
+		}
+		// Only append when the converted manifest actually differs.
+		if r.newDesc.Digest == origManifests[r.idx].Digest {
+			continue
+		}
+		combined = append(combined, *r.newDesc)
+		labelKey := fmt.Sprintf("containerd.io/gc.ref.content.m.%d", nextLabel)
+		labels[labelKey] = r.newDesc.Digest.String()
+		nextLabel++
+	}
+
+	if len(combined) == len(origManifests) {
+		// Nothing was actually converted (all layers unchanged, or no matching
+		// platform).  Return nil to signal "no change".
+		return nil, nil
+	}
+
+	index.Manifests = combined
+	return WriteJSON(ctx, cs, &index, desc, labels)
+}
+
+// promoteManifestToIndex converts a single manifest and wraps both the
+// original and the converted manifest in a new OCI image index.
+//
+// The original manifest is listed first (index entry 0); the converted
+// manifest follows (index entry 1).  Each entry's Platform field is
+// populated from the image config when not already present on the descriptor.
+func promoteManifestToIndex(ctx context.Context, cs content.Store, desc ocispec.Descriptor, inner *defaultConverter) (*ocispec.Descriptor, error) {
+	newMani, err := inner.convert(ctx, cs, desc)
+	if err != nil {
+		return nil, err
+	}
+	if newMani == nil || newMani.Digest == desc.Digest {
+		// Conversion produced no change; nothing to append.
+		return nil, nil
+	}
+
+	// Resolve the platform for the original manifest so the index entry is
+	// properly annotated.  This reads the image config which is a small JSON
+	// blob and is not expensive.
+	origPlatform, err := manifestPlatform(ctx, cs, desc)
+	if err != nil {
+		return nil, fmt.Errorf("converter: resolve platform for %s: %w", desc.Digest, err)
+	}
+
+	origDesc := desc
+	origDesc.Platform = &origPlatform
+
+	newDesc := *newMani
+	// The converted manifest's Platform is set by updateManifestFunc
+	// (typically UpdateManifestPlatform which adds os.features=["erofs"]).
+	// If it wasn't set, copy the original platform so the index entry is
+	// fully annotated.
+	if newDesc.Platform == nil {
+		np := origPlatform
+		newDesc.Platform = &np
+	}
+
+	labels := map[string]string{
+		"containerd.io/gc.ref.content.m.0": origDesc.Digest.String(),
+		"containerd.io/gc.ref.content.m.1": newDesc.Digest.String(),
+	}
+	idx := ocispec.Index{
+		Versioned: ocispecs.Versioned{SchemaVersion: 2},
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{origDesc, newDesc},
+	}
+
+	// Use a synthetic "source" descriptor with the same media type as the
+	// output index.  WriteJSON infers the new digest and size from the
+	// marshalled bytes.
+	srcDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageIndex,
+		Digest:    desc.Digest, // will be replaced by WriteJSON
+	}
+	return WriteJSON(ctx, cs, &idx, srcDesc, labels)
+}
+
+// manifestPlatform resolves the platform for a single manifest descriptor by
+// reading its config.
+func manifestPlatform(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (ocispec.Platform, error) {
+	if desc.Platform != nil {
+		return *desc.Platform, nil
+	}
+	var manifest ocispec.Manifest
+	if _, err := ReadJSON(ctx, cs, &manifest, desc); err != nil {
+		return ocispec.Platform{}, err
+	}
+	return images.ConfigPlatform(ctx, cs, manifest.Config)
+}
+
+type defaultConverter struct {
+	layerConvertFunc      ConvertFunc
+	multiLayerConvertFunc MultiLayerConvertFunc
+	docker2oci            bool
+	platformMC            platforms.MatchComparer
+	diffIDMap             map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
+	diffIDMapMu           sync.RWMutex
+	hooks                 ConvertHooks
+	updateManifestFunc    UpdateManifestFunc
+	parallelism           int // 0 = use default; >0 = max concurrent manifest AND layer conversions
+}
+
+// defaultLayerParallelism is the maximum number of layers converted
+// concurrently within a single manifest when parallelism is not explicitly
+// set.  Layer conversion (especially EROFS) is memory-intensive; a low
+// default prevents RAM exhaustion on large images like pytorch.
+const defaultLayerParallelism = 2
 
 // convert dispatches desc.MediaType and calls c.convert{Layer,Manifest,Index,Config}.
 //
@@ -151,6 +369,10 @@ func (c *defaultConverter) convertLayer(ctx context.Context, cs content.Store, d
 //
 // - converts `.mediaType` if the target format is OCI
 // - records diff ID changes in c.diffIDMap
+// - when multiLayerConvertFunc is set, one source layer may expand to N output
+//   layers (e.g. [data-providing-layer-desc, metadata-layer-desc] when using
+//   the data/metadata split producer strategy from erofs-image-spec §10.2)
+//   which are spliced in-order into the output manifest's Layers array.
 func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
 	var (
 		manifest ocispec.Manifest
@@ -163,10 +385,70 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 	if labels == nil {
 		labels = make(map[string]string)
 	}
+
+	// EROFS is a Linux filesystem. Skip conversion for non-Linux manifests so
+	// that Windows (and other OS) variants are preserved unchanged in the index.
+	// Apply whenever any conversion work is configured (layer conversion OR
+	// an update hook such as MergeManifestFunc); skip only for pure media-type
+	// conversions (docker2oci with nothing else set).
+	if c.layerConvertFunc != nil || c.multiLayerConvertFunc != nil || c.updateManifestFunc != nil {
+		p, err := images.ConfigPlatform(ctx, cs, manifest.Config)
+		if err != nil {
+			return nil, fmt.Errorf("converter: resolve platform for %s: %w", desc.Digest, err)
+		}
+		if p.OS != "" && p.OS != "linux" {
+			return nil, nil
+		}
+	}
+
 	if images.IsDockerType(manifest.MediaType) && c.docker2oci {
 		manifest.MediaType = ConvertDockerMediaTypeToOCI(manifest.MediaType)
 		modified = true
 	}
+
+	// When multiLayerConvertFunc is set, process layers sequentially (fan-out
+	// breaks the parallel model used by the single-layer path).
+	if c.multiLayerConvertFunc != nil {
+		var newLayers []ocispec.Descriptor
+		gcLabelIdx := 0
+		for _, l := range manifest.Layers {
+			expanded, err := c.multiLayerConvertFunc(ctx, cs, l)
+			if err != nil {
+				return nil, err
+			}
+			if expanded == nil {
+				newLayers = append(newLayers, l)
+				gcLabelIdx++
+				continue
+			}
+			// Remove old GC label for this digest.
+			ClearGCLabels(labels, l.Digest)
+			// Add GC labels and accumulate the expanded descriptors.
+			for _, nl := range expanded {
+				labels[fmt.Sprintf("containerd.io/gc.ref.content.l.%d", gcLabelIdx)] = nl.Digest.String()
+				newLayers = append(newLayers, nl)
+				gcLabelIdx++
+				modified = true
+			}
+		}
+		if modified {
+			manifest.Layers = newLayers
+		}
+		// Still need to convert the config and finalise the manifest.
+		goto configAndFinalize
+	}
+
+	{
+	// Limit concurrent layer conversions.  Layer conversion (especially
+	// EROFS) can require several GiB of RAM per layer; running all layers
+	// simultaneously on a large image exhausts memory.  Use the configured
+	// parallelism if set, otherwise fall back to defaultLayerParallelism.
+	layerPar := c.parallelism
+	if layerPar <= 0 {
+		layerPar = defaultLayerParallelism
+	}
+	layerSem := make(chan struct{}, layerPar)
+
 	var mu sync.Mutex
 	eg, ctx2 := errgroup.WithContext(ctx)
 	for i, l := range manifest.Layers {
@@ -175,6 +457,8 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 			return nil, err
 		}
 		eg.Go(func() error {
+			layerSem <- struct{}{}
+			defer func() { <-layerSem }()
 			newL, err := c.convert(ctx2, cs, l)
 			if err != nil {
 				return err
@@ -189,10 +473,13 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 				modified = true
 				mu.Unlock()
 
-				// diffID changes if the tar entries were modified.
-				// diffID stays same if only the compression type was changed.
-				// When diffID changed, add a map entry so that we can update image config.
-				newDiffID, err := images.GetDiffID(ctx, cs, *newL)
+				// diffID changes if the tar entries were modified (e.g. EROFS
+				// conversion changes the byte layout entirely).
+				// Use UncompressedDigestFromDescriptor which reads the
+				// org.erofs.uncompressed-digest annotation on newL when present
+				// — this avoids live decompression of multi-GB EROFS blobs that
+				// GetDiffID would otherwise trigger.
+				newDiffID, err := images.UncompressedDigestFromDescriptor(ctx, cs, *newL)
 				if err != nil {
 					return err
 				}
@@ -208,6 +495,9 @@ func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
+	}
+
+configAndFinalize:
 
 	newConfig, err := c.convert(ctx, cs, manifest.Config)
 	if err != nil {
@@ -270,6 +560,11 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 	newManifestsToBeRemoved := make(map[int]struct{}) // slice index
 	var mu sync.Mutex
 	eg, ctx2 := errgroup.WithContext(ctx)
+	// sem limits concurrent manifest conversions; nil means unbounded.
+	var sem chan struct{}
+	if c.parallelism > 0 {
+		sem = make(chan struct{}, c.parallelism)
+	}
 	for i, mani := range index.Manifests {
 		labelKey := fmt.Sprintf("containerd.io/gc.ref.content.m.%d", i)
 		eg.Go(func() error {
@@ -280,6 +575,14 @@ func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, d
 				modified = true
 				mu.Unlock()
 				return nil
+			}
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-ctx2.Done():
+					return ctx2.Err()
+				}
 			}
 			newMani, err := c.convert(ctx2, cs, mani)
 			if err != nil {
