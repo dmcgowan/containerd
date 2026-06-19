@@ -192,6 +192,17 @@ func SetupLoop(backingFile string, param LoopParams) (*os.File, error) {
 	return nil, errors.New("timeout creating new loopback device")
 }
 
+// SetLoopAutoclear toggles the LO_FLAGS_AUTOCLEAR bit on an already-configured
+// loop device.  When autoclear is true the kernel detaches the device as soon
+// as the last file descriptor referring to it is closed; when false the device
+// persists until an explicit LOOP_CLR_FD.  Callers typically configure the
+// loop with autoclear=true (so a setup failure does not leak a device) and
+// then disable autoclear once the device is bound to a mount, restoring it
+// before unmount.
+func SetLoopAutoclear(loop *os.File, autoclear bool) error {
+	return setLoopAutoclear(loop, autoclear)
+}
+
 func setLoopAutoclear(loop *os.File, autoclear bool) error {
 	info, err := unix.IoctlLoopGetStatus64(int(loop.Fd()))
 	if err != nil {

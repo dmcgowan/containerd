@@ -18,6 +18,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -223,6 +224,34 @@ func (r *OCIRegistry) SetResolverOptions(options ...transfer.ImageResolverOption
 
 func (r *OCIRegistry) Fetcher(ctx context.Context, ref string) (transfer.Fetcher, error) {
 	return r.resolver.Fetcher(ctx, ref)
+}
+
+// RegistryCredentialJSON satisfies the local.credentialProvider interface.
+// It calls the credential helper (if any) to retrieve credentials for host
+// and returns them as a JSON blob, or nil when no credential is configured.
+// The JSON schema is {"host":"…","username":"…","secret":"…","header":"…"}.
+func (r *OCIRegistry) RegistryCredentialJSON(ctx context.Context, host string) ([]byte, error) {
+	if r.creds == nil {
+		return nil, nil
+	}
+	c, err := r.creds.GetCredentials(ctx, r.reference, host)
+	if err != nil {
+		return nil, err
+	}
+	if c.Username == "" && c.Secret == "" && c.Header == "" {
+		return nil, nil
+	}
+	return json.Marshal(struct {
+		Host     string `json:"host"`
+		Username string `json:"username,omitempty"`
+		Secret   string `json:"secret,omitempty"`
+		Header   string `json:"header,omitempty"`
+	}{
+		Host:     host,
+		Username: c.Username,
+		Secret:   c.Secret,
+		Header:   c.Header,
+	})
 }
 
 func (r *OCIRegistry) Pusher(ctx context.Context, desc ocispec.Descriptor) (transfer.Pusher, error) {

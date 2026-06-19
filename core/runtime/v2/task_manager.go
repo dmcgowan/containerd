@@ -187,7 +187,7 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 
 	// Add options based on runtime
 	if ai, err := m.mounts.Activate(ctx, taskID, opts.Rootfs, activateOpts...); err == nil {
-		opts.Rootfs = ai.System
+		opts.Rootfs = fuseOverlayfsIfNeeded(ctx, ai.System)
 		defer func() {
 			if retErr != nil {
 				dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
@@ -205,8 +205,12 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 		if err != nil {
 			return nil, fmt.Errorf("failed to get info on already active mount: %w", err)
 		}
-		opts.Rootfs = ai.System
-	} else if !errdefs.IsNotImplemented(err) {
+		opts.Rootfs = fuseOverlayfsIfNeeded(ctx, ai.System)
+	} else if errdefs.IsNotImplemented(err) {
+		// Mount manager not configured — pass rootfs directly to the shim,
+		// but still rewrite overlay mounts for rootless operation.
+		opts.Rootfs = fuseOverlayfsIfNeeded(ctx, opts.Rootfs)
+	} else {
 		return nil, err
 	}
 
@@ -440,6 +444,50 @@ func usesIDMapMounts(spec specs.Spec) bool {
 
 	}
 	return false
+}
+
+// fuseOverlayfsIfNeeded rewrites any overlay system mounts to use
+// fuse-overlayfs when the process is not root.  This allows unprivileged
+// containers to work when the daemon activated block mounts via erofs-fuse
+// rather than loop devices: kernel overlayfs requires CAP_SYS_ADMIN but
+// fuse-overlayfs (type "fuse3.fuse-overlayfs") works for any user that has
+// access to /dev/fuse (which is typically world-accessible).
+//
+// The mount Type is changed from "overlay" to "fuse3.fuse-overlayfs"; all
+// other fields (Source, Options) are left as-is because fuse-overlayfs
+// accepts the same lowerdir/upperdir/workdir option syntax.
+//
+// When fuse-overlayfs is not installed the original overlay mounts are
+// returned unchanged; the subsequent mount attempt will fail with a clear
+// error message rather than a silent no-op.
+func fuseOverlayfsIfNeeded(ctx context.Context, mounts []mount.Mount) []mount.Mount {
+
+	if os.Getuid() == 0 {
+		return mounts
+	}
+	if _, err := exec.LookPath("fuse-overlayfs"); err != nil {
+		// Not installed — return as-is; the caller will get a descriptive
+		// mount error if overlay is truly unavailable.
+		return mounts
+	}
+	out := make([]mount.Mount, len(mounts))
+	copy(out, mounts)
+	for i, m := range out {
+		// Match both the raw "overlay" type and the transform prefix forms
+		// "format/mkdir/overlay" and "format/overlay" produced by the erofs
+		// snapshotter.  The shim's internal mount manager resolves the
+		// format/* templates; by rewriting the type here we cause it to call
+		// fuse-overlayfs instead of the kernel overlay after resolution.
+		switch {
+		case m.Type == "overlay",
+			m.Type == "format/mkdir/overlay",
+			m.Type == "format/overlay":
+			log.G(ctx).WithField("source", m.Source).
+				Debug("task_manager: substituting fuse-overlayfs for overlay (non-root)")
+			out[i].Type = strings.Replace(m.Type, "overlay", "fuse3.fuse-overlayfs", 1)
+		}
+	}
+	return out
 }
 
 func supportsIDMapMounts(features *features.Features) error {

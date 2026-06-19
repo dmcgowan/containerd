@@ -89,6 +89,16 @@ command. As part of this process, we do the following:
 			Name:  "sync-fs",
 			Usage: "Synchronize the underlying filesystem containing files when unpack images, false by default",
 		},
+		// erofs lazy / on-demand flag
+		&cli.BoolFlag{
+			Name: "lazy",
+			Usage: "Enable on-demand (lazy) layer ingestion via the indexed content store. " +
+				"Only the layer chunk-index metadata is fetched at pull time; chunk data is " +
+				"filled on first access by the shim's BlockCache service. " +
+				"Requires --snapshotter erofs and a chunked-EROFS image " +
+				"(built with `ctr image convert` — the default layer type is the " +
+				"application/vnd.erofs+zstd chunked format).",
+		},
 	),
 	Action: func(cliContext *cli.Context) error {
 		var (
@@ -136,12 +146,35 @@ command. As part of this process, we do the following:
 				}
 				p = append(p, spec)
 			}
+			// On-demand mode: extend the requested platforms with os.features=erofs
+			// so the platform comparer prefers the chunked-EROFS manifest over the
+			// tar manifest when both match.  Together with WithManifestLimit(1) this
+			// guarantees that only the EROFS manifest is processed during pull and
+			// unpack; otherwise both manifests would be passed through the dispatcher
+			// and the unpacker would try to extract the tar layer too.
+			unpackOpt := image.WithUnpack
+			if cliContext.Bool("lazy") {
+				unpackOpt = image.WithOnDemandUnpack
+				for i := range p {
+					hasErofs := false
+					for _, f := range p[i].OSFeatures {
+						if f == "erofs" {
+							hasErofs = true
+							break
+						}
+					}
+					if !hasErofs {
+						p[i].OSFeatures = append(p[i].OSFeatures, "erofs")
+					}
+				}
+				sopts = append(sopts, image.WithManifestLimit(1))
+			}
 			// we use an empty `Platform` slice to indicate that we want to pull all platforms
 			sopts = append(sopts, image.WithPlatforms(p...))
 			// TODO: Support unpack for all platforms..?
 			// Pass in a *?
 			for _, platform := range p {
-				sopts = append(sopts, image.WithUnpack(platform, cliContext.String("snapshotter")))
+				sopts = append(sopts, unpackOpt(platform, cliContext.String("snapshotter")))
 			}
 
 			if cliContext.Bool("metadata-only") {

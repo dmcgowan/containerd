@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -46,6 +47,12 @@ func AppendDistributionSourceLabel(manager content.Manager, ref string) (images.
 	return func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		info, err := manager.Info(ctx, desc.Digest)
 		if err != nil {
+			// Lazy-ingest layers live in the indexed content store; the regular
+			// content store does not have them, so the distribution-source label
+			// cannot be set.  Skip silently rather than aborting the pull.
+			if errdefs.IsNotFound(err) {
+				return nil, nil
+			}
 			return nil, err
 		}
 

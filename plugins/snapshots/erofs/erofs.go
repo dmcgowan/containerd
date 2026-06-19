@@ -22,17 +22,22 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
+	godigest "github.com/opencontainers/go-digest"
+
+	"github.com/containerd/containerd/v2/core/content/index/cache"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/snapshots/storage"
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsverity"
 	"github.com/containerd/containerd/v2/internal/userns"
+	blockplugin "github.com/containerd/containerd/v2/plugins/mount/block"
 )
 
 // SnapshotterConfig is used to configure the erofs snapshotter instance
@@ -48,6 +53,9 @@ type SnapshotterConfig struct {
 	remapIDs    bool
 	// dmverityMode controls dm-verity behavior: "auto" (use if .dmverity exists), "on" (require .dmverity), "off" (disable)
 	dmverityMode string
+	// cacheRoot is the root of the block cache, passed in from the snapshotter
+	// plugin root so the snapshotter can compute backing-file paths for block mounts.
+	cacheRoot string
 }
 
 // Opt is an option to configure the erofs snapshotter
@@ -95,6 +103,16 @@ func WithRemapIDs() Opt {
 	}
 }
 
+// WithCacheRoot sets the block-cache state root.  It must match the root
+// used by the daemon's block cache (plugins/mount/block and plugins/services/blockcache).
+// When set, lazy-ingested snapshots emit block mount descriptors whose Source
+// is the pre-computed sparse backing-file path.
+func WithCacheRoot(root string) Opt {
+	return func(config *SnapshotterConfig) {
+		config.cacheRoot = root
+	}
+}
+
 type MetaStore interface {
 	TransactionContext(ctx context.Context, writable bool) (context.Context, storage.Transactor, error)
 	WithTransaction(ctx context.Context, writable bool, fn storage.TransactionCallback) error
@@ -103,6 +121,7 @@ type MetaStore interface {
 
 type snapshotter struct {
 	root            string
+	cacheRoot       string // root of the block cache (shared with daemon block handler)
 	ms              *storage.MetaStore
 	ovlOptions      []string
 	enableFsverity  bool
@@ -179,6 +198,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 
 	return &snapshotter{
 		root:            root,
+		cacheRoot:       config.cacheRoot,
 		ms:              ms,
 		ovlOptions:      config.ovlOptions,
 		enableFsverity:  config.enableFsverity,
@@ -212,17 +232,123 @@ func (s *snapshotter) layerBlobPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "layer.erofs")
 }
 
+// layerIndexedPath returns the path for the lazy-ingest marker file.
+// When this file exists the snapshot was applied in lazy mode; the file
+// contains the blob digest that the mount manager's block handler uses.
+func (s *snapshotter) layerIndexedPath(id string) string {
+	return filepath.Join(s.root, "snapshots", id, "layer.indexed")
+}
+
+// readLayerIndexed returns the blob digest stored in the layer.indexed marker,
+// or ("", false) if the marker does not exist.
+func (s *snapshotter) readLayerIndexed(id string) (string, bool) {
+	data, err := os.ReadFile(s.layerIndexedPath(id))
+	if err != nil {
+		return "", false
+	}
+	dgst := strings.TrimSpace(string(data))
+	if dgst == "" {
+		return "", false
+	}
+	return dgst, true
+}
+
+// layerDmverityPath returns the path of the dm-verity sidecar for a
+// lazy snapshot, parallel to the layer.indexed marker.  Present iff
+// the differ persisted verity params from the layer descriptor
+// annotations during lazy ingest.
+func (s *snapshotter) layerDmverityPath(id string) string {
+	return filepath.Join(s.root, "snapshots", id, "layer.dmverity")
+}
+
+// readLayerDmverity returns the parsed dm-verity metadata for a lazy
+// snapshot, or (nil, false) if the sidecar is absent.  A
+// present-but-malformed sidecar is treated as ABSENT (logged and
+// dropped) — the hard-fail policy for verity-on-but-broken belongs
+// at mount time, not at marker-read time, because the snapshotter
+// is also called for non-mount paths (e.g. Walk, Stat) where the
+// verity verdict is irrelevant.
+func (s *snapshotter) readLayerDmverity(id string) (*dmverity.DmverityMetadata, bool) {
+	path := s.layerDmverityPath(id)
+	if _, err := os.Stat(path); err != nil {
+		return nil, false
+	}
+	m, err := dmverity.ReadMetadataFromPath(path)
+	if err != nil {
+		log.G(context.Background()).WithError(err).WithField("path", path).
+			Warn("erofs snapshotter: malformed layer.dmverity sidecar; treating as absent")
+		return nil, false
+	}
+	return m, true
+}
+
 func (s *snapshotter) fsMetaPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "fsmeta.erofs")
 }
 
+// rawDevicePath returns the path for a raw device blob stored inside a
+// snapshot directory.  index is the device slot (0-based position of the
+// device-role layer in the contiguous run of role=device layers preceding
+// the consuming EROFS metadata layer).
+//
+// Raw device blobs are produced for any layer carrying the descriptor
+// annotation org.erofs.role=device (erofs-image-spec §7, §10.2).  The
+// blob is the decompressed payload of the source layer (tar+zstd,
+// octet-stream, …) and the snapshotter passes its path to the
+// consuming EROFS mount via the device= option.
+func (s *snapshotter) rawDevicePath(id string, index int) string {
+	return filepath.Join(s.root, "snapshots", id, fmt.Sprintf("device.%d.raw", index))
+}
+
+// collectRawDevices returns the paths to all device.*.raw files in the
+// snapshot directory for id, in ascending index order.  The returned slice
+// is empty when no raw devices are present.
+func (s *snapshotter) collectRawDevices(id string) []string {
+	var devs []string
+	for i := 0; ; i++ {
+		p := s.rawDevicePath(id, i)
+		if _, err := os.Stat(p); err != nil {
+			break
+		}
+		devs = append(devs, p)
+	}
+	return devs
+}
+
 func (s *snapshotter) lowerPath(id string) (string, error) {
 	layerBlob := s.layerBlobPath(id)
-	if _, err := os.Stat(layerBlob); err != nil {
-		return "", fmt.Errorf("failed to find valid erofs layer blob: %w", err)
+	if _, err := os.Stat(layerBlob); err == nil {
+		return layerBlob, nil
 	}
-
-	return layerBlob, nil
+	// Also accept a layer that was lazily ingested (no layer.erofs file present).
+	if blobDigest, ok := s.readLayerIndexed(id); ok {
+		// Detect stale lazy snapshots: layer.indexed exists but the block-cache
+		// backing file was removed by GC (because the image was deleted and GC
+		// ran before ctr run).  The backing file is created by cache.Attach on
+		// first mount, so it is absent for both fresh lazy pulls AND stale
+		// states.  Distinguish them: if the cache *directory* exists the blob
+		// was previously attached (Attach creates the dir).  If neither the dir
+		// nor the backing file exists the blob was never mounted, which is fine.
+		// Only fail if the cache dir exists but is empty/incomplete — a sign
+		// that blobRemover already cleaned it up.
+		cacheDir := filepath.Dir(cache.BackingFilePath(s.cacheRoot, godigest.Digest(blobDigest)))
+		if _, statErr := os.Stat(cacheDir); statErr == nil {
+			// Cache directory exists; check that the backing file is present
+			// (meaning Attach was called at least once and the file wasn't removed).
+			backingFile := cache.BackingFilePath(s.cacheRoot, godigest.Digest(blobDigest))
+			if _, bfErr := os.Stat(backingFile); bfErr != nil {
+				// Cache dir exists but backing file is gone: GC cleared it.
+				return "", fmt.Errorf(
+					"lazy snapshot %s is stale: the block cache for %s was removed by GC "+
+						"(run 'ctr image rm <image> && ctr image pull --lazy <image>' to restore)", id, blobDigest)
+			}
+		}
+		// Return a sentinel so callers know a blob path is available
+		// indirectly. Callers that need the actual path call
+		// readLayerIndexed directly.
+		return s.layerIndexedPath(id), nil
+	}
+	return "", fmt.Errorf("failed to find valid erofs layer blob or lazy index for snapshot %s", id)
 }
 
 func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
@@ -261,9 +387,21 @@ func (s *snapshotter) mountFsMeta(snap storage.Snapshot, id int) (mount.Mount, b
 		Type:    "erofs",
 		Options: []string{"ro", "loop"},
 	}
+	// Add all preceding layers as data devices.  Traverse from bottom (oldest)
+	// ancestor to the specified id so that device IDs match layers[] order.
+	// A parent contributes either its layer.erofs file (regular EROFS layer)
+	// or its device.*.raw files (any layer carrying org.erofs.role=device —
+	// see erofs-image-spec §7 and §10.2) as device= options.
 	for j := len(snap.ParentIDs) - 1; j >= id; j-- {
-		path := s.layerBlobPath(snap.ParentIDs[j])
-		m.Options = append(m.Options, "device="+path)
+		pid := snap.ParentIDs[j]
+		rawDevs := s.collectRawDevices(pid)
+		if len(rawDevs) > 0 {
+			for _, db := range rawDevs {
+				m.Options = append(m.Options, "device="+db)
+			}
+		} else {
+			m.Options = append(m.Options, "device="+s.layerBlobPath(pid))
+		}
 	}
 	return m, true
 }
@@ -308,13 +446,141 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 
 // createErofsMount creates a mount specification for an EROFS layer.
 // Applies dmverityMode policy and passes it to the mount handler.
-func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
+// extraDevices are optional paths to additional files that are supplied as
+// EROFS data devices via device= mount options.  Sources include
+// device.<N>.raw blobs in the snapshot tree, produced from layers
+// carrying the org.erofs.role=device annotation.
+// newBlockMount constructs the block-type mount descriptor for a lazy-ingested
+// blob.  The mount Source is the local sparse backing-file path (keyed purely
+// by the blob digest); the blockid option carries the digest for the daemon's
+// BlockCache service lookup.  The fill=sparse option signals to the shim that
+// the backing file has holes that must be filled (via the BlockCache Fill
+// stream) before reading.
+// newBlockMount builds a block mount for one lazy parent.  `snapID` is
+// the snapshotter-internal ID of the snapshot whose lazy marker
+// produced `blobDigest`; it is consulted to pick up an optional
+// `layer.dmverity` sidecar (written by the differ when the source
+// descriptor carries org.erofs.dmverity.* annotations).  When the
+// sidecar is present the verity params are appended as
+// dmverity-roothash/hashoffset/blocksize options; the block handler
+// then HARD-FAILS the mount if it cannot honour them (Q4: secure
+// default).
+func (s *snapshotter) newBlockMount(snapID, blobDigest string) mount.Mount {
+	backingFile := cache.BackingFilePath(s.cacheRoot, godigest.Digest(blobDigest))
+	extraOpts := []string{
+		"blockid=" + blobDigest,
+		"fill=sparse",
+	}
+	if v, ok := s.readLayerDmverity(snapID); ok {
+		extraOpts = append(extraOpts, blockplugin.DmVerityOpts(blockplugin.DmVerityOptions{
+			RootHash:   v.RootHash,
+			HashOffset: v.HashOffset,
+			BlockSize:  v.BlockSize,
+		})...)
+	}
+	return blockplugin.NewBlockMount(backingFile, extraOpts...)
+}
+
+// lazyParent pairs a parent snapshot ID with its lazy blob digest.
+// Returned by collectLazyParents so the caller can read the
+// associated layer.dmverity sidecar (which is keyed by snapshot ID,
+// not blob digest) when constructing each block mount.
+type lazyParent struct {
+	snapID     string
+	blobDigest string
+}
+
+// collectLazyParents returns one lazyParent per parent snapshot if
+// ALL parents carry a layer.indexed marker.  If any parent is not
+// lazy-ingested, (nil, false) is returned and the caller should fall
+// through to the regular per-layer mount path.
+func (s *snapshotter) collectLazyParents(parentIDs []string) ([]lazyParent, bool) {
+	out := make([]lazyParent, len(parentIDs))
+	for i, id := range parentIDs {
+		d, ok := s.readLayerIndexed(id)
+		if !ok {
+			return nil, false
+		}
+		out[i] = lazyParent{snapID: id, blobDigest: d}
+	}
+	return out, true
+}
+
+// lazyOverlayMounts builds a mount list for a snapshot whose parents are all
+// lazy-ingested EROFS blobs.  Each parent becomes an independent block mount
+// (one sparse backing file per layer); an overlay mount stitches them into the
+// final view presented to the container.
+//
+// The parent block mounts are emitted in the same order as parentIDs (top-most
+// first, matching the EROFS snapshotter convention for lowerdir ordering).
+// The overlay mount references all of them via the "{{ overlay N M }}"
+// template placeholder used by the containerd mount manager.
+//
+// Mixed-mode images (some parents lazy, some eager) are not supported; the
+// caller must fall through to the regular path in that case.  In practice an
+// image is either entirely lazy-pulled or not, so this constraint is harmless.
+func (s *snapshotter) lazyOverlayMounts(
+	snap storage.Snapshot,
+	info snapshots.Info,
+	parents []lazyParent,
+	existingMounts []mount.Mount,
+	options []string,
+	writable bool,
+) ([]mount.Mount, error) {
+	mounts := existingMounts
+	// Append one block mount per parent (top to bottom).  Each
+	// parent's optional layer.dmverity sidecar is picked up by
+	// newBlockMount so per-layer verity decisions ride alongside
+	// the per-layer block mount.
+	first := len(mounts)
+	for _, p := range parents {
+		mounts = append(mounts, s.newBlockMount(p.snapID, p.blobDigest))
+	}
+
+	if s.remapIDs {
+		if v, ok := info.Labels[snapshots.LabelSnapshotUIDMapping]; ok {
+			options = append(options, fmt.Sprintf("uidmap=%s", v))
+		}
+		if v, ok := info.Labels[snapshots.LabelSnapshotGIDMapping]; ok {
+			options = append(options, fmt.Sprintf("gidmap=%s", v))
+		}
+	}
+
+	numLower := len(mounts) - first
+	if numLower == 1 {
+		// Single lazy lower layer — use format/bind instead of overlay (overlay
+		// over a single lowerdir is unsupported by the kernel).
+		if !writable {
+			return append(mounts, mount.Mount{
+				Type:    "format/bind",
+				Source:  fmt.Sprintf("{{ mount %d }}", first),
+				Options: append(options, "ro", "rbind"),
+			}), nil
+		}
+		options = append(options, fmt.Sprintf("lowerdir={{ mount %d }}", first))
+	} else {
+		options = append(options, fmt.Sprintf("lowerdir={{ overlay %d %d }}", first, len(mounts)-1))
+	}
+	options = append(options, s.ovlOptions...)
+
+	return append(mounts, mount.Mount{
+		Type:    "format/mkdir/overlay",
+		Source:  "overlay",
+		Options: options,
+	}), nil
+}
+
+func (s *snapshotter) createErofsMount(layerBlob string, extraDevices ...string) (mount.Mount, error) {
 	options := []string{"ro", "loop"}
 
 	if dmverityOpt, err := s.applyDmverityPolicy(layerBlob); err != nil {
 		return mount.Mount{}, err
 	} else if dmverityOpt != "" {
 		options = append(options, dmverityOpt)
+	}
+
+	for _, db := range extraDevices {
+		options = append(options, "device="+db)
 	}
 
 	return mount.Mount{
@@ -328,6 +594,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	var options []string
 
 	if len(snap.ParentIDs) == 0 {
+		// Check for a lazy-ingest blob (layer.indexed marker).
+		if blobDigest, ok := s.readLayerIndexed(snap.ID); ok {
+			if snap.Kind != snapshots.KindView {
+				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot")
+			}
+			// Return a block mount; the mount manager's block handler will
+			// attach the cache, fill all chunks, and mount EROFS over loop.
+			return []mount.Mount{s.newBlockMount(snap.ID, blobDigest)}, nil
+		}
 		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
 			if snap.Kind != snapshots.KindView {
 				return nil, fmt.Errorf("only works for snapshots.KindView on a committed snapshot: %w", err)
@@ -337,7 +612,9 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 					return nil, err
 				}
 			}
-			m, err := s.createErofsMount(layerBlob)
+			// Include any role=device blobs stored alongside this snapshot.
+			rawDevs := s.collectRawDevices(snap.ID)
+			m, err := s.createErofsMount(layerBlob, rawDevs...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 			}
@@ -419,20 +696,34 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		}
 		writable = true
 	} else if len(snap.ParentIDs) == 1 {
-		// For a single parent, check whether a tar-index fsmeta exists first.
-		// If so, mount the metadata image with the data layer as device 1.
-		if m, ok := s.mountFsMeta(snap, 0); ok {
-			return []mount.Mount{m}, nil
+		// Check for lazy-ingest marker on the parent snapshot first.
+		if blobDigest, ok := s.readLayerIndexed(snap.ParentIDs[0]); ok {
+			// Return a block mount; the block mount handler provides the
+			// EROFS filesystem over a loop device backed by the cache.
+			return []mount.Mount{s.newBlockMount(snap.ParentIDs[0], blobDigest)}, nil
 		}
 		layerBlob, err := s.lowerPath(snap.ParentIDs[0])
 		if err != nil {
 			return nil, err
 		}
-		m, err := s.createErofsMount(layerBlob)
+		// Attach any role=device blobs stored alongside this parent.
+		rawDevs := s.collectRawDevices(snap.ParentIDs[0])
+		m, err := s.createErofsMount(layerBlob, rawDevs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount: %w", err)
 		}
 		return []mount.Mount{m}, nil
+	}
+
+	// For snapshots with ≥2 parents, check if all parents are lazy-ingested.
+	// This branch is reached for both KindActive (writable=true, upper/work
+	// options already populated above) and KindView.  It must come before the
+	// general per-parent loop so that lazy parents aren't resolved to erofs
+	// mounts via lowerPath().
+	if len(snap.ParentIDs) >= 2 {
+		if digests, ok := s.collectLazyParents(snap.ParentIDs); ok {
+			return s.lazyOverlayMounts(snap, info, digests, mounts, options, writable)
+		}
 	}
 
 	first := len(mounts)
@@ -445,12 +736,23 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 			break
 		}
 
+		// Lazy-ingest parents are mounted via the block mount handler, which
+		// attaches a loop device over the sparse cache file and mounts EROFS
+		// from there.  This must come before lowerPath/createErofsMount which
+		// would otherwise wrap the layer.indexed marker as an erofs source.
+		if blobDigest, ok := s.readLayerIndexed(snap.ParentIDs[i]); ok {
+			mounts = append(mounts, s.newBlockMount(snap.ParentIDs[i], blobDigest))
+			continue
+		}
+
 		layerBlob, err := s.lowerPath(snap.ParentIDs[i])
 		if err != nil {
 			return nil, err
 		}
 
-		m, err := s.createErofsMount(layerBlob)
+		// Attach role=device blobs for this parent snapshot.
+		rawDevs := s.collectRawDevices(snap.ParentIDs[i])
+		m, err := s.createErofsMount(layerBlob, rawDevs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create erofs mount for parent %s: %w", snap.ParentIDs[i], err)
 		}
@@ -519,6 +821,11 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, fmt.Errorf("failed to create prepare snapshot dir: %w", err)
 	}
 
+	// Note: the sparse-file cache no longer needs a per-snapshot GC anchor.
+	// Cache lifetime is bound to the indexed-content blob it caches: the blob
+	// is kept alive by the manifest's gc.ref.content-index reference, and when
+	// the blob is finally collected the index store's GC removes the cache.
+
 	if err := s.ms.WithTransaction(ctx, true, func(ctx context.Context) (err error) {
 		snap, err = storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 		if err != nil {
@@ -573,7 +880,13 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 				}
 			}
 
-			if mappedUID != -1 && mappedGID != -1 {
+			if mappedUID != -1 && mappedGID != -1 && os.Getuid() == 0 {
+				// Chown the upper dir to the mapped host uid/gid so the
+				// container can write through overlay.  When running
+				// unprivileged the upper dir is already owned by the current
+				// user; fuse-overlayfs handles ownership via the user
+				// namespace, so no explicit chown is needed (and it would
+				// fail with EPERM anyway).
 				if err := os.Lchown(filepath.Join(td, "fs"), mappedUID, mappedGID); err != nil {
 					return fmt.Errorf("failed to chown: %w", err)
 				}
@@ -654,6 +967,29 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	})
 	if err != nil {
 		return err
+	}
+
+	// If a lazy-ingest marker exists, this snapshot was populated by the
+	// lazy-EROFS path (layer.indexed was written by the differ).  Skip
+	// the normal layer.erofs conversion — the block mount handler will
+	// serve the bytes from the indexed content store on demand.
+	//
+	// Also write a GC-protection label on the snapshot so the indexed store
+	// entry is not collected while this snapshot is alive.  Without this,
+	// "ctr image rm" followed by a GC run would remove the indexed blob
+	// even though layer.indexed still references it, causing "blob not found"
+	// errors on the next ctr run.
+	if blobDigest, ok := s.readLayerIndexed(id); ok {
+		return s.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			opts := snapshots.Usage{}
+			// Label the snapshot with a forward reference to the indexed blob
+			// so the GC keeps it alive as long as this snapshot exists.
+			gcLabel := snapshots.WithLabels(map[string]string{
+				"containerd.io/gc.ref.content-index": blobDigest,
+			})
+			_, err := storage.CommitActive(ctx, key, name, opts, gcLabel)
+			return err
+		})
 	}
 
 	// If the layer blob doesn't exist, which means this layer wasn't applied by
@@ -865,7 +1201,6 @@ func (s *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 	return usage, nil
 }
 
-// Add a method to verify fsverity
 func (s *snapshotter) verifyFsverity(path string) error {
 	if !s.enableFsverity {
 		return nil

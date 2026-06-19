@@ -139,7 +139,20 @@ func NewCreator(opts ...Opt) Creator {
 		opt(streams)
 	}
 	if streams.FIFODir == "" {
-		streams.FIFODir = defaults.DefaultFIFODir
+		// When running as a non-root user, /run/containerd/fifo is not
+		// writable.  Prefer $XDG_RUNTIME_DIR/containerd/fifo when the dir
+		// exists — inside a user namespace (e.g. rootlesskit) the process
+		// appears as uid 0 but XDG_RUNTIME_DIR may point to a non-existent
+		// path (e.g. /run/user/0), so we check existence before using it.
+		if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
+			if fi, err := os.Stat(xdg); err == nil && fi.IsDir() {
+				streams.FIFODir = filepath.Join(xdg, "containerd", "fifo")
+			} else {
+				streams.FIFODir = defaults.DefaultFIFODir
+			}
+		} else {
+			streams.FIFODir = defaults.DefaultFIFODir
+		}
 	}
 	return func(id string) (IO, error) {
 		fifos, err := NewFIFOSetInDir(streams.FIFODir, id, streams.Terminal)

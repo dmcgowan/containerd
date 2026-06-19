@@ -111,38 +111,86 @@ func Format(dataDevice, hashDevice string, opts *DmverityOptions) (string, error
 	return fmt.Sprintf("%x", rootDigest), nil
 }
 
-// Open creates a read-only device-mapper target for transparent integrity verification.
-// It supports both superblock and no-superblock modes:
+// noSuperblockParams builds a complete verity.Params for opening a
+// no-superblock dm-verity device whose merkle tree begins at hashOffset.
 //
-//   - Superblock mode (opts == nil or opts.NoSuperblock == false):
-//     Reads dm-verity parameters from the superblock at the specified hashOffset.
-//     Only rootHash needs to be provided; all other parameters are read from the device.
-//     Use hashOffset to specify where the superblock is located (required when hash tree
-//     is stored in the same file as data).
+// Per veritysetup(8): with --no-superblock the opener must supply the same
+// parameters used at format time.  Our converter always formats with
+// sha256 / hash-type 1 / no salt / equal data & hash block sizes, so those
+// are fixed here.  DataBlocks is derived from hashOffset (= the data extent)
+// divided by the block size.  hashOffset must be a positive multiple of the
+// block size.
+func noSuperblockParams(hashOffset uint64, blockSize uint32) (verity.Params, error) {
+	if blockSize == 0 {
+		blockSize = 4096
+	}
+	if !verity.IsBlockSizeValid(blockSize) {
+		return verity.Params{}, fmt.Errorf("dmverity: invalid block size %d", blockSize)
+	}
+	if hashOffset == 0 {
+		return verity.Params{}, fmt.Errorf("dmverity: hashOffset required for no-superblock open")
+	}
+	if hashOffset%uint64(blockSize) != 0 {
+		return verity.Params{}, fmt.Errorf("dmverity: hashOffset %d not a multiple of block size %d", hashOffset, blockSize)
+	}
+	return verity.Params{
+		HashName:       "sha256",
+		HashType:       1,
+		DataBlockSize:  blockSize,
+		HashBlockSize:  blockSize,
+		DataBlocks:     hashOffset / uint64(blockSize),
+		HashAreaOffset: hashOffset,
+		NoSuperblock:   true,
+	}, nil
+}
+
+// Open creates a read-only device-mapper target for transparent integrity
+// verification.  It always operates in no-superblock mode: dm-verity images
+// produced by this project carry no on-disk superblock (see
+// internal/erofsutils.VerityWriter), so every parameter is supplied
+// out-of-band here.  The merkle tree begins directly at hashOffset (= the
+// EROFS data size); the block size defaults to 4096 and may be overridden
+// via opts.  DataBlocks is derived as hashOffset/blockSize.
 //
-//   - No-superblock mode (opts != nil and opts.NoSuperblock == true):
-//     Uses explicitly provided parameters from opts. All dm-verity parameters must be
-//     supplied programmatically since there's no superblock to read from.
+// opts may be nil (all defaults).  Any opts.NoSuperblock value is ignored —
+// no-superblock is unconditional.
 func Open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions) (string, error) {
 	if rootHash == "" {
 		return "", fmt.Errorf("rootHash cannot be empty")
 	}
 
-	rootDigest, err := utils.ParseRootHash(rootHash)
+	hexHash, err := normalizeRootHash(rootHash)
+	if err != nil {
+		return "", fmt.Errorf("invalid root hash: %w", err)
+	}
+	rootDigest, err := utils.ParseRootHash(hexHash)
 	if err != nil {
 		return "", fmt.Errorf("invalid root hash: %w", err)
 	}
 
-	var params verity.Params
-
-	if opts != nil && opts.NoSuperblock {
-		params, err = convertToVerityParams(opts)
-		if err != nil {
-			return "", fmt.Errorf("failed to convert options: %w", err)
+	blockSize := uint32(4096)
+	if opts != nil && opts.DataBlockSize > 0 {
+		blockSize = opts.DataBlockSize
+	}
+	params, err := noSuperblockParams(hashOffset, blockSize)
+	if err != nil {
+		return "", err
+	}
+	// Allow an explicit salt/hash-algorithm override via opts for the
+	// (uncommon) eager-format path, but keep the no-superblock defaults
+	// otherwise.  The converter never sets these.
+	if opts != nil {
+		if opts.HashAlgorithm != "" {
+			params.HashName = opts.HashAlgorithm
 		}
-	} else {
-		params = verity.DefaultParams()
-		params.HashAreaOffset = hashOffset
+		if opts.Salt != "" {
+			salt, saltSize, serr := utils.ApplySalt(opts.Salt, 256)
+			if serr != nil {
+				return "", fmt.Errorf("invalid salt: %w", serr)
+			}
+			params.Salt = salt
+			params.SaltSize = saltSize
+		}
 	}
 
 	loopParams := mount.LoopParams{
@@ -196,7 +244,11 @@ func Close(name string) error {
 
 // VerifyDevice ensures an existing dm-verity device matches the expected metadata and is healthy.
 func VerifyDevice(name string, rootHash string) error {
-	rootDigest, err := utils.ParseRootHash(rootHash)
+	hexHash, err := normalizeRootHash(rootHash)
+	if err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
+	rootDigest, err := utils.ParseRootHash(hexHash)
 	if err != nil {
 		return fmt.Errorf("invalid root hash: %w", err)
 	}

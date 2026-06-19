@@ -14,9 +14,8 @@
    limitations under the License.
 */
 
-// This file contains the public erofsutils API. All conversion paths now use
-// pure-Go implementations via go-erofs + continuity/tarconv; no external
-// process is spawned.
+// All conversion paths use pure-Go implementations via go-erofs +
+// continuity/tarconv; no external process is spawned.
 package erofsutils
 
 import (
@@ -37,9 +36,9 @@ func IsErofsMediaType(mt string) bool {
 	return strings.HasPrefix(mt, "application/vnd.erofs")
 }
 
-// SupportGenerateFromTar reports whether the tar-index conversion mode is
-// available. The pure-Go implementation is always available, so this always
-// returns (true, nil).
+// SupportGenerateFromTar reports whether tar-index conversion is available.
+// The pure-Go implementation is always available, so this always returns
+// (true, nil).
 func SupportGenerateFromTar() (bool, error) {
 	return true, nil
 }

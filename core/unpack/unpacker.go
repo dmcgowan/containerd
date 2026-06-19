@@ -319,9 +319,32 @@ func (u *Unpacker) unpack(
 		return fmt.Errorf("unmarshal image config: %w", err)
 	}
 
-	diffIDs := i.RootFS.DiffIDs
-	if len(layers) != len(diffIDs) {
-		return fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(diffIDs))
+	// Build the per-layer DiffID list. For each layer, the annotation
+	// org.erofs.uncompressed-digest is preferred; when absent,
+	// UncompressedDigestFromDescriptor falls back to the content-store
+	// label and live decompression (erofs-image-spec §5.2).
+	// rootfs.diff_ids from the image config is used as a last-resort
+	// fallback when the layer blob has not yet been fetched (the unpacker
+	// runs diff-id derivation BEFORE the layer fetch goroutine starts).
+	legacyDiffIDs := i.RootFS.DiffIDs
+	if len(legacyDiffIDs) > 0 && len(legacyDiffIDs) != len(layers) {
+		return fmt.Errorf("number of layers and diffIDs don't match: %d != %d", len(layers), len(legacyDiffIDs))
+	}
+	diffIDs := make([]digest.Digest, len(layers))
+	for idx, layerDesc := range layers {
+		d, err := images.UncompressedDigestFromDescriptor(ctx, u.content, layerDesc)
+		if err != nil {
+			// Fall back to the legacy rootfs.diff_ids field if available.
+			// This handles the common case where a layer blob has not been
+			// fetched yet (eager pull does diff-id derivation before fetch)
+			// and the image config carries the diff IDs as it usually does.
+			if errdefs.IsNotFound(err) && idx < len(legacyDiffIDs) && legacyDiffIDs[idx] != "" {
+				d = legacyDiffIDs[idx]
+			} else {
+				return fmt.Errorf("deriving diff-id for layer %d (%s): %w", idx, layerDesc.Digest, err)
+			}
+		}
+		diffIDs[idx] = d
 	}
 
 	// TODO: Support multiple unpacks rather than just first match
@@ -508,6 +531,15 @@ func (u *Unpacker) unpack(
 						},
 					}
 					if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
+						// Lazy-ingest layers (org.erofs.chunk-index.range) live in
+						// the indexed content store, not the regular content store.
+						// The label update is a hint for future eager unpacks; skip
+						// it when the blob is absent from the regular store.
+						if errdefs.IsNotFound(err) {
+							log.G(ctx).WithField("digest", desc.Digest).
+								Debug("lazy layer: skipping uncompressed label update (blob not in regular content store)")
+							return nil
+						}
 						return err
 					}
 					return nil

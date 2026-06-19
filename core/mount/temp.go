@@ -140,7 +140,12 @@ func WithReadonlyTempMount(ctx context.Context, mounts []Mount, f func(root stri
 
 func getTempDir() string {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		return xdg
+		// Only use XDG_RUNTIME_DIR if the directory exists; inside a user
+		// namespace (e.g. rootlesskit) the process may run as uid 0 but
+		// XDG_RUNTIME_DIR may point to /run/user/0 which was never created.
+		if _, err := os.Stat(xdg); err == nil {
+			return xdg
+		}
 	}
 	return os.TempDir()
 }

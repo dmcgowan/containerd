@@ -48,139 +48,41 @@ func TestDMVerity(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("WithSuperblock", func(t *testing.T) {
-		t.Run("SameDevice", func(t *testing.T) {
-			tempDir := t.TempDir()
-			_, loopDevice := createLoopbackDevice(t, tempDir, "1Mb")
-			defer func() {
-				assert.NoError(t, mount.DetachLoopDevice(loopDevice))
-			}()
+	// The stack is no-superblock only: the merkle tree is stored on the
+	// same device as the data, starting at hashOffset (= the data extent),
+	// and Open reconstructs every parameter from (hashOffset, blockSize).
+	// This mirrors exactly how the block-mount / EROFS-mount handlers open
+	// a converted verity layer.
+	t.Run("NoSuperblock_SameDevice_RoundTrip", func(t *testing.T) {
+		tempDir := t.TempDir()
+		_, loopDevice := createLoopbackDevice(t, tempDir, "1Mb")
+		defer func() {
+			assert.NoError(t, mount.DetachLoopDevice(loopDevice))
+		}()
 
-			opts := testOptions(true, 1048576)
+		// 1 MiB data region (256 blocks of 4096); tree stored after it.
+		const hashOffset = 1048576
+		opts := testOptions(hashOffset)
 
-			// Format with superblock - data and hash on same device
-			rootHash, err := Format(loopDevice, loopDevice, &opts)
-			assert.NoError(t, err)
-			assert.NotEmpty(t, rootHash)
+		rootHash, err := Format(loopDevice, loopDevice, &opts)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, rootHash)
 
-			// Open with superblock mode - provide hashOffset, opts is nil
-			deviceName := testDeviceName + "-sb-same"
-			devicePath, err := Open(loopDevice, deviceName, loopDevice, rootHash, opts.HashOffset, nil)
-			assert.NoError(t, err)
-			assert.Equal(t, "/dev/mapper/"+deviceName, devicePath)
+		// Open the way the mount handlers do: pass hashOffset + block-size
+		// opts; NoSuperblock is unconditional inside Open.
+		deviceName := testDeviceName + "-nosb-same"
+		devicePath, err := Open(loopDevice, deviceName, loopDevice, rootHash, hashOffset,
+			&DmverityOptions{DataBlockSize: 4096, HashBlockSize: 4096, HashOffset: hashOffset})
+		assert.NoError(t, err)
+		assert.Equal(t, "/dev/mapper/"+deviceName, devicePath)
 
-			waitForDevice(t, devicePath)
+		waitForDevice(t, devicePath)
 
-			// Close device
-			err = Close(deviceName)
-			assert.NoError(t, err)
+		err = Close(deviceName)
+		assert.NoError(t, err)
 
-			// Verify device is removed
-			_, err = os.Stat(devicePath)
-			assert.True(t, os.IsNotExist(err))
-		})
-
-		t.Run("SeparateDevices", func(t *testing.T) {
-			tempDir := t.TempDir()
-			_, dataDevice := createLoopbackDevice(t, tempDir, "1Mb")
-			_, hashDevice := createLoopbackDevice(t, tempDir, "512Kb")
-			defer func() {
-				assert.NoError(t, mount.DetachLoopDevice(dataDevice))
-				assert.NoError(t, mount.DetachLoopDevice(hashDevice))
-			}()
-
-			// HashOffset is REQUIRED even for separate devices when using superblock.
-			// Typically 4096 bytes (one block) is sufficient for superblock metadata.
-			opts := testOptions(true, 4096)
-			opts.UUID = "12345678-1234-5678-9012-123456789012" // Different UUID for variety
-
-			// Format with superblock - data and hash on separate devices
-			rootHash, err := Format(dataDevice, hashDevice, &opts)
-			assert.NoError(t, err)
-			assert.NotEmpty(t, rootHash)
-
-			// Open with superblock mode - separate devices
-			deviceName := testDeviceName + "-sb-sep"
-			devicePath, err := Open(dataDevice, deviceName, hashDevice, rootHash, opts.HashOffset, nil)
-			assert.NoError(t, err)
-			assert.Equal(t, "/dev/mapper/"+deviceName, devicePath)
-
-			waitForDevice(t, devicePath)
-
-			// Close device
-			err = Close(deviceName)
-			assert.NoError(t, err)
-
-			// Verify device is removed
-			_, err = os.Stat(devicePath)
-			assert.True(t, os.IsNotExist(err))
-		})
-	})
-
-	t.Run("NoSuperblock", func(t *testing.T) {
-		t.Run("SameDevice", func(t *testing.T) {
-			tempDir := t.TempDir()
-			_, loopDevice := createLoopbackDevice(t, tempDir, "1Mb")
-			defer func() {
-				assert.NoError(t, mount.DetachLoopDevice(loopDevice))
-			}()
-
-			opts := testOptions(false, 1048576)
-
-			// Format without superblock - data and hash on same device
-			rootHash, err := Format(loopDevice, loopDevice, &opts)
-			assert.NoError(t, err)
-			assert.NotEmpty(t, rootHash)
-
-			// Open with no-superblock mode - provide opts with NoSuperblock=true
-			deviceName := testDeviceName + "-nosb-same"
-			devicePath, err := Open(loopDevice, deviceName, loopDevice, rootHash, 0, &opts)
-			assert.NoError(t, err)
-			assert.Equal(t, "/dev/mapper/"+deviceName, devicePath)
-
-			waitForDevice(t, devicePath)
-
-			// Close device
-			err = Close(deviceName)
-			assert.NoError(t, err)
-
-			// Verify device is removed
-			_, err = os.Stat(devicePath)
-			assert.True(t, os.IsNotExist(err))
-		})
-
-		t.Run("SeparateDevices", func(t *testing.T) {
-			tempDir := t.TempDir()
-			_, dataDevice := createLoopbackDevice(t, tempDir, "1Mb")
-			_, hashDevice := createLoopbackDevice(t, tempDir, "512Kb")
-			defer func() {
-				assert.NoError(t, mount.DetachLoopDevice(dataDevice))
-				assert.NoError(t, mount.DetachLoopDevice(hashDevice))
-			}()
-
-			opts := testOptions(false, 0) // Hash device is separate, starts at offset 0
-
-			// Format without superblock - data and hash on separate devices
-			rootHash, err := Format(dataDevice, hashDevice, &opts)
-			assert.NoError(t, err)
-			assert.NotEmpty(t, rootHash)
-
-			// Open with no-superblock mode - separate devices
-			deviceName := testDeviceName + "-nosb-sep"
-			devicePath, err := Open(dataDevice, deviceName, hashDevice, rootHash, 0, &opts)
-			assert.NoError(t, err)
-			assert.Equal(t, "/dev/mapper/"+deviceName, devicePath)
-
-			waitForDevice(t, devicePath)
-
-			// Close device
-			err = Close(deviceName)
-			assert.NoError(t, err)
-
-			// Verify device is removed
-			_, err = os.Stat(devicePath)
-			assert.True(t, os.IsNotExist(err))
-		})
+		_, err = os.Stat(devicePath)
+		assert.True(t, os.IsNotExist(err))
 	})
 }
 
@@ -219,8 +121,8 @@ func waitForDevice(t *testing.T, devicePath string) {
 }
 
 // testOptions creates DmverityOptions for testing with common defaults
-func testOptions(superblock bool, hashOffset uint64) DmverityOptions {
-	opts := DmverityOptions{
+func testOptions(hashOffset uint64) DmverityOptions {
+	return DmverityOptions{
 		Salt:          "0000000000000000000000000000000000000000000000000000000000000000",
 		HashAlgorithm: "sha256",
 		DataBlockSize: 4096,
@@ -228,12 +130,8 @@ func testOptions(superblock bool, hashOffset uint64) DmverityOptions {
 		DataBlocks:    256,
 		HashOffset:    hashOffset,
 		HashType:      1,
-		NoSuperblock:  !superblock,
+		NoSuperblock:  true,
 	}
-	if superblock {
-		opts.UUID = "12345678-1234-1234-1234-123456789012"
-	}
-	return opts
 }
 
 // createTempFile creates a temporary file with optional data, returns file path and cleanup function
@@ -331,16 +229,25 @@ func TestErrorHandling(t *testing.T) {
 	})
 
 	t.Run("Open_NonexistentDevice", func(t *testing.T) {
-		_, err = Open("/nonexistent/device.img", "test-device", "/nonexistent/device.img", "abc123", 0, nil)
+		_, err = Open("/nonexistent/device.img", "test-device", "/nonexistent/device.img", "abc123", 4096, nil)
 		assert.Error(t, err)
+	})
+
+	t.Run("Open_ZeroHashOffset", func(t *testing.T) {
+		// No-superblock open requires a non-zero hashOffset (the tree
+		// location); zero is rejected before any device I/O.
+		dataFile := createTempFile(t, nil)
+		_, err := Open(dataFile, "test-device", dataFile, "abc123def456", 0, nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "hashOffset required")
 	})
 
 	t.Run("Open_InvalidSalt", func(t *testing.T) {
 		dataFile := createTempFile(t, nil)
 		opts := DefaultDmverityOptions()
-		opts.NoSuperblock = true
 		opts.Salt = "invalid-hex-string"
-		_, err := Open(dataFile, "test-device", dataFile, "abc123def456", 0, opts)
+		// Non-zero, block-aligned hashOffset so parsing reaches the salt.
+		_, err := Open(dataFile, "test-device", dataFile, "abc123def456", 4096, opts)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid salt")
 	})

@@ -67,50 +67,6 @@ func writeFile(t *testing.T, path string) {
 // Single-parent: tar-index layout (fsmeta.erofs present)
 // ============================================================
 
-// TestMountsSingleParentFsmetaUsed verifies that mounts() selects the
-// fsmeta.erofs + layer.erofs (device=) mount when fsmeta.erofs exists for the
-// parent snapshot.
-func TestMountsingleParentFsmetaUsed(t *testing.T) {
-	s, root := snapshotterForMountTest(t)
-
-	const parentID = "parent-snap"
-	dir := snapshotDir(t, root, parentID)
-
-	// Populate both output files produced by GenerateTarIndexAndAppendTar.
-	fsmeta := filepath.Join(dir, "fsmeta.erofs")
-	layer := filepath.Join(dir, "layer.erofs")
-	writeFile(t, fsmeta)
-	writeFile(t, layer)
-
-	snap := storage.Snapshot{
-		Kind:      snapshots.KindView,
-		ID:        "view-snap",
-		ParentIDs: []string{parentID},
-	}
-
-	mounts, err := s.mounts(snap, snapshots.Info{})
-	require.NoError(t, err)
-	require.Len(t, mounts, 1, "single-parent tar-index must produce exactly one mount")
-
-	m := mounts[0]
-	assert.Equal(t, "erofs", m.Type)
-	assert.Equal(t, fsmeta, m.Source,
-		"mount source must be fsmeta.erofs, not layer.erofs")
-	assert.Contains(t, m.Options, "ro")
-	assert.Contains(t, m.Options, "loop")
-
-	// device= must point at layer.erofs (the data file).
-	var deviceOpt string
-	for _, opt := range m.Options {
-		if strings.HasPrefix(opt, "device=") {
-			deviceOpt = opt
-			break
-		}
-	}
-	assert.Equal(t, "device="+layer, deviceOpt,
-		"device= option must reference layer.erofs")
-}
-
 // TestMountsingleParentNoFsmetaFallback verifies that mounts() falls back to
 // a direct erofs mount of layer.erofs when fsmeta.erofs does not exist.
 func TestMountsingleParentNoFsmetaFallback(t *testing.T) {

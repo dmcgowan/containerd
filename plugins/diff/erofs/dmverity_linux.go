@@ -24,10 +24,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containerd/go-dmverity/pkg/utils"
 	"github.com/containerd/go-dmverity/pkg/verity"
 	"github.com/containerd/log"
-	"github.com/google/uuid"
 
 	"github.com/containerd/containerd/v2/internal/dmverity"
 )
@@ -40,7 +38,7 @@ func (s *erofsDiff) getDmverityOptions() *dmverity.DmverityOptions {
 	opts := dmverity.DefaultDmverityOptions()
 
 	// Tar index mode requires 512-byte blocks because:
-	// 1. EROFS tar index mode uses 512-byte metadata blocks
+	// 1. EROFS tar index mode uses 512-byte metadata blocks (mkfs.erofs --tar=i)
 	// 2. dm-verity sets the virtual block device logical_block_size to match the data block size
 	// 3. EROFS requires its block size (512) to be >= the underlying block device's logical_block_size
 	// Using 4096-byte dm-verity blocks would set logical_block_size=4096, causing EROFS sb_set_blocksize(512) to fail
@@ -49,6 +47,12 @@ func (s *erofsDiff) getDmverityOptions() *dmverity.DmverityOptions {
 		opts.HashBlockSize = 512
 	}
 	// Regular mode uses the default 4096-byte blocks (standard page size)
+
+	// Format without an on-disk superblock, matching the rest of the
+	// stack (see internal/erofsutils.VerityWriter and internal/dmverity.Open):
+	// every parameter is carried in the .dmverity sidecar, so the superblock
+	// is redundant and is not emitted.
+	opts.NoSuperblock = true
 
 	return opts
 }
@@ -88,20 +92,11 @@ func (s *erofsDiff) formatDmverityLayer(ctx context.Context, layerBlobPath strin
 		return fmt.Errorf("failed to calculate hash tree size: %w", err)
 	}
 
-	// In superblock mode, Format() stores the superblock at hashOffset and the hash tree after it
-	superblockSize := uint64(0)
-	if !opts.NoSuperblock {
-		superblockSize = utils.AlignUp(uint64(verity.SuperblockSize), uint64(opts.HashBlockSize))
-	}
-	requiredSize := hashOffset + superblockSize + hashTreeSize
+	// No-superblock mode: the hash tree begins directly at hashOffset
+	// (no superblock block precedes it).
+	requiredSize := hashOffset + hashTreeSize
 	if err := os.Truncate(layerBlobPath, int64(requiredSize)); err != nil {
 		return fmt.Errorf("failed to pre-allocate space for hash tree: %w", err)
-	}
-
-	// Generate a random UUID for the superblock (required for superblock mode)
-	// The library's ReadSuperblock() validates that UUID is not nil/empty
-	if opts.UUID == "" {
-		opts.UUID = uuid.New().String()
 	}
 
 	rootHash, err := dmverity.Format(layerBlobPath, layerBlobPath, opts)
@@ -109,12 +104,12 @@ func (s *erofsDiff) formatDmverityLayer(ctx context.Context, layerBlobPath strin
 		return fmt.Errorf("failed to format dm-verity: %w", err)
 	}
 
-	// Important: Save the ORIGINAL hashOffset (where superblock is located),
-	// not result.HashOffset (which points to where the hash tree starts after the superblock).
-	// Open() needs the superblock location to read device parameters.
+	// Persist hashOffset (= where the hash tree starts) and the block size
+	// so the no-superblock opener can reconstruct the format parameters.
 	metadata := dmverity.DmverityMetadata{
 		RootHash:   rootHash,
 		HashOffset: hashOffset,
+		BlockSize:  opts.DataBlockSize,
 	}
 	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {

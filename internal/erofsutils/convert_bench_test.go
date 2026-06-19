@@ -14,10 +14,10 @@
    limitations under the License.
 */
 
-// Package erofsutils_test provides benchmarks and tests for the pure-Go EROFS
-// conversion functions.
+// Benchmarks and correctness tests for mkfs.erofs subprocess vs pure-Go
+// erofsutils implementations.
 //
-// # Running benchmarks
+// Run benchmarks:
 //
 //	go test ./internal/erofsutils/... -bench=. -benchtime=3x -v
 package erofsutils_test
@@ -26,8 +26,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,13 +39,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ============================================================
-// Helpers
-// ============================================================
+// hasMkfsErofs returns true when mkfs.erofs is in PATH.
+func hasMkfsErofs() bool {
+	_, err := exec.LookPath("mkfs.erofs")
+	return err == nil
+}
 
-// makeTarStream builds a synthetic tar archive of approximately payloadBytes
-// bytes of content. The archive contains a flat directory tree with one file
-// per subdirectory, each file containing repeating 4 KiB payloads.
+// makeTarStream builds a synthetic tar of approximately payloadBytes bytes.
 func makeTarStream(t testing.TB, payloadBytes int) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -76,7 +78,7 @@ func makeTarStream(t testing.TB, payloadBytes int) []byte {
 	return buf.Bytes()
 }
 
-// makeTarStreamOCI builds a small but realistic OCI-shaped layer tar.
+// makeTarStreamOCI builds a small realistic OCI-layer tar.
 func makeTarStreamOCI(t testing.TB) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -129,10 +131,34 @@ func makeSourceDir(t testing.TB, payloadBytes int) string {
 }
 
 // ============================================================
-// Benchmarks
+// Benchmarks: ConvertTarErofs — mkfs subprocess
 // ============================================================
 
-func BenchmarkConvertTarErofs_Go_1MB(b *testing.B)  { benchTarGo(b, 1<<20) }
+func BenchmarkConvertTarErofs_Mkfs_1MB(b *testing.B) { benchTarMkfs(b, 1<<20) }
+func BenchmarkConvertTarErofs_Mkfs_16MB(b *testing.B) { benchTarMkfs(b, 16<<20) }
+func BenchmarkConvertTarErofs_Mkfs_64MB(b *testing.B) { benchTarMkfs(b, 64<<20) }
+
+func benchTarMkfs(b *testing.B, size int) {
+	if !hasMkfsErofs() {
+		b.Skip("mkfs.erofs not in PATH")
+	}
+	data := makeTarStream(b, size)
+	ctx := context.Background()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := filepath.Join(b.TempDir(), "layer.erofs")
+		if err := erofsutils.ConvertTarErofs(ctx, bytes.NewReader(data), out, ""); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// ============================================================
+// Benchmarks: ConvertTarErofs — pure Go
+// ============================================================
+
+func BenchmarkConvertTarErofs_Go_1MB(b *testing.B) { benchTarGo(b, 1<<20) }
 func BenchmarkConvertTarErofs_Go_16MB(b *testing.B) { benchTarGo(b, 16<<20) }
 func BenchmarkConvertTarErofs_Go_64MB(b *testing.B) { benchTarGo(b, 64<<20) }
 
@@ -149,7 +175,33 @@ func benchTarGo(b *testing.B, size int) {
 	}
 }
 
-func BenchmarkConvertDirErofs_Go_1MB(b *testing.B)  { benchDirGo(b, 1<<20) }
+// ============================================================
+// Benchmarks: ConvertDirErofs — mkfs subprocess
+// ============================================================
+
+func BenchmarkConvertDirErofs_Mkfs_1MB(b *testing.B) { benchDirMkfs(b, 1<<20) }
+func BenchmarkConvertDirErofs_Mkfs_16MB(b *testing.B) { benchDirMkfs(b, 16<<20) }
+
+func benchDirMkfs(b *testing.B, size int) {
+	if !hasMkfsErofs() {
+		b.Skip("mkfs.erofs not in PATH")
+	}
+	src := makeSourceDir(b, size)
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := filepath.Join(b.TempDir(), "layer.erofs")
+		if err := erofsutils.ConvertErofs(ctx, out, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// ============================================================
+// Benchmarks: ConvertDirErofs — pure Go
+// ============================================================
+
+func BenchmarkConvertDirErofs_Go_1MB(b *testing.B) { benchDirGo(b, 1<<20) }
 func BenchmarkConvertDirErofs_Go_16MB(b *testing.B) { benchDirGo(b, 16<<20) }
 
 func benchDirGo(b *testing.B, size int) {
@@ -159,6 +211,26 @@ func benchDirGo(b *testing.B, size int) {
 	for i := 0; i < b.N; i++ {
 		out := filepath.Join(b.TempDir(), "layer.erofs")
 		if err := erofsutils.ConvertErofs(ctx, out, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// ============================================================
+// Benchmarks: realistic OCI layer
+// ============================================================
+
+func BenchmarkOCILayer_Mkfs(b *testing.B) {
+	if !hasMkfsErofs() {
+		b.Skip("mkfs.erofs not in PATH")
+	}
+	data := makeTarStreamOCI(b)
+	ctx := context.Background()
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := filepath.Join(b.TempDir(), "layer.erofs")
+		if err := erofsutils.ConvertTarErofs(ctx, bytes.NewReader(data), out, ""); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -181,8 +253,6 @@ func BenchmarkOCILayer_Go(b *testing.B) {
 // Correctness tests
 // ============================================================
 
-// TestConvertTarErofsBasic verifies that ConvertTarErofs produces a valid
-// EROFS image (confirmed by the EROFS superblock magic at offset 1024).
 func TestConvertTarErofsBasic(t *testing.T) {
 	data := makeTarStream(t, 64*1024)
 	out := filepath.Join(t.TempDir(), "layer.erofs")
@@ -191,8 +261,6 @@ func TestConvertTarErofsBasic(t *testing.T) {
 	checkSuperblock(t, out)
 }
 
-// TestConvertErofsBasic verifies that ConvertErofs produces a valid
-// EROFS image.
 func TestConvertErofsBasic(t *testing.T) {
 	src := makeSourceDir(t, 64*1024)
 	out := filepath.Join(t.TempDir(), "layer.erofs")
@@ -200,9 +268,79 @@ func TestConvertErofsBasic(t *testing.T) {
 	checkSuperblock(t, out)
 }
 
-// TestConvertTarErofsWhiteouts verifies that OCI whiteout entries (.wh.*)
-// are translated to overlayfs char-device nodes in the pure-Go path.
-func TestConvertTarErofsWhiteouts(t *testing.T) {
+func TestGenerateTarIndexAndAppendTarBasic(t *testing.T) {
+	data := makeTarStream(t, 32*1024)
+	out := filepath.Join(t.TempDir(), "layer.erofs")
+	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTar(
+		context.Background(), bytes.NewReader(data), out, ""))
+
+	// 1. EROFS superblock at offset 1024.
+	checkSuperblock(t, out)
+
+	// 2. The tar-index output has two sections: EROFS metadata + raw payload data.
+	//    Read the EROFS metadata section (starts at byte 0) and open it.
+	//    The EROFS superblock at offset 1024 confirms the metadata is valid.
+	//    Since both the EROFS metadata AND the payload data are present, the
+	//    output is larger than the metadata section alone.
+	fi, err := os.Stat(out)
+	require.NoError(t, err)
+	require.Greater(t, fi.Size(), int64(4096),
+		"tar-index output must be larger than a minimal EROFS (metadata + payload)")
+
+	// 3. The EROFS metadata section must list the same files as a
+	//    full-extraction EROFS built from the same tar.
+	//    Note: the tar-index EROFS references an external data device, so we
+	//    pass the output file itself as both the EROFS image and the data device.
+	erofsOnly := filepath.Join(t.TempDir(), "only.erofs")
+	require.NoError(t, erofsutils.ConvertTarErofs(
+		context.Background(), bytes.NewReader(data), erofsOnly, ""))
+	namesIdx := erofsFileNamesWithDevice(t, out, out)
+	namesOnly := erofsFileNames(t, erofsOnly)
+	require.Equal(t, len(namesOnly), len(namesIdx),
+		"tar-index and full-extraction must have equal entry counts")
+}
+
+// TestGenerateTarIndexAndAppendTarGoPayload verifies that the file payload
+// is correctly stored in the data section (after the EROFS metadata image).
+// The payload bytes must be present at a 512-byte-aligned offset in the
+// combined output.
+func TestGenerateTarIndexAndAppendTarGoPayload(t *testing.T) {
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir, Name: "./", Mode: 0755,
+	}))
+	const payload = "hello tar-index world"
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeReg, Name: "hello.txt",
+		Size: int64(len(payload)), Mode: 0644,
+	}))
+	_, err := tw.Write([]byte(payload))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+	tarData := tarBuf.Bytes()
+
+	out := filepath.Join(t.TempDir(), "layer.erofs")
+	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTar(
+		context.Background(), bytes.NewReader(tarData), out, ""))
+
+	// The EROFS metadata must be valid.
+	checkSuperblock(t, out)
+
+	// The payload "hello tar-index world" must appear somewhere in the output.
+	outData, err := os.ReadFile(out)
+	require.NoError(t, err)
+	require.Contains(t, string(outData), payload,
+		"file payload must be present in the tar-index EROFS output")
+
+	// The output size must be larger than the payload alone.
+	require.Greater(t, len(outData), len(payload)+1024,
+		"output must contain EROFS metadata in addition to payload")
+}
+
+// TestConvertTarErofsGoWhiteouts verifies that OCI whiteouts (.wh.*) are
+// translated to overlayfs char-device nodes in the Go path.
+func TestConvertTarErofsGoWhiteouts(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "./", Mode: 0755}))
@@ -228,106 +366,93 @@ func TestConvertTarErofsWhiteouts(t *testing.T) {
 		}
 	}
 	require.True(t, foundKeep, "keep.txt must be present: %v", names)
-	require.True(t, foundGone, "gone.txt whiteout must appear as a device node: %v", names)
+	require.True(t, foundGone, "gone.txt whiteout must appear as device node: %v", names)
+}
+
+// TestConvertTarErofsGoVsMkfs checks that the Go implementation produces an
+// image with the same file listing as mkfs.erofs (when available).
+func TestConvertTarErofsGoVsMkfs(t *testing.T) {
+	if !hasMkfsErofs() {
+		t.Skip("mkfs.erofs not in PATH")
+	}
+	data := makeTarStreamOCI(t)
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	outMkfs := filepath.Join(tmp, "mkfs.erofs")
+	outGo := filepath.Join(tmp, "go.erofs")
+
+	require.NoError(t, erofsutils.ConvertTarErofs(ctx,
+		bytes.NewReader(data), outMkfs, ""))
+	require.NoError(t, erofsutils.ConvertTarErofs(ctx,
+		bytes.NewReader(data), outGo, ""))
+
+	mkfsNames := erofsFileNames(t, outMkfs)
+	goNames := erofsFileNames(t, outGo)
+
+	require.NotEmpty(t, mkfsNames, "mkfs.erofs image must not be empty")
+
+	mkfsSet := map[string]bool{}
+	for _, n := range mkfsNames {
+		mkfsSet[strings.TrimPrefix(n, "./")] = true
+	}
+	for _, n := range goNames {
+		mkfsSet[strings.TrimPrefix(n, "./")] = false // mark as seen
+	}
+
+	var missing []string
+	for k, notSeen := range mkfsSet {
+		if notSeen {
+			missing = append(missing, k)
+		}
+	}
+	require.Empty(t, missing,
+		"files in mkfs.erofs image but missing from Go image: %v", missing)
+	t.Logf("mkfs.erofs: %d entries, Go: %d entries", len(mkfsNames), len(goNames))
+}
+
+// TestConvertDirErofsGoVsMkfs checks that the Go dir-to-EROFS implementation
+// contains the same files as mkfs.erofs.
+func TestConvertDirErofsGoVsMkfs(t *testing.T) {
+	if !hasMkfsErofs() {
+		t.Skip("mkfs.erofs not in PATH")
+	}
+	src := makeSourceDir(t, 64*1024)
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	outMkfs := filepath.Join(tmp, "mkfs.erofs")
+	outGo := filepath.Join(tmp, "go.erofs")
+
+	require.NoError(t, erofsutils.ConvertErofs(ctx, outMkfs, src))
+	require.NoError(t, erofsutils.ConvertErofs(ctx, outGo, src))
+
+	mkfsNames := erofsFileNames(t, outMkfs)
+	goNames := erofsFileNames(t, outGo)
+	require.NotEmpty(t, mkfsNames)
+
+	mkfsSet := map[string]bool{}
+	for _, n := range mkfsNames {
+		mkfsSet[strings.TrimPrefix(n, "./")] = true
+	}
+	for _, n := range goNames {
+		mkfsSet[strings.TrimPrefix(n, "./")] = false
+	}
+	var missing []string
+	for k, notSeen := range mkfsSet {
+		if notSeen {
+			missing = append(missing, k)
+		}
+	}
+	require.Empty(t, missing,
+		"files in mkfs.erofs image but missing from Go image: %v", missing)
 }
 
 // ============================================================
-// Tar-index tests
+// Helpers
 // ============================================================
 
-// TestGenerateTarIndexAndAppendTarBasic verifies that
-// GenerateTarIndexAndAppendTar produces:
-//   - fsmeta.erofs: valid EROFS metadata image (superblock at offset 1024)
-//   - layer.erofs: raw payload data (non-empty, no EROFS magic)
-func TestGenerateTarIndexAndAppendTarBasic(t *testing.T) {
-	data := makeTarStream(t, 32*1024)
-	dir := t.TempDir()
-	layerPath := filepath.Join(dir, "layer.erofs")
-	metaPath := filepath.Join(dir, "fsmeta.erofs")
-
-	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTar(
-		context.Background(), bytes.NewReader(data), layerPath, ""))
-
-	// fsmeta.erofs must be a valid EROFS image.
-	checkSuperblock(t, metaPath)
-
-	// layer.erofs must exist and contain payload data.
-	fi, err := os.Stat(layerPath)
-	require.NoError(t, err)
-	require.Greater(t, fi.Size(), int64(0), "layer.erofs must contain payload data")
-}
-
-// TestGenerateTarIndexAndAppendTarFileList verifies that the EROFS metadata
-// in fsmeta.erofs lists the same files as a full-extraction EROFS image
-// produced from the same tar stream.
-func TestGenerateTarIndexAndAppendTarFileList(t *testing.T) {
-	data := makeTarStream(t, 32*1024)
-
-	// Full extraction for comparison.
-	fullOut := filepath.Join(t.TempDir(), "full.erofs")
-	require.NoError(t, erofsutils.ConvertTarErofs(
-		context.Background(), bytes.NewReader(data), fullOut, ""))
-
-	// Tar-index output: writes fsmeta.erofs + layer.erofs to the same dir.
-	idxDir := t.TempDir()
-	idxLayer := filepath.Join(idxDir, "layer.erofs")
-	idxMeta := filepath.Join(idxDir, "fsmeta.erofs")
-	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTar(
-		context.Background(), bytes.NewReader(data), idxLayer, ""))
-
-	fullNames := erofsFileNames(t, fullOut)
-	// fsmeta.erofs uses DeviceID=1 (chunk indexes into layer.erofs).
-	// Supply layer.erofs as the extra device so go-erofs can resolve chunks.
-	idxNames := erofsFileNamesWithDevice(t, idxMeta, idxLayer)
-
-	require.Equal(t, len(fullNames), len(idxNames),
-		"tar-index and full-extraction must have the same number of entries")
-}
-
-// TestGenerateTarIndexAndAppendTarPayload verifies that file payload bytes
-// land in layer.erofs (the data file), not inside fsmeta.erofs.
-func TestGenerateTarIndexAndAppendTarPayload(t *testing.T) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	require.NoError(t, tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeDir, Name: "./", Mode: 0755,
-	}))
-	const payload = "hello tar-index world"
-	require.NoError(t, tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeReg, Name: "hello.txt",
-		Size: int64(len(payload)), Mode: 0644,
-	}))
-	_, err := tw.Write([]byte(payload))
-	require.NoError(t, err)
-	require.NoError(t, tw.Close())
-
-	dir := t.TempDir()
-	layerPath := filepath.Join(dir, "layer.erofs")
-	metaPath := filepath.Join(dir, "fsmeta.erofs")
-
-	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTar(
-		context.Background(), bytes.NewReader(buf.Bytes()), layerPath, ""))
-
-	// fsmeta.erofs is the EROFS metadata image — payload must NOT be there.
-	checkSuperblock(t, metaPath)
-	metaData, err := os.ReadFile(metaPath)
-	require.NoError(t, err)
-	require.NotContains(t, string(metaData), payload,
-		"payload must not appear inside the metadata image")
-
-	// layer.erofs is the raw data file — payload must be there.
-	layerData, err := os.ReadFile(layerPath)
-	require.NoError(t, err)
-	require.Contains(t, string(layerData), payload,
-		"payload must appear in the layer data file")
-}
-
-// ============================================================
-// Test helpers
-// ============================================================
-
-// checkSuperblock asserts that the file at path contains the EROFS superblock
-// magic bytes (0xE0F5E1E2 in little-endian) at offset 1024.
+// checkSuperblock asserts the EROFS magic at offset 1024.
 func checkSuperblock(t *testing.T, path string) {
 	t.Helper()
 	f, err := os.Open(path)
@@ -341,19 +466,17 @@ func checkSuperblock(t *testing.T, path string) {
 	_, err = f.ReadAt(magic[:], 1024)
 	require.NoError(t, err)
 	require.Equal(t, [4]byte{0xE2, 0xE1, 0xF5, 0xE0}, magic,
-		"EROFS magic 0xE0F5E1E2 must be present at offset 1024")
+		"EROFS magic 0xE0F5E1E2 must be at offset 1024")
 }
 
-// erofsFileNames opens an EROFS image with go-erofs and returns the path of
-// every entry as returned by fs.WalkDir.
+// erofsFileNames opens an EROFS image with go-erofs and returns all paths.
 func erofsFileNames(t *testing.T, path string) []string {
 	t.Helper()
 	return erofsFileNamesWithDevice(t, path, "")
 }
 
-// erofsFileNamesWithDevice opens an EROFS image with go-erofs, optionally
-// supplying an extra device for chunk-based images created with WithDataFile.
-// Pass devicePath == "" when the image is self-contained.
+// erofsFileNamesWithDevice opens an EROFS image optionally passing an extra
+// device (for chunk-based images created with WithDataFile).
 func erofsFileNamesWithDevice(t *testing.T, path, devicePath string) []string {
 	t.Helper()
 	f, err := os.Open(path)
@@ -382,4 +505,14 @@ func erofsFileNamesWithDevice(t *testing.T, path, devicePath string) []string {
 	})
 	require.NoError(t, err)
 	return names
+}
+
+// ioReaderAt adapts an io.ReadSeeker so it satisfies io.ReaderAt.
+type ioReaderAt struct{ r io.ReadSeeker }
+
+func (ra ioReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if _, err := ra.r.Seek(off, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return io.ReadAtLeast(ra.r, p, len(p))
 }

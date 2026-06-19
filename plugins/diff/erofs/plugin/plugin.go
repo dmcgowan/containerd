@@ -17,26 +17,28 @@
 package plugin
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/diff/erofs"
 )
 
-// Config represents configuration for the erofs plugin.
+// Config represents configuration for the erofs differ plugin.
 type Config struct {
-	// EnableTarIndex enables the tar index mode where the index is generated
-	// for tar content without extracting the tar
+	// EnableTarIndex enables the tar index mode where only filesystem
+	// metadata is stored inline and file content is referenced by position
+	// in the original tar stream.
 	EnableTarIndex bool `toml:"enable_tar_index"`
 
-	// EnableDmverity enables dm-verity formatting for EROFS layers
-	// Linux only
+	// EnableDmverity enables dm-verity formatting for EROFS layers (Linux only).
 	EnableDmverity bool `toml:"enable_dmverity"`
 }
 
@@ -47,8 +49,12 @@ func init() {
 		Requires: []plugin.Type{
 			plugins.MetadataPlugin,
 		},
+		// ContentIndexPlugin is optional: when present the differ can detect
+		// lazy-ingested layers and write layer.indexed instead of extracting.
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
+			// The EROFS differ now uses pure-Go implementations (go-erofs +
+			// continuity/tarconv).  No mkfs.erofs binary is required.
 			md, err := ic.GetSingle(plugins.MetadataPlugin)
 			if err != nil {
 				return nil, err
@@ -57,7 +63,7 @@ func init() {
 			p := platforms.DefaultSpec()
 			p.OS = "linux"
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
-			// Select this differ for EROFS native images by default
+			// Select this differ for EROFS native images by default.
 			p.OSFeatures = []string{"erofs"}
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 			cs := md.(*metadata.DB).ContentStore()
@@ -80,7 +86,24 @@ func init() {
 				opts = append(opts, erofs.WithDmverity())
 			}
 
+			// Wire the indexed content store into the differ when it is
+			// available.  This lets the differ detect lazy-ingested layers
+			// (written by the transfer service with Lazy=true) and write a
+			// layer.indexed marker instead of re-extracting the blob.
+			idxRaw, err := ic.GetSingle(plugins.ContentIndexPlugin)
+			if err != nil && !errors.Is(err, plugin.ErrPluginNotFound) {
+				return nil, fmt.Errorf("erofs differ: look up content index plugin: %w", err)
+			}
+			if idxRaw != nil {
+				if is, ok := idxRaw.(contentindex.Store); ok {
+					opts = append(opts, erofs.WithIndexStore(is))
+				}
+			}
+
 			return erofs.NewErofsDiffer(cs, opts...), nil
 		},
 	})
 }
+
+// Ensure fmt import is used (ErrSkipPlugin wrapping uses it).
+var _ = fmt.Sprintf

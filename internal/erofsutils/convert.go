@@ -14,42 +14,36 @@
    limitations under the License.
 */
 
-// Package erofsutils provides pure-Go implementations of EROFS image creation.
+// Package erofsutils provides pure-Go EROFS image creation using:
 //
 // All functions use only:
 //   - github.com/erofs/go-erofs — in-process EROFS writer
 //   - github.com/containerd/continuity/tarconv — tar→EROFS conversion
 //
-// No external process is spawned. The implementations are cross-platform
-// (Linux, macOS, Windows).
-//
-// # Running benchmarks
-//
-//	go test ./internal/erofsutils/... -bench=. -benchtime=3x -v
+// No external process is spawned.  The implementations are cross-platform
+// (Linux, macOS, Windows) to the same extent that go-erofs and continuity are.
 package erofsutils
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"time"
 
-	"github.com/containerd/continuity/tarconv"
 	"github.com/containerd/log"
+	"github.com/containerd/continuity/tarconv"
 	goerofs "github.com/erofs/go-erofs"
 )
 
 // ConvertTarErofs converts a tar stream r into a full EROFS image at
 // layerPath using the pure-Go go-erofs + continuity/tarconv stack.
+// Whiteouts are translated to overlayfs representation (char-device 0:0 +
+// xattrs).
 //
-// OCI/AUFS whiteout entries (.wh.*) are translated to overlayfs
-// char-device+xattr representation.
-//
-// The uuid parameter is accepted for API compatibility but is currently
-// unused: go-erofs derives a deterministic superblock build-time from the
-// image content. It will be plumbed through to [goerofs.WithBuildTime] once
-// that API stabilises.
+// The uuid parameter is currently unused (go-erofs derives a deterministic UUID
+// from the image content); it is retained for API compatibility.
 func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string) error {
 	f, err := os.Create(layerPath)
 	if err != nil {
@@ -68,129 +62,14 @@ func ConvertTarErofs(ctx context.Context, r io.Reader, layerPath, uuid string) e
 	return nil
 }
 
-// GenerateTarIndexAndAppendTar produces the EROFS tar-index format.
-//
-// It is a convenience wrapper around [GenerateTarIndexAndAppendTarTo] that
-// derives the metadata output path as "fsmeta.erofs" in the same directory as
-// layerPath.  The snapshot layout convention (fsmeta.erofs / layer.erofs in
-// the same snapshot directory) is owned by the caller; this wrapper exists
-// only to preserve the existing call-site signature.
-//
-// See [GenerateTarIndexAndAppendTarTo] for the full output description.
-//
-// The uuid parameter is accepted for API compatibility but is currently unused.
-func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath, uuid string) error {
-	metaPath := filepath.Join(filepath.Dir(layerPath), "fsmeta.erofs")
-	return GenerateTarIndexAndAppendTarTo(ctx, r, metaPath, layerPath, uuid)
-}
-
-// GenerateTarIndexAndAppendTarTo produces the EROFS tar-index format, writing
-// output to caller-specified paths.
-//
-// # Output layout (two files)
-//
-//   - metaPath: EROFS metadata image — superblock + inodes + chunk-index table.
-//     Chunk indexes use DeviceID=1, which the EROFS kernel driver resolves via
-//     the "device=" mount option pointing at dataPath.
-//
-//   - dataPath: Raw file payload bytes — one 512-byte-block-aligned region per
-//     file.  No EROFS wrapper.  This file is supplied as device 1 when mounting
-//     metaPath with the kernel EROFS driver.
-//
-// The caller decides where the two files live; the package imposes no naming
-// convention.  The EROFS snapshotter uses "fsmeta.erofs" and "layer.erofs" in
-// the same snapshot directory, but that is a snapshotter concern, not this
-// package's.
-//
-// The uuid parameter is accepted for API compatibility but is currently unused.
-func GenerateTarIndexAndAppendTarTo(ctx context.Context, r io.Reader, metaPath, dataPath, uuid string) error {
-	// dataTemp receives raw file payload bytes written by go-erofs at
-	// 512-byte-aligned positions. go-erofs records chunk indexes
-	// (DeviceID=1) pointing into this file. It is renamed to dataPath on
-	// success; we write to a temp file first so a partial write never leaves
-	// a corrupt dataPath in place.
-	dataTemp, err := os.CreateTemp(filepath.Dir(dataPath), ".erofs-tar-idx-data-*")
-	if err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: create data temp: %w", err)
-	}
-	dataTempName := dataTemp.Name()
-	dataDone := false
-	defer func() {
-		dataTemp.Close()
-		if !dataDone {
-			os.Remove(dataTempName)
-		}
-	}()
-
-	// metaTemp receives the EROFS metadata-only image (superblock + inodes +
-	// chunk table). No payload bytes are written here; data lives in dataTemp.
-	// It is renamed to metaPath on success.
-	metaTemp, err := os.CreateTemp(filepath.Dir(metaPath), ".erofs-tar-idx-meta-*.erofs")
-	if err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: create meta temp: %w", err)
-	}
-	metaTempName := metaTemp.Name()
-	metaDone := false
-	defer func() {
-		metaTemp.Close()
-		if !metaDone {
-			os.Remove(metaTempName)
-		}
-	}()
-
-	// Block size 512 matches tar's natural granularity: file data in a tar
-	// stream always starts on a 512-byte boundary (one tar header block).
-	// Chunk indexes in the metadata image reference blocks in dataTemp
-	// starting at offset 0, which will match the start of dataPath after
-	// the rename below.
-	w := goerofs.Create(metaTemp,
-		goerofs.WithBlockSize(512),
-		goerofs.WithDataFile(dataTemp),
-	)
-
-	if err := tarconv.Apply(w, r); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: apply tar: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: finalise EROFS: %w", err)
-	}
-
-	// Flush and rename both temp files to their final paths.
-	// metaTemp → metaPath  (EROFS metadata image, mounted as primary)
-	// dataTemp → dataPath  (raw payload data, mounted as device 1)
-	if err := metaTemp.Sync(); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: sync meta: %w", err)
-	}
-	metaTemp.Close()
-	if err := os.Rename(metaTempName, metaPath); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: rename meta: %w", err)
-	}
-	metaDone = true
-
-	if err := dataTemp.Sync(); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: sync data: %w", err)
-	}
-	dataTemp.Close()
-	if err := os.Rename(dataTempName, dataPath); err != nil {
-		return fmt.Errorf("GenerateTarIndexAndAppendTarTo: rename data: %w", err)
-	}
-	dataDone = true
-
-	log.G(ctx).Debugf("GenerateTarIndexAndAppendTarTo: wrote EROFS metadata to %s, data to %s", metaPath, dataPath)
-	return nil
-}
-
 // ConvertErofs converts a source directory srcDir into an EROFS image at
 // layerPath using the pure-Go go-erofs writer.
 //
-// On platforms where go-erofs cannot extract Unix metadata from os.Stat()
-// results (i.e., non-Linux, non-Darwin), file ownership and device numbers
-// will be zero-valued. Permission bits and timestamps are always preserved.
-//
-// Extended attributes (xattrs) — including the overlayfs opaque marker
-// trusted.overlay.opaque — are copied via a second pass using raw syscalls
-// on Linux. This is necessary because os.DirFS does not expose xattrs through
-// the fs.FileInfo.Sys() interface, so CopyFrom alone would silently drop them.
+// Used by the EROFS snapshotter's Commit() path (converting an overlayfs
+// upperdir to EROFS).  On platforms where go-erofs cannot extract Unix
+// metadata from os.Stat() results (i.e. non-Linux, non-Darwin), file
+// ownership and device numbers will be zero-valued.  Permission bits and
+// timestamps are always preserved.
 func ConvertErofs(ctx context.Context, layerPath, srcDir string) error {
 	f, err := os.Create(layerPath)
 	if err != nil {
@@ -212,4 +91,123 @@ func ConvertErofs(ctx context.Context, layerPath, srcDir string) error {
 	}
 	log.G(ctx).Debugf("ConvertErofs: wrote %s from %s", layerPath, srcDir)
 	return nil
+}
+
+// GenerateTarIndexAndAppendTar produces the EROFS tar-index format in pure Go.
+//
+// # Output file layout
+//
+//	[EROFS metadata image (chunk-index table referencing the data file)]
+//	[Sequential file payload bytes at 512-byte-aligned positions]
+//
+// The EROFS portion contains only filesystem metadata and chunk-index entries.
+// Each file's payload is stored at a 512-byte-block-aligned position in the
+// appended data region; the chunk indexes record those block offsets so a
+// consumer using the EROFS kernel driver (with DeviceID=1 for the data device)
+// can read file content directly from the combined blob.
+//
+// The data region contains raw payload bytes (block-padded) rather than the
+// original tar stream.  Consumers that use the EROFS chunk-based inode format
+// to locate file data are unaffected by this distinction.
+func GenerateTarIndexAndAppendTar(ctx context.Context, r io.Reader, layerPath, uuid string) error {
+	// dataFile receives file payload bytes from the tar stream.
+	// go-erofs writes payloads here at 512-byte-block-aligned positions and
+	// records chunk indexes (DeviceID=1) pointing into this file.
+	dataFile, err := os.CreateTemp("", "erofs-tar-idx-data-*")
+	if err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: create data temp: %w", err)
+	}
+	defer os.Remove(dataFile.Name())
+	defer dataFile.Close()
+
+	// metaFile receives the EROFS metadata image (superblock + inodes + chunk
+	// table, no payload bytes).
+	metaFile, err := os.CreateTemp("", "erofs-tar-idx-meta-*.erofs")
+	if err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: create meta temp: %w", err)
+	}
+	defer os.Remove(metaFile.Name())
+	defer metaFile.Close()
+
+	// Block size 512 matches tar's granularity: file data in a tar stream
+	// always starts on a 512-byte boundary (one header block = 512 bytes).
+	w := goerofs.Create(metaFile,
+		goerofs.WithBlockSize(512),
+		goerofs.WithDataFile(dataFile),
+	)
+
+	// Apply the tar stream.  In the default (non-tar-index) mode, addFile
+	// calls io.Copy(f, tr) which routes data through the go-erofs File and
+	// on to dataFile.  go-erofs tracks the write offset and records chunk
+	// indexes; closeDataFile() pads each file to a 512-byte boundary and
+	// records Chunk{PhysicalBlock: startBlock, Count: …, DeviceID: 1}.
+	if err := tarconv.Apply(w, r); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: apply tar: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: finalise EROFS: %w", err)
+	}
+
+	// Assemble output = EROFS metadata + payload data.
+	out, err := os.Create(layerPath)
+	if err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: create output: %w", err)
+	}
+	defer out.Close()
+
+	if _, err := metaFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: seek meta: %w", err)
+	}
+	if _, err := io.Copy(out, metaFile); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: copy meta: %w", err)
+	}
+
+	if _, err := dataFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: seek data: %w", err)
+	}
+	if _, err := io.Copy(out, dataFile); err != nil {
+		return fmt.Errorf("GenerateTarIndexAndAppendTar: append data: %w", err)
+	}
+
+	log.G(ctx).Debugf("GenerateTarIndexAndAppendTar: wrote tar-index EROFS at %s", layerPath)
+	return nil
+}
+
+// noDataFS wraps an fs.FS and returns zero-length readers for all regular files.
+// Used to build metadata-only EROFS images.
+type noDataFS struct {
+	inner fs.FS
+}
+
+func (n noDataFS) Open(name string) (fs.File, error) {
+	f, err := n.inner.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		return f, nil
+	}
+	// For regular files return a zero-length reader to skip payload.
+	return &zeroFile{File: f, info: info}, nil
+}
+
+type zeroFile struct {
+	fs.File
+	info fs.FileInfo
+}
+
+func (z *zeroFile) Read(p []byte) (int, error)          { return 0, io.EOF }
+func (z *zeroFile) Stat() (fs.FileInfo, error)           { return z.info, nil }
+func (z *zeroFile) Close() error                         { return z.File.Close() }
+func (z *zeroFile) ReadDir(n int) ([]fs.DirEntry, error) { return nil, fmt.Errorf("not a directory") }
+
+// BuildTimeFromStat extracts the mtime from a FileInfo for use as the EROFS
+// build time (applied via WithBuildTime option if available).
+func BuildTimeFromStat(info fs.FileInfo) time.Time {
+	return info.ModTime()
 }

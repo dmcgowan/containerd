@@ -180,8 +180,43 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		})
 	}
 
+	// Determine if any unpack configuration requests on-demand caching.
+	// UnpackConfiguration.OnDemand is a generic "on-demand content caching"
+	// hint; the transfer service interprets it for the specific snapshotter
+	// and platform in use.  On non-Linux platforms (or when no index store is
+	// configured) the hint is silently ignored and all layers are fetched
+	// eagerly.
+	wantOnDemand := false
+	if ts.config.IndexStore != nil {
+		if iu, ok := is.(transfer.ImageUnpacker); ok {
+			for _, uc := range iu.UnpackPlatforms() {
+				if uc.OnDemand {
+					wantOnDemand = true
+					break
+				}
+			}
+		}
+	}
+
+	var layerFetchHandler images.Handler
+	if wantOnDemand && ts.config.IndexStore != nil {
+		// lazyLayerHandler is only non-nil on Linux; on other platforms the
+		// build-tag stub returns nil and we fall back to eager fetch.
+		var cp credentialProvider
+		if v, ok := ir.(credentialProvider); ok {
+			cp = v
+		}
+		if h := lazyLayerHandler(store, fetcher, ts.config.IndexStore, ts.config.CacheWarmer, name, cp, progressTracker); h != nil {
+			layerFetchHandler = h
+		} else {
+			layerFetchHandler = fetchHandler(store, fetcher, progressTracker)
+		}
+	} else {
+		layerFetchHandler = fetchHandler(store, fetcher, progressTracker)
+	}
+
 	handler = images.Handlers(append(baseHandlers,
-		fetchHandler(store, fetcher, progressTracker),
+		layerFetchHandler,
 		checkNeedsFix,
 		childrenHandler, // List children to track hierarchy
 		appendDistSrcLabelHandler,
@@ -189,6 +224,13 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 	// First find suitable platforms to unpack into
 	// If image storer is also an unpacker type, i.e implemented UnpackPlatforms() func
+	//
+	// Skip the unpacker entirely for on-demand (lazy) pulls: the unpacker
+	// wraps every layer handler and intercepts layer descriptors before they
+	// reach lazyLayerHandler, preventing the indexed-store write that lazy
+	// loading requires.  Snapshot creation for lazy layers happens at
+	// container run time via image.Unpack() / the diff service.
+	if !wantOnDemand {
 	if iu, ok := is.(transfer.ImageUnpacker); ok {
 		unpacks := iu.UnpackPlatforms()
 		if len(unpacks) > 0 {
@@ -232,6 +274,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 			handler = unpacker.Unpack(handler)
 		}
 	}
+	} // end !wantOnDemand
 
 	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {
 		if unpacker != nil {

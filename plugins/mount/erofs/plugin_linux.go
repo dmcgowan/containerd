@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -120,9 +121,26 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 			Autoclear: true,
 		}
 		// set up all loop devices
-		loop, err := mount.SetupLoop(m.Source, params)
-		if err != nil {
-			return mount.ActiveMount{}, err
+		loop, loopErr := mount.SetupLoop(m.Source, params)
+		if loopErr != nil {
+			// Loop device setup failed.  When running unprivileged, fall back
+			// to erofs-fuse which mounts the EROFS image via /dev/fuse without
+			// requiring CAP_SYS_ADMIN.
+			if errors.Is(loopErr, unix.EPERM) || errors.Is(loopErr, unix.EACCES) {
+				log.G(ctx).WithField("source", m.Source).
+					WithError(loopErr).
+					Debug("erofs: loop device unavailable, falling back to erofs-fuse")
+				if fuseErr := mountErofsFuseLayer(m.Source, mp); fuseErr != nil {
+					return mount.ActiveMount{}, fmt.Errorf("erofs: loop failed (%v), erofs-fuse also failed: %w", loopErr, fuseErr)
+				}
+				t := time.Now()
+				return mount.ActiveMount{
+					Mount:      m,
+					MountedAt:  &t,
+					MountPoint: mp,
+				}, nil
+			}
+			return mount.ActiveMount{}, loopErr
 		}
 		m.Source = loop.Name()
 		loops = append(loops, loop)
@@ -147,6 +165,20 @@ func (h *erofsMountHandler) Mount(ctx context.Context, m mount.Mount, mp string,
 		if err != nil {
 			return mount.ActiveMount{}, err
 		}
+	} else if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		// fsmount is also unavailable (no CAP_SYS_ADMIN) — try erofs-fuse.
+		log.G(ctx).WithField("source", m.Source).
+			WithError(err).
+			Debug("erofs: fsmount unavailable, falling back to erofs-fuse")
+		if fuseErr := mountErofsFuseLayer(m.Source, mp); fuseErr != nil {
+			return mount.ActiveMount{}, fmt.Errorf("erofs: fsmount failed (%v), erofs-fuse also failed: %w", err, fuseErr)
+		}
+		t := time.Now()
+		return mount.ActiveMount{
+			Mount:      m,
+			MountedAt:  &t,
+			MountPoint: mp,
+		}, nil
 	} else if err != nil {
 		return mount.ActiveMount{}, err
 	}
@@ -180,8 +212,16 @@ func setupDmVerityDevice(ctx context.Context, source string, metadata *dmverity.
 		"hash-offset": metadata.HashOffset,
 	}).Debug("opening dm-verity device")
 
-	// Try to create dm-verity device first (avoids TOCTOU race)
-	_, err = dmverity.Open(source, deviceName, source, metadata.RootHash, metadata.HashOffset, nil)
+	// Try to create dm-verity device first (avoids TOCTOU race).
+	// No-superblock open: pass the block size from the sidecar so the
+	// derived DataBlocks matches what the layer was formatted with.
+	bs := metadata.EffectiveBlockSize()
+	_, err = dmverity.Open(source, deviceName, source, metadata.RootHash, metadata.HashOffset,
+		&dmverity.DmverityOptions{
+			DataBlockSize: bs,
+			HashBlockSize: bs,
+			HashOffset:    metadata.HashOffset,
+		})
 	if err == nil {
 		// New device created — wait for it to appear and return cleanupName
 		// so the caller can close it on error.
@@ -218,6 +258,59 @@ func waitForDevice(devicePath string) error {
 		return fmt.Errorf("dm-verity device %q not found after creation: %w", devicePath, err)
 	}
 	return nil
+}
+
+// mountErofsFuseLayer mounts an EROFS image file at target using erofs-fuse.
+// This is used as a privilege-free fallback when loop devices are unavailable.
+// The erofs-fuse process is started and detached; unmounting via fusermount3/
+// fusermount is handled by the kernel when the last file descriptor is closed
+// or when the user explicitly unmounts.
+func mountErofsFuseLayer(source, target string) error {
+	bin := os.Getenv("CONTAINERD_EROFS_FUSE_BINARY")
+	if bin == "" {
+		for _, name := range []string{"erofs-fuse", "erofsfuse"} {
+			if p, err := exec.LookPath(name); err == nil {
+				bin = p
+				break
+			}
+		}
+	}
+	if bin == "" {
+		return fmt.Errorf("erofs-fuse binary not found (tried erofs-fuse, erofsfuse; install erofs-utils with FUSE support or set CONTAINERD_EROFS_FUSE_BINARY)")
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		return fmt.Errorf("erofs mount: create target %s: %w", target, err)
+	}
+	// Pass allow_other so that processes in user namespaces (where the
+	// container runs as a different uid) can access the FUSE mount.
+	// Requires user_allow_other in /etc/fuse.conf.
+	cmd := exec.Command(bin, "-o", "allow_other", source, target)
+	cmd.Stdout = log.L.WriterLevel(log.DebugLevel)
+	cmd.Stderr = log.L.WriterLevel(log.WarnLevel)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("erofs-fuse start: %w", err)
+	}
+	// erofs-fuse / erofsfuse daemonizes: parent exits immediately while
+	// the daemon child holds the FUSE mount.
+	_ = cmd.Wait()
+
+	// Wait for the FUSE supermagic to appear on the mountpoint.
+	const fuseSuperMagic = 0x65735546
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var st unix.Statfs_t
+		if unix.Statfs(target, &st) == nil && st.Type == fuseSuperMagic {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("erofs-fuse did not mount within 5s")
+		case <-tick.C:
+		}
+	}
 }
 
 func doMount(m mount.Mount, target string) error {

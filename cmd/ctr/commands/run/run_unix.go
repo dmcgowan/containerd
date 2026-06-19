@@ -139,6 +139,12 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 			args = cliContext.Args().Slice()[2:]
 		)
 		opts = append(opts, oci.WithDefaultSpecForPlatform(platform), oci.WithDefaultUnixDevices)
+		// When running inside a rootlesskit user namespace, replace mounts
+		// that require host-level CAP_SYS_ADMIN (sysfs, proc, cgroup) with
+		// rootless-compatible alternatives.
+		if os.Getenv("ROOTLESSKIT_STATE_DIR") != "" {
+			opts = append(opts, oci.WithRootlessMounts)
+		}
 		if ef := cliContext.String("env-file"); ef != "" {
 			opts = append(opts, oci.WithEnvFile(ef))
 		}
@@ -165,6 +171,18 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 					return nil, err
 				}
 				image = containerd.NewImageWithPlatform(client, i, platforms.Only(platform))
+			} else if snapshotter == "erofs" {
+				// EROFS snapshotter: prefer manifests carrying os.features=[erofs]
+				// (the chunked-EROFS variant in a dual-format index) over the
+				// default tar manifest.  Without this preference the image's
+				// diff IDs and chain IDs would be those of the tar manifest, and
+				// the prepared snapshot would not be the lazy-ingested one.
+				p := platforms.DefaultSpec()
+				if p.OS == "darwin" {
+					p.OS = "linux"
+				}
+				p.OSFeatures = append(p.OSFeatures, "erofs")
+				image = containerd.NewImageWithPlatform(client, i, platforms.Only(p))
 			} else {
 				image = containerd.NewImage(client, i)
 			}
@@ -249,10 +267,19 @@ func NewContainer(ctx context.Context, client *containerd.Client, cliContext *cl
 			if err != nil {
 				return nil, fmt.Errorf("get hostname: %w", err)
 			}
+			hostResolv := []oci.SpecOpts{oci.WithHostResolvconf, oci.WithHostHostsFile}
+			// Inside rootlesskit, /etc is a copy-up tmpfs overlay; bind-mounting
+			// files from it into the container fails with EPERM.  Skip the host
+			// resolv.conf and hosts bind mounts — the container inherits them via
+			// --net=host from rootlesskit's namespace.
+			if os.Getenv("ROOTLESSKIT_STATE_DIR") != "" {
+				hostResolv = nil
+			}
 			opts = append(opts,
 				oci.WithHostNamespace(specs.NetworkNamespace),
-				oci.WithHostHostsFile,
-				oci.WithHostResolvconf,
+			)
+			opts = append(opts, hostResolv...)
+			opts = append(opts,
 				oci.WithEnv([]string{fmt.Sprintf("HOSTNAME=%s", hostname)}),
 			)
 		}

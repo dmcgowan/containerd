@@ -239,12 +239,16 @@ The differ must be configured to generate dm-verity metadata:
 
 When dm-verity is enabled, the EROFS differ formats each layer with dm-verity
 by appending a Merkle hash tree to the EROFS blob and generating a root hash.
-The hash tree is stored inline within the layer blob itself.
-The root hash and hash offset are saved in a `.dmverity` metadata file alongside the
-layer blob in JSON format. All other dm-verity parameters (block sizes, salt, etc.)
-are stored in a superblock within the layer blob and are auto-detected when mounting.
-Regular mode uses 4096-byte blocks (standard page size), while tar-index mode uses
-512-byte blocks (dm-verity logical_block_size constraint).
+The hash tree is stored inline within the layer blob itself, directly at the
+hash offset — **no on-disk dm-verity superblock is written** (equivalent to
+`veritysetup --no-superblock`).
+The root hash, hash offset, and block size are saved in a `.dmverity` metadata
+file alongside the layer blob in JSON format. Because there is no superblock,
+all remaining dm-verity parameters are fixed by convention rather than read
+from disk: SHA-256, hash type 1, and no salt. The number of data blocks is
+derived as `hash_offset / block_size`. Regular mode uses 4096-byte blocks
+(standard page size), while tar-index mode uses 512-byte blocks (dm-verity
+logical_block_size constraint).
 
 The snapshotter can be configured to control dm-verity behavior using `dmverity_mode`:
 
@@ -275,10 +279,11 @@ The available modes are:
   compatibility or when dm-verity overhead is unacceptable.
 
 When mounting a layer with dm-verity enabled, the snapshotter reads the metadata
-from the `.dmverity` file and creates a dm-verity device. The dm-verity library
-automatically reads all parameters from the superblock, ensuring that any corruption
-or tampering will be detected at read time. The dm-verity device is then mounted as
-the backing layer in the OverlayFS stack
+from the `.dmverity` file and creates a dm-verity device in no-superblock mode,
+supplying the block size and hash offset from the metadata and the fixed
+parameters (SHA-256, hash type 1, no salt) by convention. Any corruption or
+tampering is detected at read time by the kernel dm-verity target. The dm-verity
+device is then mounted as the backing layer in the OverlayFS stack
 
 ## How It Works
 

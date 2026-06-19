@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -58,6 +59,11 @@ const (
 )
 
 func newSnapshotter(t *testing.T, opts ...Opt) func(ctx context.Context, root string) (snapshots.Snapshotter, func() error, error) {
+	_, err := exec.LookPath("mkfs.erofs")
+	if err != nil {
+		t.Skipf("could not find mkfs.erofs: %v", err)
+	}
+
 	if !FindErofs() {
 		t.Skip("check for erofs kernel support failed, skipping test")
 	}
@@ -190,9 +196,10 @@ func TestErofsDifferWithTarIndexMode(t *testing.T) {
 		t.Skip("check for erofs kernel support failed, skipping test")
 	}
 
+	// Check if mkfs.erofs supports tar index mode
 	supported, err := erofsutils.SupportGenerateFromTar()
 	if err != nil || !supported {
-		t.Skip("EROFS tar index mode not available, skipping tar index test")
+		t.Skip("mkfs.erofs does not support tar mode, skipping tar index test")
 	}
 
 	tempDir := t.TempDir()
@@ -446,7 +453,7 @@ func TestDmverityEndToEnd(t *testing.T) {
 			testDmverityEndToEndWithMode(t, true)
 		})
 	} else {
-		t.Logf("Skipping tar index mode test: EROFS tar index mode not available")
+		t.Logf("Skipping tar index mode test: mkfs.erofs does not support tar mode")
 	}
 }
 

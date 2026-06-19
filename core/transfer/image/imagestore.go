@@ -173,6 +173,20 @@ func WithUnpack(p ocispec.Platform, snapshotter string) StoreOpt {
 	}
 }
 
+// WithOnDemandUnpack is like WithUnpack but sets OnDemand=true, requesting
+// on-demand content caching: only metadata is fetched at pull time and actual
+// bytes are retrieved on first container access.  On unsupported combinations
+// the hint is silently ignored and the full layer is fetched eagerly.
+func WithOnDemandUnpack(p ocispec.Platform, snapshotter string) StoreOpt {
+	return func(s *Store) {
+		s.unpacks = append(s.unpacks, transfer.UnpackConfiguration{
+			Platform:    p,
+			Snapshotter: snapshotter,
+			OnDemand:    true,
+		})
+	}
+}
+
 // NewStore creates a new image store source or Destination
 func NewStore(image string, opts ...StoreOpt) *Store {
 	s := &Store{
@@ -385,6 +399,7 @@ func (is *Store) UnpackPlatforms() []transfer.UnpackConfiguration {
 	for i, uc := range is.unpacks {
 		unpacks[i].Snapshotter = uc.Snapshotter
 		unpacks[i].Platform = uc.Platform
+		unpacks[i].OnDemand = uc.OnDemand
 	}
 	return unpacks
 }
@@ -458,6 +473,7 @@ func unpackToProto(uc []transfer.UnpackConfiguration) []*transfertypes.UnpackCon
 		auc[i] = &transfertypes.UnpackConfiguration{
 			Platform:    &p,
 			Snapshotter: uc[i].Snapshotter,
+			OnDemand:    uc[i].OnDemand,
 		}
 	}
 	return auc
@@ -467,6 +483,7 @@ func unpackFromProto(auc []*transfertypes.UnpackConfiguration) []transfer.Unpack
 	uc := make([]transfer.UnpackConfiguration, len(auc))
 	for i := range auc {
 		uc[i].Snapshotter = auc[i].Snapshotter
+		uc[i].OnDemand = auc[i].OnDemand
 		if auc[i].Platform != nil {
 			uc[i].Platform.OS = auc[i].Platform.OS
 			uc[i].Platform.Architecture = auc[i].Platform.Architecture

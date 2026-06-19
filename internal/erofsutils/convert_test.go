@@ -23,8 +23,6 @@
 package erofsutils_test
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"io/fs"
 	"os"
@@ -132,91 +130,6 @@ func TestConvertErofsOpaqueXattr(t *testing.T) {
 	assert.Equal(t, "y", xattrs["trusted.overlay.opaque"],
 		"trusted.overlay.opaque must be preserved in EROFS image")
 }
-
-// ============================================================
-// GenerateTarIndexAndAppendTarTo tests
-// ============================================================
-
-// TestGenerateTarIndexAndAppendTarToExplicitPaths verifies that the explicit-
-// path variant writes metadata to metaPath and data to dataPath, and that the
-// two files have the expected structure.
-func TestGenerateTarIndexAndAppendTarToExplicitPaths(t *testing.T) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	require.NoError(t, tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeDir, Name: "./", Mode: 0755,
-	}))
-	const payload = "explicit-paths test content"
-	require.NoError(t, tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeReg, Name: "data.txt",
-		Size: int64(len(payload)), Mode: 0644,
-	}))
-	_, err := tw.Write([]byte(payload))
-	require.NoError(t, err)
-	require.NoError(t, tw.Close())
-
-	metaDir := t.TempDir()
-	dataDir := t.TempDir()
-	metaPath := filepath.Join(metaDir, "my-meta.erofs")
-	dataPath := filepath.Join(dataDir, "my-data.bin")
-
-	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTarTo(
-		context.Background(), bytes.NewReader(buf.Bytes()), metaPath, dataPath, ""))
-
-	// metaPath must be a valid EROFS image.
-	checkSuperblock(t, metaPath)
-
-	// dataPath must contain the file payload.
-	dataBytes, err := os.ReadFile(dataPath)
-	require.NoError(t, err)
-	require.Contains(t, string(dataBytes), payload,
-		"payload must appear in the data file")
-
-	// metaPath must NOT contain the payload (it is metadata-only).
-	metaBytes, err := os.ReadFile(metaPath)
-	require.NoError(t, err)
-	require.NotContains(t, string(metaBytes), payload,
-		"payload must not appear in the metadata image")
-
-	// Both files must be in their respective directories, not mixed up.
-	_, err = os.Stat(filepath.Join(metaDir, "my-data.bin"))
-	require.True(t, os.IsNotExist(err), "data file must not appear in meta directory")
-	_, err = os.Stat(filepath.Join(dataDir, "my-meta.erofs"))
-	require.True(t, os.IsNotExist(err), "meta file must not appear in data directory")
-}
-
-// TestGenerateTarIndexAndAppendTarToChunkDeviceID verifies that the metadata
-// image produced by GenerateTarIndexAndAppendTarTo contains chunk indexes that
-// reference DeviceID=1 (i.e., the data file), and that the file list matches
-// a full-extraction image from the same tar.
-func TestGenerateTarIndexAndAppendTarToChunkDeviceID(t *testing.T) {
-	data := makeTarStream(t, 16*1024)
-
-	dir := t.TempDir()
-	metaPath := filepath.Join(dir, "fsmeta.erofs")
-	dataPath := filepath.Join(dir, "layer.erofs")
-
-	require.NoError(t, erofsutils.GenerateTarIndexAndAppendTarTo(
-		context.Background(), bytes.NewReader(data), metaPath, dataPath, ""))
-
-	// Full extraction for comparison.
-	fullOut := filepath.Join(t.TempDir(), "full.erofs")
-	require.NoError(t, erofsutils.ConvertTarErofs(
-		context.Background(), bytes.NewReader(data), fullOut, ""))
-
-	// The metadata image references DeviceID=1 == dataPath.
-	// Supply dataPath as the extra device so the reader can resolve chunks.
-	idxNames := erofsFileNamesWithDevice(t, metaPath, dataPath)
-	fullNames := erofsFileNames(t, fullOut)
-
-	require.Equal(t, len(fullNames), len(idxNames),
-		"tar-index metadata and full-extraction must list the same number of entries")
-}
-
-// ============================================================
-// Helpers
-// ============================================================
-
 // openEROFS opens an EROFS image file and returns the fs.FS, asserting no error.
 func openEROFS(t *testing.T, path string) fs.FS {
 	t.Helper()

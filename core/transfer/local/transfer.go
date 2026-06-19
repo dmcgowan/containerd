@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"time"
 
 	"github.com/containerd/typeurl/v2"
@@ -28,12 +29,79 @@ import (
 	"github.com/containerd/errdefs"
 
 	"github.com/containerd/containerd/v2/core/content"
+	contentindex "github.com/containerd/containerd/v2/core/content/index"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/pkg/imageverifier"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+// LazyIndexStore is the minimal interface the transfer service needs to
+// perform a lazy ingest. Implemented by the local indexed-content store
+// (core/content/index/local.Store).
+//
+// The interface is intentionally small so that alternative implementations
+// (e.g. remote stores, caching proxies) can satisfy it without pulling in the
+// full contentindex.Store contract.
+type LazyIndexStore interface {
+	WriteLazy(ctx context.Context, ref string, desc ocispec.Descriptor, p contentindex.ByteProvider) error
+}
+
+// lazyIndexStore is the unexported alias used inside the package.
+type lazyIndexStore = LazyIndexStore
+
+// providerPersister is an optional interface a lazy index store may implement
+// to persist registry-provider reconstruction metadata (the registry ref and,
+// when supplied, an encrypted credential) so chunk filling can survive a
+// daemon restart.  The local indexed-content store satisfies it.
+type providerPersister interface {
+	PutProvider(ctx context.Context, name, ref string, cred []byte) error
+}
+
+// credentialProvider is an optional interface that an ImageFetcher may satisfy
+// to expose the registry credential for a specific host as a pre-serialised
+// (JSON) byte blob.  Used by lazyLayerHandler to persist reconstruction
+// metadata.  OCIRegistry satisfies this interface.
+type credentialProvider interface {
+	// RegistryCredentialJSON returns the JSON-serialised credential for host.
+	// Returns nil and no error when no credential is configured.
+	RegistryCredentialJSON(ctx context.Context, host string) ([]byte, error)
+}
+
+// registryHostFromRef extracts just the host[:port] from an image ref such as
+// "registry.example.com/repo:tag" or "registry.example.com/repo@sha256:…".
+func registryHostFromRef(ref string) string {
+	// Add a dummy scheme so url.Parse works.
+	u, err := url.Parse("dummy://" + ref)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+// LazyCacheWarmer schedules background population of the on-disk cache for
+// a lazy-ingested blob.  When configured, the lazy-pull path invokes Warm
+// after a successful WriteLazy so the sparse cache file is opportunistically
+// filled (at PriorityBackground) before the container is actually run.
+// The block-mount handler's foreground EnsureAll then finds the file already
+// populated and the mount completes effectively instantly.
+//
+// PrepareForFSView, when implemented, additionally pre-warms the EROFS
+// superblock + inode-table region synchronously before returning.  This
+// makes the backing file directly usable as an io.ReaderAt by go-erofs:
+// the client-side fsview/block handler can resolve /etc/passwd /
+// /etc/group from the sparse file without triggering a kernel mount.
+// Implementations that don't (or can't) pre-warm the metadata region
+// should still implement the method as a no-op.
+//
+// The interface mirrors core/content/index/cache.Warmer but is restated here
+// to avoid a transfer→cache import.
+type LazyCacheWarmer interface {
+	Warm(ctx context.Context, desc ocispec.Descriptor, p contentindex.ByteProvider) error
+	PrepareForFSView(ctx context.Context, desc ocispec.Descriptor, p contentindex.ByteProvider) error
+}
 
 type localTransferService struct {
 	content content.Store
@@ -59,6 +127,9 @@ func NewTransferService(cs content.Store, is images.Store, tc TransferConfig) tr
 	if tc.MaxConcurrentDownloads > 0 {
 		ts.limiterD = semaphore.NewWeighted(int64(tc.MaxConcurrentDownloads))
 	}
+	// MaxConcurrentUnpacks > 1 enables parallel layer unpack. Value of 0 or 1
+	// means sequential (no semaphore). Parallel unpack requires the snapshotter
+	// to support the "rebase" capability.
 	if tc.MaxConcurrentUnpacks > 1 {
 		ts.limiterP = semaphore.NewWeighted(int64(tc.MaxConcurrentUnpacks))
 	}
@@ -207,4 +278,19 @@ type TransferConfig struct {
 
 	// RegistryConfigPath is a path to the root directory containing registry-specific configurations
 	RegistryConfigPath string
+
+	// IndexStore is the optional indexed content store used for lazy EROFS
+	// layer ingest. When set and an UnpackConfiguration has LazyEROFS=true,
+	// EROFS layers carrying org.erofs.chunk-index.range are ingested lazily
+	// (only the chunk-index section is downloaded) via this store.
+	IndexStore lazyIndexStore
+
+	// CacheWarmer, when non-nil, is invoked after each successful lazy
+	// ingest so the sparse cache file begins streaming in the background.
+	// Without a warmer the chunks would not be fetched until the container
+	// is run (the block-mount handler's eager EnsureAll), serialising
+	// network IO on the run path.  Optional: when nil, lazy pull still
+	// works but the run is delayed by the time it takes to fetch and
+	// decompress every chunk.
+	CacheWarmer LazyCacheWarmer
 }

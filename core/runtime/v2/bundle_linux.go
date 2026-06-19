@@ -35,6 +35,13 @@ func prepareBundleDirectoryPermissions(path string, spec []byte) error {
 	if gid == 0 {
 		return nil
 	}
+	// Chowning requires CAP_CHOWN which is not available when running
+	// unprivileged.  When non-root the bundle is already owned by the
+	// invoking user, which maps to the container's root via the user
+	// namespace, so the chown is unnecessary.
+	if os.Getuid() != 0 {
+		return nil
+	}
 	if err := os.Chown(path, -1, int(gid)); err != nil {
 		return err
 	}

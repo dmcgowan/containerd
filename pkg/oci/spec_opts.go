@@ -1258,6 +1258,59 @@ func WithReadonlyPaths(paths []string) SpecOpts {
 	}
 }
 
+// WithRootlessMounts replaces filesystem mounts that require CAP_SYS_ADMIN in
+// the initial user namespace (sysfs, proc, cgroup) with bind mounts from the
+// host namespace.  This makes the spec compatible with rootless containers
+// running inside a user namespace created by rootlesskit or similar tools.
+func WithRootlessMounts(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
+	for i, m := range s.Mounts {
+		switch m.Type {
+		case "sysfs":
+			// Replace kernel sysfs with a read-only bind mount of the host's
+			// /sys, which is already visible inside the user namespace.
+			s.Mounts[i] = specs.Mount{
+				Destination: m.Destination,
+				Type:        "bind",
+				Source:      "/sys",
+				Options:     []string{"rbind", "ro", "nosuid", "noexec", "nodev"},
+			}
+		case "proc":
+			// Replace a fresh procfs with a bind mount of /proc from the
+			// user namespace's own procfs (provided by rootlesskit).
+			s.Mounts[i] = specs.Mount{
+				Destination: m.Destination,
+				Type:        "bind",
+				Source:      "/proc",
+				Options:     []string{"rbind", "nosuid", "noexec", "nodev"},
+			}
+		case "cgroup", "cgroup2":
+			// Remove cgroup mounts entirely; cgroup management is handled
+			// by the daemon (--cgroup "" disables containerd-side cgroups).
+			s.Mounts[i].Type = "tmpfs"
+			s.Mounts[i].Source = "tmpfs"
+		case "bind":
+			// Bind mounts with MS_REC from copy-up paths (e.g. /etc inside
+			// rootlesskit's copy-up tmpfs) may fail if the source itself is
+			// a tmpfs-overlaid path.  Remove MS_REC from the options for
+			// bind mounts of individual files — file bind mounts don't need
+			// recursive propagation and the recursive flag causes EPERM when
+			// the source is inside a rootlesskit copy-up overlay.
+			var filtered []string
+			for _, o := range m.Options {
+				if o != "rprivate" && o != "rbind" {
+					filtered = append(filtered, o)
+				} else if o == "rbind" {
+					filtered = append(filtered, "bind")
+				} else {
+					filtered = append(filtered, "private")
+				}
+			}
+			s.Mounts[i].Options = filtered
+		}
+	}
+	return nil
+}
+
 // WithWriteableSysfs makes any sysfs mounts writeable
 func WithWriteableSysfs(_ context.Context, _ Client, _ *containers.Container, s *Spec) error {
 	for _, m := range s.Mounts {

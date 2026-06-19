@@ -15,10 +15,10 @@
 */
 
 package plugin
-
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
@@ -55,6 +55,7 @@ type Config struct {
 	// DmverityMode controls dm-verity behavior: "auto" (use if available), "on" (require), "off" (disable)
 	// Linux only
 	DmverityMode string `toml:"dmverity_mode"`
+
 }
 
 func init() {
@@ -63,13 +64,15 @@ func init() {
 		ID:     "erofs",
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
-			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
-			// Also advertise support for the EROFS-featured platform so that
-			// image.Unpack with a converted EROFS image (os.features=["erofs"])
-			// passes the snapshotter platform support check.
-			erofsSpec := platforms.DefaultSpec()
-			erofsSpec.OSFeatures = []string{"erofs"}
-			ic.Meta.Platforms = append(ic.Meta.Platforms, erofsSpec)
+			// Advertise the standard local platform and also the EROFS-featured
+		// variant so that images with os.features=["erofs"] are accepted by
+		// client.checkSnapshotterSupport and the transfer service platform
+		// matching logic.
+		localSpec := platforms.DefaultSpec()
+		ic.Meta.Platforms = append(ic.Meta.Platforms, localSpec)
+		erofsSpec := localSpec
+		erofsSpec.OSFeatures = append(append([]string{}, localSpec.OSFeatures...), "erofs")
+		ic.Meta.Platforms = append(ic.Meta.Platforms, erofsSpec)
 
 			config, ok := ic.Config.(*Config)
 			if !ok {
@@ -105,6 +108,15 @@ func init() {
 			if config.DmverityMode != "" {
 				opts = append(opts, erofs.WithDmverityMode(config.DmverityMode))
 			}
+
+			// Compute the cache root by convention so we do not have to
+			// declare a plugin dependency on io.containerd.cache.v1 (which
+			// would form a cycle: snapshotter \u2192 cache \u2192 content-index \u2192
+			// metadata \u2192 snapshotter).  The cache plugin uses the same
+			// convention so both sides agree on the backing-file path
+			// without a runtime hand-off.
+			cacheRoot := filepath.Join(filepath.Dir(root), "io.containerd.cache.v1.local", "blobs")
+			opts = append(opts, erofs.WithCacheRoot(cacheRoot))
 
 			// Don't bother supporting overlay's slow_chown, only RemapIDs
 			ic.Meta.Capabilities = append(ic.Meta.Capabilities, capaOnlyRemapIDs)
