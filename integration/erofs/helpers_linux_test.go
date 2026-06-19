@@ -16,9 +16,8 @@
    limitations under the License.
 */
 
-// helpers_linux_test.go provides Linux-only test helpers. These depend on
-// packages with Linux-only transitive dependencies (erofsutils → dmverity →
-// go-dmverity/keyring).
+// helpers_linux_test.go provides test helpers that depend on Linux-only
+// packages (converter/erofs → erofsutils/dmverity → go-dmverity/keyring).
 package erofs
 
 import (
@@ -32,29 +31,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// isSnapshotterPlatformError returns true when err is the snapshotter platform
-// support check failure. This occurs when the snapshotter has not declared
-// support for the image's platform (e.g. os.features=["erofs"]). Tests that
-// hit this error skip until the snapshotter advertises the full platform set.
-func isSnapshotterPlatformError(err error) bool {
-	return err != nil && containsFrag(err.Error(), "does not support platform")
-}
-
-// isErofsMediaTypePrefix returns true for any media type that starts with
-// "application/vnd.erofs". This covers both the canonical types
-// (vnd.erofs, vnd.erofs+zstd) and the legacy layer type (vnd.erofs.layer.v1).
-func isErofsMediaTypePrefix(mt string) bool {
-	const prefix = "application/vnd.erofs"
-	return len(mt) >= len(prefix) && mt[:len(prefix)] == prefix
-}
-
-// erofsTestImage is the small, publicly available tar image used as the seed
-// for local EROFS conversions. Kept small to minimise download time.
+// erofsTestImage is the small tar image used as the seed for local conversions.
 const erofsTestImage = "ghcr.io/containerd/alpine:3.14.0"
 
-// localEROFS fetches erofsTestImage and converts it to a per-layer EROFS+zstd
-// image using the local converter (no registry push). The converted image is
-// stored as dstRef. Both images are cleaned up on test exit.
+// localEROFS converts erofsTestImage to a single merged EROFS layer under
+// dstRef using a local converter.Convert call (no registry push required).
+// It registers t.Cleanup to delete both the seed and the converted image.
 func localEROFS(t *testing.T, c *containerd.Client, dstRef string) *images.Image {
 	t.Helper()
 	ctx, cancel := testContext(t)
@@ -62,12 +44,7 @@ func localEROFS(t *testing.T, c *containerd.Client, dstRef string) *images.Image
 
 	_, err := c.Fetch(ctx, erofsTestImage,
 		containerd.WithPlatform(platforms.DefaultString()))
-	if err != nil {
-		if isNetworkError(err) {
-			t.Skipf("seed image %s not reachable: %v", erofsTestImage, err)
-		}
-		require.NoError(t, err, "fetch seed image for local EROFS conversion")
-	}
+	require.NoError(t, err, "fetch seed image for local conversion")
 	t.Cleanup(func() {
 		ctx2, c2 := testContext(t)
 		defer c2()
@@ -75,13 +52,12 @@ func localEROFS(t *testing.T, c *containerd.Client, dstRef string) *images.Image
 	})
 
 	opts := []converter.Opt{
-		converter.WithLayerConvertFunc(erofsconv.LayerConvertFunc(
+		converter.WithUpdateManifest(erofsconv.MergeManifestFunc(
 			erofsconv.WithBlobCompression("zstd"))),
-		converter.WithUpdateManifest(erofsconv.UpdateManifestPlatform),
 		converter.WithPlatform(platforms.DefaultStrict()),
 	}
 	img, err := converter.Convert(ctx, c, dstRef, erofsTestImage, opts...)
-	require.NoError(t, err, "convert to per-layer EROFS+zstd")
+	require.NoError(t, err, "convert to merged EROFS")
 	t.Cleanup(func() {
 		ctx2, c2 := testContext(t)
 		defer c2()

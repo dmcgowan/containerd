@@ -16,62 +16,88 @@
    limitations under the License.
 */
 
-// snapshotter_linux_test.go contains integration tests for the EROFS
-// snapshotter that exercise the Prepare/Apply/Commit lifecycle.
+// snapshotter_linux_test.go contains Linux-specific snapshotter tests that
+// use local image conversion (which depends on Linux-only packages) instead
+// of pulling pre-converted images from a remote registry.
 //
-// # Root requirements
-//
-// These tests do NOT require root. The EROFS Prepare/Apply/Commit pipeline
-// only writes EROFS image files (layer.erofs) and bolt records; it does not
-// issue mount(2) syscalls. Only tests in exec_linux_test.go actually mount
-// EROFS images and therefore need root.
-//
-// Tests use an in-process containerd client so no daemon binary is needed.
-//
-// # What is tested
-//
-//   - After converting and unpacking an EROFS image, every layer snapshot is
-//     in KindCommitted state (Stat() is a boltdb read).
-//   - Mounts() via a KindView snapshot returns non-empty descriptors with
-//     a non-empty Source path (metadata read, no mount(2)).
+// These tests still do NOT require root: the EROFS differ writes layer.erofs
+// via plain file I/O with no mount(2) syscall.
 package erofs
 
 import (
-	"fmt"
+	"bytes"
 	"testing"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/images/converter"
+	erofsconv "github.com/containerd/containerd/v2/core/images/converter/erofs"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/platforms"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
-// TestErofsSnapshotterCommitted converts and unpacks a local EROFS image,
-// then verifies that every resulting snapshot is in KindCommitted state.
+// TestErofsSnapshotterLocalConvertAndUnpack converts a local tar image to
+// EROFS (no registry needed after the initial fetch) and unpacks it.
+//
+// Does NOT require root: Prepare→Apply→Commit uses no mount(2) calls.
 // ---------------------------------------------------------------------------
-func TestErofsSnapshotterCommitted(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode")
-	}
+func TestErofsSnapshotterLocalConvertAndUnpack(t *testing.T) {
+	skipIfErofsSnapshotterUnavailable(t)
 
 	ctx, cancel := testContext(t)
 	defer cancel()
 
 	c := newTestClient(t)
+	defer c.Close()
 
-	dstRef := erofsTestImage + "-erofs-snap-committed-test"
+	dstRef := erofsTestImage + "-erofs-local-unpack-test"
 	dstImg := localEROFS(t, c, dstRef)
 
 	pm := erofsPM()
 	img := containerd.NewImageWithPlatform(c, *dstImg, pm)
-	if err := img.Unpack(ctx, erofsSnapshotterName); err != nil {
-		if isSnapshotterPlatformError(err) {
-			t.Skipf("erofs snapshotter does not yet advertise os.features=[erofs] platform support: %v", err)
-		}
+
+	require.NoError(t, img.Unpack(ctx, erofsSnapshotterName),
+		"Unpack must succeed: EROFS differ writes layer.erofs via file I/O, "+
+			"no mount(2) syscall is issued")
+
+	unpacked, err := img.IsUnpacked(ctx, erofsSnapshotterName)
+	require.NoError(t, err)
+	assert.True(t, unpacked)
+
+	mfst, err := images.Manifest(ctx, c.ContentStore(), dstImg.Target, pm)
+	require.NoError(t, err)
+	sn := c.SnapshotService(erofsSnapshotterName)
+	for _, id := range chainIDs(t, c, mfst.Layers) {
+		info, err := sn.Stat(ctx, id)
 		require.NoError(t, err)
+		assert.Equal(t, snapshots.KindCommitted, info.Kind)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// TestErofsSnapshotterLocalSnapshotState verifies KindCommitted for all
+// snapshots after local conversion and unpack.
+// ---------------------------------------------------------------------------
+func TestErofsSnapshotterLocalSnapshotState(t *testing.T) {
+	skipIfErofsSnapshotterUnavailable(t)
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	c := newTestClient(t)
+	defer c.Close()
+
+	dstRef := erofsTestImage + "-erofs-snap-state-test"
+	dstImg := localEROFS(t, c, dstRef)
+
+	pm := erofsPM()
+	img := containerd.NewImageWithPlatform(c, *dstImg, pm)
+	require.NoError(t, img.Unpack(ctx, erofsSnapshotterName))
 
 	mfst, err := images.Manifest(ctx, c.ContentStore(), dstImg.Target, pm)
 	require.NoError(t, err)
@@ -79,88 +105,167 @@ func TestErofsSnapshotterCommitted(t *testing.T) {
 	sn := c.SnapshotService(erofsSnapshotterName)
 	for _, id := range chainIDs(t, c, mfst.Layers) {
 		info, err := sn.Stat(ctx, id)
-		require.NoError(t, err, "snapshot %s must exist after unpack", id)
-		assert.Equal(t, snapshots.KindCommitted, info.Kind,
-			"snapshot %s must be in KindCommitted state", id)
+		require.NoError(t, err)
+		assert.Equal(t, snapshots.KindCommitted, info.Kind)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestErofsSnapshotterMountsSpec verifies that a KindView snapshot over a
-// committed EROFS snapshot returns non-empty mount descriptors with populated
-// Source paths. This is a metadata-only operation; no mount(2) is issued.
+// TestErofsSnapshotterLocalMountsSpec verifies that Mounts() returns valid
+// mount descriptors after a local-conversion unpack.  Mounts() issues no
+// mount(2) syscall — root not required.
 // ---------------------------------------------------------------------------
-func TestErofsSnapshotterMountsSpec(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode")
-	}
+func TestErofsSnapshotterLocalMountsSpec(t *testing.T) {
+	skipIfErofsSnapshotterUnavailable(t)
 
 	ctx, cancel := testContext(t)
 	defer cancel()
 
 	c := newTestClient(t)
+	defer c.Close()
 
-	dstRef := erofsTestImage + "-erofs-snap-mountspec-test"
+	dstRef := erofsTestImage + "-erofs-mounts-test"
 	dstImg := localEROFS(t, c, dstRef)
 
 	pm := erofsPM()
 	img := containerd.NewImageWithPlatform(c, *dstImg, pm)
-	if err := img.Unpack(ctx, erofsSnapshotterName); err != nil {
-		if isSnapshotterPlatformError(err) {
-			t.Skipf("erofs snapshotter does not yet advertise os.features=[erofs] platform support: %v", err)
-		}
-		require.NoError(t, err)
-	}
+	require.NoError(t, img.Unpack(ctx, erofsSnapshotterName))
 
 	mfst, err := images.Manifest(ctx, c.ContentStore(), dstImg.Target, pm)
 	require.NoError(t, err)
 
 	sn := c.SnapshotService(erofsSnapshotterName)
-	for i, id := range chainIDs(t, c, mfst.Layers) {
-		// Committed snapshots require a KindView to get mounts.
-		viewKey := fmt.Sprintf("%s-view-%d", t.Name(), i)
-		mounts, err := sn.View(ctx, viewKey, id)
-		require.NoError(t, err, "View() must succeed for committed snapshot %s", id)
-		t.Cleanup(func() {
-			ctx2, cancel2 := testContext(t)
-			defer cancel2()
-			_ = sn.Remove(ctx2, viewKey)
-		})
-		assert.NotEmpty(t, mounts, "View() must return at least one mount descriptor")
+	for _, id := range chainIDs(t, c, mfst.Layers) {
+		mounts, err := sn.Mounts(ctx, id)
+		require.NoError(t, err,
+			"Mounts() is metadata-only, must not require root")
+		assert.NotEmpty(t, mounts)
 		for _, m := range mounts {
-			assert.NotEmpty(t, m.Source, "mount descriptor source path must be non-empty")
-			t.Logf("snapshot %s: type=%s source=%s", id, m.Type, m.Source)
+			assert.NotEmpty(t, m.Source)
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestErofsSnapshotterIsUnpacked verifies that IsUnpacked returns true
-// after unpacking with the EROFS snapshotter.
+// TestErofsSnapshotterLocalUnpackParallel converts and unpacks the same image
+// in three concurrent goroutines to verify thread-safety in the snapshotter's
+// metadata layer.  No root required.
 // ---------------------------------------------------------------------------
-func TestErofsSnapshotterIsUnpacked(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping in short mode")
-	}
+func TestErofsSnapshotterLocalUnpackParallel(t *testing.T) {
+	skipIfErofsSnapshotterUnavailable(t)
 
 	ctx, cancel := testContext(t)
 	defer cancel()
 
 	c := newTestClient(t)
+	defer c.Close()
 
-	dstRef := erofsTestImage + "-erofs-snap-isunpacked-test"
-	dstImg := localEROFS(t, c, dstRef)
+	// Pre-fetch the seed so all goroutines share the same content blobs.
+	_, err := c.Fetch(ctx, erofsTestImage,
+		containerd.WithPlatform(platforms.DefaultString()))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx2, c2 := testContext(t)
+		defer c2()
+		_ = c.ImageService().Delete(ctx2, erofsTestImage, images.SynchronousDelete())
+	})
 
-	pm := erofsPM()
-	img := containerd.NewImageWithPlatform(c, *dstImg, pm)
-	if err := img.Unpack(ctx, erofsSnapshotterName); err != nil {
-		if isSnapshotterPlatformError(err) {
-			t.Skipf("erofs snapshotter does not yet advertise os.features=[erofs] platform support: %v", err)
-		}
-		require.NoError(t, err)
+	const parallelism = 3
+	errs := make(chan error, parallelism)
+
+	for i := 0; i < parallelism; i++ {
+		idx := i
+		go func() {
+			ref := erofsTestImage + "-erofs-par-" + string(rune('a'+idx))
+			t.Cleanup(func() {
+				ctx2, c2 := testContext(t)
+				defer c2()
+				_ = c.ImageService().Delete(ctx2, ref, images.SynchronousDelete())
+			})
+			ctx2, cancel2 := testContext(t)
+			defer cancel2()
+
+			converted, convertErr := converter.Convert(ctx2, c, ref, erofsTestImage,
+				converter.WithUpdateManifest(erofsconv.MergeManifestFunc(
+					erofsconv.WithBlobCompression("zstd"))),
+				converter.WithPlatform(platforms.DefaultStrict()),
+			)
+			if convertErr != nil {
+				errs <- convertErr
+				return
+			}
+			wrapped := containerd.NewImageWithPlatform(c, *converted, erofsPM())
+			errs <- wrapped.Unpack(ctx2, erofsSnapshotterName)
+		}()
 	}
 
-	unpacked, err := img.IsUnpacked(ctx, erofsSnapshotterName)
+	timer := time.NewTimer(120 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < parallelism; i++ {
+		select {
+		case unpackErr := <-errs:
+			assert.NoError(t, unpackErr, "parallel goroutine %d failed", i)
+		case <-timer.C:
+			t.Fatal("timeout waiting for parallel EROFS unpacks")
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestErofsSnapshotterOCIArchiveRoundtrip exercises the full workflow using
+// locally converted images:
+//  1. Convert tar → EROFS
+//  2. Unpack with EROFS snapshotter  (no root: file I/O only)
+//  3. Export to OCI archive          (no root: content store reads)
+//  4. Import archive                 (no root: content store writes)
+//  5. Re-unpack the imported image   (no root: file I/O only)
+// ---------------------------------------------------------------------------
+func TestErofsSnapshotterOCIArchiveRoundtrip(t *testing.T) {
+	skipIfErofsSnapshotterUnavailable(t)
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	c := newTestClient(t)
+	defer c.Close()
+
+	srcRef := erofsTestImage + "-erofs-rt-src"
+	srcDst := localEROFS(t, c, srcRef)
+
+	pm := erofsPM()
+	srcImg := containerd.NewImageWithPlatform(c, *srcDst, pm)
+	require.NoError(t, srcImg.Unpack(ctx, erofsSnapshotterName))
+
+	// Export to in-memory buffer (no root needed).
+	var buf bytes.Buffer
+	err := c.Export(ctx, &buf,
+		archive.WithImage(c.ImageService(), srcRef),
+		archive.WithPlatform(pm),
+		archive.WithSkipDockerManifest(),
+	)
 	require.NoError(t, err)
-	assert.True(t, unpacked, "IsUnpacked must return true after EROFS unpack")
+	require.Greater(t, buf.Len(), 1024)
+
+	// Import.
+	importedRef := erofsTestImage + "-erofs-rt-imported"
+	t.Cleanup(func() {
+		ctx2, c2 := testContext(t)
+		defer c2()
+		_ = c.ImageService().Delete(ctx2, importedRef, images.SynchronousDelete())
+	})
+
+	importedImgs, err := c.Import(ctx, &buf,
+		containerd.WithImageRefTranslator(func(string) string { return importedRef }),
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, importedImgs)
+
+	// Re-unpack.
+	imported := containerd.NewImageWithPlatform(c, importedImgs[0], pm)
+	require.NoError(t, imported.Unpack(ctx, erofsSnapshotterName),
+		"EROFS image must be re-unpackable after OCI archive round-trip")
+
+	unpacked, err := imported.IsUnpacked(ctx, erofsSnapshotterName)
+	require.NoError(t, err)
+	assert.True(t, unpacked)
 }

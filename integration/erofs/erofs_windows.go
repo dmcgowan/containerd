@@ -18,12 +18,8 @@
 
 package erofs
 
-import (
-	"fmt"
-	"os"
+const (
+	defaultAddress = `\\.\pipe\containerd-erofs-test`
+	defaultRoot    = `C:\containerd-erofs-test\root`
+	defaultState   = `C:\containerd-erofs-test\state`
 )
-
-// socketPath returns the named pipe path for the in-process containerd server.
-func socketPath(_ string) string {
-	return fmt.Sprintf(`\\.\pipe\containerd-erofs-test-%d`, os.Getpid())
-}

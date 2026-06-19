@@ -17,62 +17,129 @@
 package erofs
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"testing"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/testutil"
+	"github.com/containerd/log"
 )
 
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	// Short mode: run only the fast, in-process, network-free tests.
+	// Short mode: skip daemon lifecycle — run only the fast, network-free tests.
 	if testing.Short() {
 		os.Exit(m.Run())
 	}
 
-	// Create a temporary directory for the server's root, state, and socket.
-	// This is cleaned up after the suite runs.
-	tmpDir, err := os.MkdirTemp("", "containerd-erofs-test-*")
+	// Non-short tests need root on Unix (snapshotter, mount, etc.).
+	testutil.RequiresRootM()
+
+	var buf bytes.Buffer
+	ctx, cancel := testContext(nil)
+	defer cancel()
+
+	if !noDaemon {
+		// Remove any stale state from a prior run.
+		_ = os.RemoveAll(defaultRoot)
+
+		stdioFile, err := os.CreateTemp("", "containerd-erofs-stdio-")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create stdio temp file: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() {
+			stdioFile.Close()
+			os.Remove(stdioFile.Name())
+		}()
+		ctrdStdioFilePath = stdioFile.Name()
+		stdioWriter := io.MultiWriter(stdioFile, &buf)
+
+		cfgPath, err := createConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create containerd config: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.Remove(cfgPath)
+
+		err = ctrd.start("containerd", address, []string{
+			"--root", defaultRoot,
+			"--state", defaultState,
+			"--log-level", "debug",
+			"--config", cfgPath,
+		}, stdioWriter, stdioWriter)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start containerd: %v\n%s\n", err, buf.String())
+			os.Exit(1)
+		}
+	} else {
+		ctrd.addr = address
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
+	client, err := ctrd.waitForStart(waitCtx)
+	waitCancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
+		ctrd.Kill()
+		ctrd.Wait()
+		fmt.Fprintf(os.Stderr, "containerd did not start in time: %v\n%s\n", err, buf.String())
 		os.Exit(1)
 	}
-	defer os.RemoveAll(tmpDir)
 
-	sock := socketPath(tmpDir)
-	address = sock
-
-	ctx := context.Background() //nolint:all
-
-	srv, err := startInProcessServer(ctx, tmpDir, sock)
+	v, err := client.Version(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start in-process containerd: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to get containerd version: %v\n", err)
 		os.Exit(1)
 	}
-	defer srv.Stop()
+	log.G(ctx).WithFields(log.Fields{
+		"version":  v.Version,
+		"revision": v.Revision,
+	}).Info("EROFS integration suite running against containerd")
 
-	if err := waitAndConfigureServer(ctx, sock); err != nil {
-		fmt.Fprintf(os.Stderr, "in-process containerd not ready: %v\n", err)
-		os.Exit(1)
+	// Set the namespace's default snapshotter so pull+unpack tests
+	// pick up the right one without extra flags.
+	snapshotter := defaults.DefaultSnapshotter
+	nsCtx := namespaces.WithNamespace(ctx, testNamespace)
+	if err := client.NamespaceService().SetLabel(nsCtx, testNamespace,
+		defaults.DefaultSnapshotterNSLabel, snapshotter); err != nil {
+		// Namespace may not exist yet — that's fine.
+		log.G(ctx).WithError(err).Debug("could not set default snapshotter label")
+	}
+	testSnapshotter = snapshotter
+
+	client.Close()
+
+	status := m.Run()
+
+	if !noDaemon {
+		if err := ctrd.Stop(); err != nil {
+			if err2 := ctrd.Kill(); err2 != nil {
+				fmt.Fprintln(os.Stderr, "failed to kill containerd:", err2)
+			}
+		}
+		ctrd.Wait()
+		_ = os.RemoveAll(defaultRoot)
 	}
 
-	os.Exit(m.Run())
+	os.Exit(status)
 }
 
-// newTestClient opens a new containerd client connected to the in-process
-// server. The client is closed automatically when the test finishes.
+// newTestClient opens a new containerd client for use in a single test.
+// It is the caller's responsibility to call Close().
 func newTestClient(t testing.TB) *containerd.Client {
 	t.Helper()
-	c, err := containerd.New(address,
-		containerd.WithDefaultNamespace(testNamespace),
-	)
+	c, err := containerd.New(address)
 	if err != nil {
 		t.Fatalf("failed to create containerd client: %v", err)
 	}
-	t.Cleanup(func() { c.Close() })
 	return c
 }

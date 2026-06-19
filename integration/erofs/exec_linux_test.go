@@ -17,61 +17,64 @@
 */
 
 // exec_linux_test.go contains tests that perform actual EROFS filesystem
-// mounts and verify mount properties.
+// mounts and run container workloads.  These tests:
 //
-// Requirements:
-//   - Linux (mount(2) and loop devices are Linux-specific).
-//   - Root / CAP_SYS_ADMIN: the erofs kernel driver requires privileged mounts.
-//   - EROFS kernel module: loaded automatically by the daemon on most systems;
-//     the test skips if the snapshotter is unavailable.
+//   - Are Linux-only: mounting EROFS images requires the erofs kernel module
+//     and loop device support, which are Linux-specific.
 //
-// All unpack / snapshot-state / mount-spec tests that do not require root live
-// in snapshotter_linux_test.go.
+//   - Require root (CAP_SYS_ADMIN): mount(2) and loop-device ioctls are
+//     privileged operations.
+//
+//   - Use testutil.RequiresRoot to skip gracefully on non-root runs.
+//
+// All unpack / snapshot-state / mount-spec tests run without root and live in
+// snapshotter_test.go and snapshotter_linux_test.go.
 package erofs
 
 import (
 	"os"
+	"os/exec"
 	"testing"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/pkg/testutil"
+	erofssnap "github.com/containerd/containerd/v2/plugins/snapshots/erofs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // skipIfEROFSMountUnavailable skips t if any prerequisite for actual EROFS
-// filesystem mounting is absent:
-//   - Root / CAP_SYS_ADMIN
-//   - EROFS snapshotter plugin registered in the daemon
+// filesystem mounting is missing:
+//   - Root / CAP_SYS_ADMIN for mount(2)
+//   - EROFS kernel module
+//   - mkfs.erofs binary
 func skipIfEROFSMountUnavailable(t *testing.T) {
 	t.Helper()
 	testutil.RequiresRoot(t)
-	if testing.Short() {
-		t.Skip("short mode: skipping mount tests")
+	if !erofssnap.FindErofs() {
+		t.Skip("EROFS kernel module not loaded")
 	}
-
-	c := newTestClient(t)
-	defer c.Close()
-
-	ctx, cancel := testContext(t)
-	defer cancel()
-	_, err := c.GetSnapshotterCapabilities(ctx, erofsSnapshotterName)
-	if err != nil {
-		t.Skipf("erofs snapshotter not available: %v", err)
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skipf("mkfs.erofs not found: %v", err)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestErofsExecLayerFileIntegrity verifies that the layer.erofs file produced
-// by the Go conversion path has a valid EROFS superblock magic at offset 1024.
+// TestErofsExecLayerFileIntegrity mounts each snapshot via the daemon and
+// verifies that the layer.erofs source file has a valid EROFS superblock
+// magic (0xE0F5E1E2 at byte offset 1024).
 //
-// The mount is performed by the daemon. This test reads the source path from
-// the Mounts() descriptor (which is a boltdb read), opens the file directly,
-// and checks the magic bytes.
+// The mount is performed by the daemon (which runs as root); the test process
+// itself only reads the resulting file path from the Mounts() descriptor.
+// However it still calls testutil.RequiresRoot because listing mount paths
+// of root-owned daemon state typically requires the same privilege level.
 // ---------------------------------------------------------------------------
 func TestErofsExecLayerFileIntegrity(t *testing.T) {
 	skipIfEROFSMountUnavailable(t)
+	if testing.Short() {
+		t.Skip()
+	}
 
 	ctx, cancel := testContext(t)
 	defer cancel()
@@ -102,11 +105,16 @@ func TestErofsExecLayerFileIntegrity(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestErofsExecMountReadonly verifies that the EROFS mount spec returned by
-// Mounts() includes the "ro" (read-only) option.
+// TestErofsExecMountReadonly verifies that an EROFS snapshot can be mounted
+// and that its mount options include "ro" (read-only).
+//
+// Actual mounting is performed by the daemon; this test checks the spec.
 // ---------------------------------------------------------------------------
 func TestErofsExecMountReadonly(t *testing.T) {
 	skipIfEROFSMountUnavailable(t)
+	if testing.Short() {
+		t.Skip()
+	}
 
 	ctx, cancel := testContext(t)
 	defer cancel()
@@ -146,20 +154,20 @@ func TestErofsExecMountReadonly(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // checkEROFSSuperblock reads bytes 1024–1027 from path and asserts the EROFS
-// magic 0xE0F5E1E2 (little-endian: bytes E2 E1 F5 E0).
+// magic 0xE0F5E1E2 (little-endian).
 // ---------------------------------------------------------------------------
 func checkEROFSSuperblock(t *testing.T, path string) {
 	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
-		t.Logf("cannot open %q: %v (skipping superblock check)", path, err)
+		t.Logf("cannot open %q: %v", path, err)
 		return
 	}
 	defer f.Close()
 
 	var magic [4]byte
 	if _, err := f.ReadAt(magic[:], 1024); err != nil {
-		t.Logf("cannot read superblock from %q: %v (skipping)", path, err)
+		t.Logf("cannot read superblock from %q: %v", path, err)
 		return
 	}
 	assert.Equal(t, [4]byte{0xE2, 0xE1, 0xF5, 0xE0}, magic,

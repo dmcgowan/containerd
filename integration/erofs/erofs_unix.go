@@ -18,9 +18,8 @@
 
 package erofs
 
-import "path/filepath"
-
-// socketPath returns the unix socket path for the in-process containerd server.
-func socketPath(tmpDir string) string {
-	return filepath.Join(tmpDir, "containerd.sock")
-}
+const (
+	defaultRoot    = "/var/lib/containerd-erofs-test"
+	defaultState   = "/run/containerd-erofs-test"
+	defaultAddress = "/run/containerd-erofs-test/containerd.sock"
+)

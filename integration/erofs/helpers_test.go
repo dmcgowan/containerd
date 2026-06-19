@@ -14,8 +14,8 @@
    limitations under the License.
 */
 
-// helpers_test.go provides cross-platform test helpers used by daemon-based
-// integration tests. These helpers have no platform-specific imports.
+// helpers_test.go provides cross-platform test helpers used by snapshotter
+// tests and other suites.  These helpers have no platform-specific imports.
 package erofs
 
 import (
@@ -30,24 +30,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const erofsSnapshotterName = "erofs"
-
 // erofsPM returns a platform matcher for the local architecture with
-// os.features=["erofs"], as required for selecting an EROFS manifest from
-// a dual-format index.
+// os.features=["erofs"], as required by the erofs-image-spec §5.1.
 func erofsPM() platforms.MatchComparer {
 	spec := platforms.DefaultSpec()
 	spec.OSFeatures = []string{"erofs"}
 	return platforms.OnlyStrict(spec)
 }
 
-// chainIDs derives the OCI chain IDs for each layer in the manifest. The
-// diff ID is obtained via images.GetDiffID, which reads the
-// labels.LabelUncompressed content label from the content store (set during
-// conversion by converter/erofs) or decompresses the layer on-the-fly if
-// the label is absent.
-//
-// This function has no Linux-only dependencies.
+// chainIDs derives the OCI chain ID for each layer in the manifest by reading
+// the org.erofs.uncompressed-digest annotation (erofs-image-spec §5.2) or
+// falling back to the content-store label / live decompression.
+// This function uses only cross-platform packages.
 func chainIDs(t *testing.T, c *containerd.Client, layers []ocispec.Descriptor) []string {
 	t.Helper()
 	ctx, cancel := testContext(t)
@@ -58,7 +52,7 @@ func chainIDs(t *testing.T, c *containerd.Client, layers []ocispec.Descriptor) [
 		ids   []string
 	)
 	for _, l := range layers {
-		diffID, err := images.GetDiffID(ctx, c.ContentStore(), l)
+		diffID, err := images.UncompressedDigestFromDescriptor(ctx, c.ContentStore(), l)
 		require.NoError(t, err, "compute diff ID for layer %s", l.Digest)
 		chain = append(chain, diffID)
 		ids = append(ids, identity.ChainID(chain).String())

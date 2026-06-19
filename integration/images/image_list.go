@@ -40,6 +40,24 @@ type ImageList struct {
 	ArgsEscaped      string
 	Nginx            string
 	Whiteout         string
+
+	// EROFS images — converted versions of the classic images above.
+	// These are dual-format OCI image indexes: the original tar-based
+	// manifests come first (for backward compat) followed by EROFS variants
+	// annotated with os.features=["erofs"].
+	//
+	// The *Merge variants collapse all layers into a single merged EROFS
+	// image (no overlay chain), which is the preferred form for the EROFS
+	// snapshotter's fast-path.
+	//
+	// Default refs point to docker.io/dmcgowan/ which hosts pre-converted
+	// reference images.  Override with -image-list to point at a local
+	// registry during development or CI.
+	ErofsAlpine      string
+	ErofsBusyBox     string
+	ErofsPause       string
+	ErofsAlpineMerge string
+	ErofsBusyBoxMerge string
 }
 
 var (
@@ -77,6 +95,25 @@ func initImages(imageListFile string) {
 		}
 	}
 
+	// Back-fill EROFS image refs that were not set by the image-list file.
+	// These are derived from the canonical tar images by appending ":erofs-demo"
+	// / ":erofs-merge" tags at the same registry used for the tar originals.
+	if imageList.ErofsAlpine == "" {
+		imageList.ErofsAlpine = "docker.io/dmcgowan/alpine:erofs-demo"
+	}
+	if imageList.ErofsBusyBox == "" {
+		imageList.ErofsBusyBox = "docker.io/dmcgowan/busybox:erofs-demo"
+	}
+	if imageList.ErofsPause == "" {
+		imageList.ErofsPause = "docker.io/dmcgowan/pause:erofs-demo"
+	}
+	if imageList.ErofsAlpineMerge == "" {
+		imageList.ErofsAlpineMerge = "docker.io/dmcgowan/alpine:erofs-merge"
+	}
+	if imageList.ErofsBusyBoxMerge == "" {
+		imageList.ErofsBusyBoxMerge = "docker.io/dmcgowan/busybox:erofs-merge"
+	}
+
 	log.L.Infof("Using the following image list: %+v", imageList)
 	imageMap = initImageMap(imageList)
 }
@@ -104,6 +141,17 @@ const (
 	Nginx
 	// Whiteout image
 	Whiteout
+
+	// ErofsAlpine is a dual-format index with an EROFS variant of Alpine.
+	ErofsAlpine
+	// ErofsBusyBox is a dual-format index with an EROFS variant of BusyBox.
+	ErofsBusyBox
+	// ErofsPause is a dual-format index with an EROFS variant of Pause.
+	ErofsPause
+	// ErofsAlpineMerge is a single-layer merged EROFS image of Alpine.
+	ErofsAlpineMerge
+	// ErofsBusyBoxMerge is a single-layer merged EROFS image of BusyBox.
+	ErofsBusyBoxMerge
 )
 
 func initImageMap(imageList ImageList) map[int]string {
@@ -118,6 +166,11 @@ func initImageMap(imageList ImageList) map[int]string {
 	images[ArgsEscaped] = imageList.ArgsEscaped
 	images[Nginx] = imageList.Nginx
 	images[Whiteout] = imageList.Whiteout
+	images[ErofsAlpine] = imageList.ErofsAlpine
+	images[ErofsBusyBox] = imageList.ErofsBusyBox
+	images[ErofsPause] = imageList.ErofsPause
+	images[ErofsAlpineMerge] = imageList.ErofsAlpineMerge
+	images[ErofsBusyBoxMerge] = imageList.ErofsBusyBoxMerge
 	return images
 }
 

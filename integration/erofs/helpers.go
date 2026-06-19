@@ -14,35 +14,38 @@
    limitations under the License.
 */
 
-// Package erofs provides a cross-platform integration test suite for the EROFS
-// image format and the EROFS differ/snapshotter.
+// Package erofs provides an integration test suite for the EROFS image format
+// and the EROFS snapshotter.
 //
-// # Test organisation
+// The suite mirrors the structure of integration/client/ but is dedicated to
+// EROFS-specific behaviour.  It covers:
 //
-// Tests are grouped by dependency level:
+//   - Media-type constant correctness (all platforms)
+//   - Image conversion via converter/erofs (Linux)
+//   - OCI archive round-trips (Linux)
+//   - Snapshotter unpack and mount operations (Linux, requires root + kernel module)
 //
-//   - convert_linux_test.go — converter round-trips using the in-process server.
-//     Linux-only due to transitive dmverity import in the erofs differ plugin.
-//   - snapshotter_linux_test.go — Prepare/Apply/Commit lifecycle on the EROFS
-//     snapshotter. No kernel mount required; runs without root.
-//   - exec_linux_test.go — tests that mount EROFS images and run container
-//     workloads. Require root + the erofs kernel module.
+// To run the full suite against a freshly started daemon:
 //
-// # Running
+//	go test ./integration/erofs/... -v
 //
-// To run cross-platform tests without the server (fast, CI-friendly):
+// To run against an already-running daemon (skip daemon start):
 //
-//	go test ./integration/erofs/... -short
+//	go test ./integration/erofs/... -no-daemon -address /run/containerd/containerd.sock
 //
-// To run the full suite (in-process server, no binary needed):
-//
-//	go test ./integration/erofs/...
+// EROFS snapshotter tests additionally require:
+//   - Running as root (-test.root)
+//   - EROFS kernel module loaded (modprobe erofs)
 package erofs
 
 import (
 	"context"
+	"flag"
+	"fmt"
+	"os"
 	"testing"
 
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/log/logtest"
 )
@@ -50,12 +53,22 @@ import (
 const testNamespace = "erofs-testing"
 
 var (
-	// address is the socket path set by TestMain to the per-run temp socket.
-	address string
+	address           string
+	ctrdStdioFilePath string
+	testSnapshotter   = defaults.DefaultSnapshotter
+	ctrd              = &daemon{}
+	noDaemon          bool
 )
 
-// testContext returns a context carrying the erofs-testing namespace and,
-// when t is non-nil, a per-test logger.
+func init() {
+	flag.StringVar(&address, "address", defaultAddress,
+		"containerd socket address for EROFS integration tests")
+	flag.BoolVar(&noDaemon, "no-daemon", false,
+		"connect to an already-running containerd instead of starting one")
+}
+
+// testContext returns a context with the erofs testing namespace and a
+// per-test logger attached.
 func testContext(t testing.TB) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:all
 	ctx = namespaces.WithNamespace(ctx, testNamespace)
@@ -65,9 +78,9 @@ func testContext(t testing.TB) (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-// isNetworkError returns true when err looks like a transient network failure
-// (dial, DNS, TLS). Used to skip tests that depend on a remote registry when
-// running in an offline environment.
+// isNetworkError returns true when the error looks like a transient network
+// problem (dial failure, DNS lookup failure, etc.).  Used to skip tests that
+// require a remote registry in offline environments.
 func isNetworkError(err error) bool {
 	if err == nil {
 		return false
@@ -95,4 +108,27 @@ func containsFrag(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// isErofsMediaTypePrefix returns true for any media type starting with
+// "application/vnd.erofs".  This is an inline copy of
+// erofsutils.IsErofsMediaType that avoids the Linux-only dm-verity transitive
+// dependency, keeping this file compilable on all platforms.
+func isErofsMediaTypePrefix(mt string) bool {
+	const prefix = "application/vnd.erofs"
+	return len(mt) >= len(prefix) && mt[:len(prefix)] == prefix
+}
+
+// createConfig writes a minimal containerd config to a temp file and returns
+// its path.  The caller is responsible for removing it.
+func createConfig() (string, error) {
+	f, err := os.CreateTemp("", "containerd-erofs-config-")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "version = 2\n"); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
 }
