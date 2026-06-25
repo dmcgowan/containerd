@@ -16,11 +16,11 @@ on:
         default: "containerd/containerd"
         type: string
       pr_number:
-        description: "PR number"
+        description: "PR number or branch name"
         required: true
         type: string
       title:
-        description: "PR title (optional for add; auto-fetched if omitted)"
+        description: "Title (optional for add; auto-fetched for PRs if omitted, not fetched for branches)"
         required: false
         type: string
 
@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   manage-pr-list:
-    name: "${{ inputs.action }} PR"
+    name: "${{ inputs.action }} PR/branch"
     runs-on: ubuntu-latest
 
     steps:
@@ -41,12 +41,12 @@ jobs:
 
       - name: Validate inputs
         run: |
-          if ! echo "${{ inputs.pr_number }}" | grep -qE '^[0-9]+$'; then
-            echo "::error::pr_number must be numeric"
+          if ! echo "${{ inputs.pr_number }}" | grep -qE '^[0-9]+$|^[a-zA-Z][a-zA-Z0-9._/-]*$'; then
+            echo "::error::pr_number must be a numeric PR number or a valid branch name (e.g. 1234 or my-feature/branch)"
             exit 1
           fi
 
-      - name: Add PR to list
+      - name: Add PR or branch to list
         if: inputs.action == 'add'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,40 +54,58 @@ jobs:
           REPO="${{ inputs.repo }}"
           PR="${{ inputs.pr_number }}"
 
-          if grep -q "^${REPO} ${PR} " contrib/pr-list; then
-            echo "::error::PR ${REPO}#${PR} already exists in contrib/pr-list"
+          if grep -qE "^${REPO} ${PR}( |$)" contrib/pr-list; then
+            echo "::error::${REPO} ${PR} already exists in contrib/pr-list"
             exit 1
           fi
 
           TITLE="${{ inputs.title }}"
-          if [ -z "${TITLE}" ]; then
+          # Auto-fetch title only for numeric PR numbers; branches have no PR to query.
+          if [ -z "${TITLE}" ] && echo "${PR}" | grep -qE '^[0-9]+$'; then
             TITLE=$(gh pr view "${PR}" --repo "${REPO}" --json title -q .title)
           fi
 
-          echo "${REPO} ${PR} ${TITLE}" >> contrib/pr-list
+          if [ -n "${TITLE}" ]; then
+            echo "${REPO} ${PR} ${TITLE}" >> contrib/pr-list
+          else
+            echo "${REPO} ${PR}" >> contrib/pr-list
+          fi
 
-      - name: Remove PR from list
+      - name: Remove PR or branch from list
         if: inputs.action == 'remove'
         run: |
           REPO="${{ inputs.repo }}"
           PR="${{ inputs.pr_number }}"
 
-          if ! grep -q "^${REPO} ${PR} " contrib/pr-list; then
-            echo "::error::PR ${REPO}#${PR} not found in contrib/pr-list"
+          if ! grep -qE "^${REPO} ${PR}( |$)" contrib/pr-list; then
+            echo "::error::${REPO} ${PR} not found in contrib/pr-list"
             exit 1
           fi
 
-          sed -i "\|^${REPO} ${PR} |d" contrib/pr-list
+          sed -i -E "\|^${REPO} ${PR}( |$)|d" contrib/pr-list
 
       - name: Commit and push
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add contrib/pr-list
-          git commit -m "contrib/pr-list: ${{ inputs.action }} ${{ inputs.repo }}#${{ inputs.pr_number }}"
-          git push origin main-fork
+          PR="${{ inputs.pr_number }}"
+          if echo "${PR}" | grep -qE '^[0-9]+$'; then
+            IDENTIFIER="${{ inputs.repo }}#${PR}"
+          else
+            IDENTIFIER="${{ inputs.repo }}:${PR}"
+          fi
+
+          # Use the GitHub Contents API so the commit is signed (verified) by
+          # GitHub, satisfying branch-protection rules that require signed commits.
+          CONTENT=$(base64 -w0 < contrib/pr-list)
+          SHA=$(gh api repos/${{ github.repository }}/contents/contrib/pr-list \
+            --jq '.sha')
+          gh api repos/${{ github.repository }}/contents/contrib/pr-list \
+            --method PUT \
+            --field message="contrib/pr-list: ${{ inputs.action }} ${IDENTIFIER}" \
+            --field content="${CONTENT}" \
+            --field sha="${SHA}" \
+            --field branch="main-fork"
 
       - name: Trigger merge workflow
         env:
