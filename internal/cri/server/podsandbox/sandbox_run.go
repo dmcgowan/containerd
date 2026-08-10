@@ -197,6 +197,16 @@ func (c *Controller) Start(ctx context.Context, id string) (cin sandbox.Controll
 		sandboxSnapshotter = ociRuntime.Snapshotter
 	}
 
+	// The pause container is a container in the pod, so its writable
+	// snapshot joins the pod's group along with the others.
+	groupOpt, err := c.snapshotGroups.LabelOpt(ctx, ociRuntime.SnapshotGrouping, sandboxSnapshotter, id)
+	if err != nil {
+		return cin, err
+	}
+	if groupOpt != nil {
+		snapshotterOpt = append(snapshotterOpt, groupOpt)
+	}
+
 	opts := []containerd.NewContainerOpts{
 		containerd.WithSnapshotter(sandboxSnapshotter),
 		customopts.WithNewSnapshot(id, pauseImage, !c.imageConfig.DisableSnapshotAnnotations, snapshotterOpt...),

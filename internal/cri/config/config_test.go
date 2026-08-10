@@ -540,3 +540,35 @@ func TestDefaultConfigEnableCRIU(t *testing.T) {
 	assert.NotNil(t, cfg.EnableCRIU)
 	assert.True(t, *cfg.EnableCRIU)
 }
+
+func TestValidateSnapshotGrouping(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "Unset", value: ""},
+		{name: "Auto", value: SnapshotGroupingAuto},
+		{name: "On", value: SnapshotGroupingOn},
+		{name: "Off", value: SnapshotGroupingOff},
+		{name: "Unknown", value: "sometimes", wantErr: true},
+		{name: "WrongCase", value: "Auto", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &RuntimeConfig{
+				ContainerdConfig: ContainerdConfig{
+					DefaultRuntimeName: "default",
+					Runtimes: map[string]Runtime{
+						"default": {SnapshotGrouping: tc.value},
+					},
+				},
+			}
+			_, err := ValidateRuntimeConfig(context.Background(), c)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}

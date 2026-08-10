@@ -278,7 +278,26 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		}
 	}
 
-	if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)); err != nil {
+	createOpts := []sb.CreateOpt{sb.WithOptions(config), sb.WithNetNSPath(sandbox.NetNSPath)}
+
+	// When the pod's containers share a backing resource, create it up
+	// front and hand it to the sandbox so a VM based runtime can attach
+	// it without having to reserve or resize a device later.
+	scratchMounts, err := c.createPodScratchSnapshot(ctx, id, ociRuntime, config, ls)
+	if err != nil {
+		return nil, err
+	}
+	if len(scratchMounts) > 0 {
+		createOpts = append(createOpts, sb.WithRootFS(scratchMounts))
+
+		k, v := scratchSnapshotBackRef(c.RuntimeSnapshotter(ctx, ociRuntime), id)
+		sandboxInfo.AddLabel(k, v)
+		if sandboxInfo, err = c.client.SandboxStore().Update(ctx, sandboxInfo, "labels"); err != nil {
+			return nil, fmt.Errorf("unable to save sandbox %q to sandbox store: %w", id, err)
+		}
+	}
+
+	if err := c.sandboxService.CreateSandbox(ctx, sandboxInfo, createOpts...); err != nil {
 		return nil, fmt.Errorf("failed to create sandbox %q: %w", id, err)
 	}
 

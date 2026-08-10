@@ -33,6 +33,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/constants"
 	"github.com/containerd/containerd/v2/internal/cri/server/events"
 	"github.com/containerd/containerd/v2/internal/cri/server/podsandbox/types"
+	"github.com/containerd/containerd/v2/internal/cri/snapshotgroup"
 	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	osinterface "github.com/containerd/containerd/v2/pkg/os"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
@@ -89,6 +90,7 @@ func init() {
 				imageConfig:    criImagePlugin.(interface{ Config() criconfig.ImageConfig }).Config(),
 				os:             osinterface.RealOS{},
 				warningService: warningPlugin.(warning.Service),
+				snapshotGroups: snapshotgroup.NewResolver(client),
 				store:          NewStore(),
 			}
 
@@ -120,6 +122,9 @@ type Controller struct {
 	// eventMonitor is the event monitor for podsandbox controller to handle sandbox task exit event
 	// actually we only use it's backoff mechanism to make sure pause container is cleaned up.
 	eventMonitor *events.EventMonitor
+	// snapshotGroups decides whether the writable snapshots of a pod
+	// share a single backing resource.
+	snapshotGroups *snapshotgroup.Resolver
 
 	store *Store
 }

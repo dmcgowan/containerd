@@ -45,6 +45,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cri/nri"
 	"github.com/containerd/containerd/v2/internal/cri/server/events"
 	"github.com/containerd/containerd/v2/internal/cri/server/images"
+	"github.com/containerd/containerd/v2/internal/cri/snapshotgroup"
 	containerstore "github.com/containerd/containerd/v2/internal/cri/store/container"
 	imagestore "github.com/containerd/containerd/v2/internal/cri/store/image"
 	"github.com/containerd/containerd/v2/internal/cri/store/label"
@@ -178,6 +179,9 @@ type criService struct {
 
 	checkCriuOnce sync.Once //nolint:nolintlint,unused // Ignore on non-Linux
 	checkCriuErr  error     //nolint:nolintlint,unused // Ignore on non-Linux
+	// snapshotGroups decides whether the writable snapshots of a pod
+	// share a single backing resource.
+	snapshotGroups *snapshotgroup.Resolver
 }
 
 type CRIServiceOptions struct {
@@ -231,6 +235,7 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 		statsCollector:     statsCollector,
 		shimPath:           options.ShimPath,
 		warningService:     options.WarningService,
+		snapshotGroups:     snapshotgroup.NewResolver(options.Client),
 	}
 
 	// TODO: Make discard time configurable

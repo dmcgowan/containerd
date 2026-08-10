@@ -63,6 +63,17 @@ const (
 	defaultImagePullProgressTimeoutDuration = 5 * time.Minute
 )
 
+// Snapshot grouping modes for Runtime.SnapshotGrouping.
+const (
+	// SnapshotGroupingAuto groups snapshots when the snapshotter
+	// advertises the "groups" capability.
+	SnapshotGroupingAuto = "auto"
+	// SnapshotGroupingOn requires snapshot grouping.
+	SnapshotGroupingOn = "on"
+	// SnapshotGroupingOff disables snapshot grouping.
+	SnapshotGroupingOff = "off"
+)
+
 type SandboxControllerMode string
 
 const (
@@ -136,6 +147,16 @@ type Runtime struct {
 	// we can also set it to "streaming" to create a stream by streaming api,
 	// and use it as a channel to transfer the io stream
 	IOType string `toml:"io_type" json:"io_type"`
+	// SnapshotGrouping controls whether the writable snapshots of every
+	// container in a pod share a single backing resource, such as one
+	// block device for the whole pod. Sharing lets a sandbox attach a
+	// single device up front and add containers as directories inside
+	// it, rather than attaching a device per container.
+	//
+	// auto - use grouping when the snapshotter supports it (default when unset)
+	// on   - always group, even if the snapshotter does not advertise support
+	// off  - never group
+	SnapshotGrouping string `toml:"snapshot_grouping" json:"snapshotGrouping"`
 }
 
 // ContainerdConfig contains toml config related to containerd
@@ -684,6 +705,14 @@ func ValidateRuntimeConfig(ctx context.Context, c *RuntimeConfig) ([]deprecation
 		}
 		if r.IOType != IOTypeStreaming && r.IOType != IOTypeFifo {
 			return warnings, errors.New("`io_type` can only be `streaming` or `named_pipe`")
+		}
+
+		// An unset value is treated as SnapshotGroupingAuto.
+		switch r.SnapshotGrouping {
+		case "", SnapshotGroupingAuto, SnapshotGroupingOn, SnapshotGroupingOff:
+		default:
+			return warnings, fmt.Errorf("runtime %s: `snapshot_grouping` can only be %q, %q or %q", k,
+				SnapshotGroupingAuto, SnapshotGroupingOn, SnapshotGroupingOff)
 		}
 	}
 

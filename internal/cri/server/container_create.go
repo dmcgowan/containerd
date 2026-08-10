@@ -308,9 +308,20 @@ func (c *criService) createContainer(r *createContainerRequest) (_ string, retEr
 		return "", err
 	}
 
+	// Place the container's writable snapshot in the pod's group so
+	// that every container in the pod shares one backing resource.
+	snapshotter := c.RuntimeSnapshotter(r.ctx, ociRuntime)
+	groupOpt, err := c.snapshotGroups.LabelOpt(r.ctx, ociRuntime.SnapshotGrouping, snapshotter, r.sandboxID)
+	if err != nil {
+		return "", err
+	}
+	if groupOpt != nil {
+		sOpts = append(sOpts, groupOpt)
+	}
+
 	// Set snapshotter before any other options.
 	opts := []containerd.NewContainerOpts{
-		containerd.WithSnapshotter(c.RuntimeSnapshotter(r.ctx, ociRuntime)),
+		containerd.WithSnapshotter(snapshotter),
 		// Prepare container rootfs. This is always writeable even if
 		// the container wants a readonly rootfs since we want to give
 		// the runtime (runc) a chance to modify (e.g. to create mount
