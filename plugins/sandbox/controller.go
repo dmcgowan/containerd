@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -49,6 +50,7 @@ func init() {
 		Requires: []plugin.Type{
 			plugins.ShimPlugin,
 			plugins.EventPlugin,
+			plugins.MountManagerPlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
 			shimPlugin, err := ic.GetSingle(plugins.ShimPlugin)
@@ -65,6 +67,15 @@ func init() {
 				shims     = shimPlugin.(*v2.ShimManager)
 				publisher = exchangePlugin.(*exchange.Exchange)
 			)
+
+			// The mount manager is optional: without it the sandbox
+			// rootfs is passed through to the shim untouched.
+			var mounts mount.Manager
+			if mountsI, err := ic.GetSingle(plugins.MountManagerPlugin); err == nil {
+				mounts = mountsI.(mount.Manager)
+			} else {
+				log.G(ic.Context).WithError(err).Info("mount manager unavailable, sandbox rootfs will be passed through unmodified")
+			}
 			state := ic.Properties[plugins.PropertyStateDir]
 			root := ic.Properties[plugins.PropertyRootDir]
 			for _, d := range []string{root, state} {
@@ -86,6 +97,7 @@ func init() {
 				state:     state,
 				shims:     shims,
 				publisher: publisher,
+				mounts:    mounts,
 			}
 			return c, nil
 		},
@@ -97,6 +109,7 @@ type controllerLocal struct {
 	state     string
 	shims     *v2.ShimManager
 	publisher events.Publisher
+	mounts    mount.Manager
 }
 
 var _ sandbox.Controller = (*controllerLocal)(nil)
@@ -156,10 +169,21 @@ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts
 		return err
 	}
 
+	rootfs, err := c.activateRootfs(ctx, info, coptions.Rootfs)
+	if err != nil {
+		c.cleanupShim(ctx, sandboxID, svc)
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			c.deactivateRootfs(ctx, sandboxID)
+		}
+	}()
+
 	if _, err := svc.CreateSandbox(ctx, &runtimeAPI.CreateSandboxRequest{
 		SandboxID:   sandboxID,
 		BundlePath:  shim.Bundle(),
-		Rootfs:      mount.ToProto(coptions.Rootfs),
+		Rootfs:      mount.ToProto(rootfs),
 		Options:     typeurl.MarshalProto(coptions.Options),
 		NetnsPath:   coptions.NetNSPath,
 		Annotations: coptions.Annotations,
@@ -169,6 +193,84 @@ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts
 	}
 
 	return nil
+}
+
+// activateRootfs prepares the sandbox rootfs through the mount
+// manager, returning the mounts to hand to the shim.
+//
+// This runs any mount transforms the snapshotter asked for, such as
+// creating and formatting a block image, and mounts anything the shim
+// has not declared it handles itself. A sandbox which attaches a block
+// device to a VM therefore receives a plain, correctly sized device
+// rather than having to create one itself.
+//
+// The mounts are returned unchanged if there is no mount manager or
+// nothing in the chain needs it.
+func (c *controllerLocal) activateRootfs(ctx context.Context, info sandbox.Sandbox, rootfs []mount.Mount) ([]mount.Mount, error) {
+	if c.mounts == nil || len(rootfs) == 0 {
+		return rootfs, nil
+	}
+
+	activateOpts := []mount.ActivateOpt{
+		mount.WithLabels(sandboxMountLabels(info)),
+	}
+	if types, err := c.shims.AllowedMountTypes(ctx, info.Runtime.Name); err == nil {
+		for _, t := range types {
+			activateOpts = append(activateOpts, mount.WithAllowMountType(t))
+		}
+	} else {
+		log.G(ctx).WithError(err).WithField("runtime", info.Runtime.Name).Error("failed to load runtime info")
+	}
+
+	ai, err := c.mounts.Activate(ctx, info.ID, rootfs, activateOpts...)
+	if err == nil {
+		return ai.System, nil
+	}
+	if errdefs.IsAlreadyExists(err) {
+		// Reuse the existing activation rather than tearing it down,
+		// the sandbox with this id still exists.
+		ai, err = c.mounts.Info(ctx, info.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get info on already active sandbox mount: %w", err)
+		}
+		return ai.System, nil
+	}
+	if errdefs.IsNotImplemented(err) {
+		// Nothing in the chain needs the mount manager.
+		return rootfs, nil
+	}
+	return nil, fmt.Errorf("failed to activate sandbox rootfs: %w", err)
+}
+
+// deactivateRootfs releases the sandbox rootfs activation. Mounts
+// shared with other activations, such as a block image backing every
+// container in the sandbox, are only unmounted once nothing else
+// references them.
+func (c *controllerLocal) deactivateRootfs(ctx context.Context, sandboxID string) {
+	if c.mounts == nil {
+		return
+	}
+	if err := c.mounts.Deactivate(ctx, sandboxID); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsNotImplemented(err) {
+		log.G(ctx).WithError(err).WithField("sandboxID", sandboxID).Error("failed to deactivate sandbox mounts")
+	}
+}
+
+// gcBackRefPrefix marks sandbox labels which describe what the
+// sandbox rootfs is derived from.
+const gcBackRefPrefix = "containerd.io/gc.bref."
+
+// sandboxMountLabels forwards the sandbox's garbage collection back
+// references to its mount activation, so that the activation is
+// collected along with the resource it was built from if the sandbox
+// is never cleanly shut down.
+func sandboxMountLabels(info sandbox.Sandbox) map[string]string {
+	labels := map[string]string{}
+	for k, v := range info.Labels {
+		if strings.HasPrefix(k, gcBackRefPrefix) {
+			labels[k] = v
+		}
+	}
+	return labels
 }
 
 func (c *controllerLocal) Start(ctx context.Context, sandboxID string) (sandbox.ControllerInstance, error) {
@@ -260,6 +362,8 @@ func (c *controllerLocal) Shutdown(ctx context.Context, sandboxID string) error 
 	if err := c.shims.Delete(ctx, sandboxID); err != nil {
 		return fmt.Errorf("failed to delete sandbox shim: %w", err)
 	}
+
+	c.deactivateRootfs(ctx, sandboxID)
 
 	return nil
 }

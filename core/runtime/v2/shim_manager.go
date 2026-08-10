@@ -488,6 +488,18 @@ type shimInfo struct {
 	handledMounts []string
 }
 
+// AllowedMountTypes returns the mount types the given runtime declares
+// it handles itself, via the containerd.io/runtime-allow-mounts
+// annotation. Mounts of these types are passed through to the shim
+// rather than being mounted by containerd.
+func (m *ShimManager) AllowedMountTypes(ctx context.Context, runtime string) ([]string, error) {
+	info, err := m.loadShimInfo(ctx, runtime)
+	if err != nil {
+		return nil, err
+	}
+	return info.handledMounts, nil
+}
+
 func (m *ShimManager) loadShimInfo(ctx context.Context, shim string) (*shimInfo, error) {
 	if i, ok := m.shimInfos.Load(shim); ok {
 		return i.(*shimInfo), nil
