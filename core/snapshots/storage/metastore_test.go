@@ -59,6 +59,10 @@ func MetaStoreSuite(t *testing.T, name string, meta func(root string) (*MetaStor
 	t.Run("RemoveWithChildren", makeTest(t, name, meta, inWriteTransaction(testRemoveWithChildren)))
 	t.Run("ParentIDs", makeTest(t, name, meta, inWriteTransaction(testParents)))
 	t.Run("Rebase", makeTest(t, name, meta, inWriteTransaction(testRebase)))
+	t.Run("GroupAssignAndLookup", makeTest(t, name, meta, inWriteTransaction(testGroupAssignAndLookup)))
+	t.Run("GroupIsolatedAcrossNamespaces", makeTest(t, name, meta, inWriteTransaction(testGroupNamespaces)))
+	t.Run("GroupRelease", makeTest(t, name, meta, inWriteTransaction(testGroupRelease)))
+	t.Run("GroupIDNotReused", makeTest(t, name, meta, inWriteTransaction(testGroupIDNotReused)))
 }
 
 // makeTest creates a testsuite with a writable transaction
@@ -701,4 +705,118 @@ func testRebase(ctx context.Context, t *testing.T, ms *MetaStore) {
 			t.Fatalf("Expected removal of parent %s to fail", tc.Name)
 		}
 	}
+}
+
+func testGroupAssignAndLookup(ctx context.Context, t *testing.T, _ *MetaStore) {
+	id1, size, err := AssignGroupID(ctx, "group-a", "snap1", 4096)
+	assert.NoError(t, err)
+	assert.NotZero(t, id1, "first assignment should produce a non-zero id")
+	assert.Equal(t, int64(4096), size)
+
+	// Adding another member returns the same id and the size fixed by
+	// the first member, not the one requested here.
+	id2, size, err := AssignGroupID(ctx, "group-a", "snap2", 8192)
+	assert.NoError(t, err)
+	assert.Equal(t, id1, id2, "members of the same group share an id")
+	assert.Equal(t, int64(4096), size, "group size is fixed by its first member")
+
+	id3, _, err := AssignGroupID(ctx, "group-b", "snap3", 0)
+	assert.NoError(t, err)
+	assert.NotEqual(t, id1, id3, "different groups should get different ids")
+
+	got, err := LookupGroupID(ctx, "group-a")
+	assert.NoError(t, err)
+	assert.Equal(t, id1, got)
+
+	gotSize, err := LookupGroupSize(ctx, "group-a")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(4096), gotSize)
+
+	missing, err := LookupGroupID(ctx, "group-z")
+	assert.NoError(t, err)
+	assert.Zero(t, missing, "lookup of unknown group should return 0")
+
+	missingSize, err := LookupGroupSize(ctx, "group-z")
+	assert.NoError(t, err)
+	assert.Zero(t, missingSize)
+
+	_, _, err = AssignGroupID(ctx, "", "snap1", 0)
+	assert.ErrorIs(t, err, errdefs.ErrInvalidArgument)
+
+	_, _, err = AssignGroupID(ctx, "group-a", "", 0)
+	assert.ErrorIs(t, err, errdefs.ErrInvalidArgument)
+
+	emptyLookup, err := LookupGroupID(ctx, "")
+	assert.NoError(t, err)
+	assert.Zero(t, emptyLookup)
+}
+
+// Distinct keys map to distinct ids; the metadata layer is expected
+// to namespace keys before passing them to the storage layer.
+func testGroupNamespaces(ctx context.Context, t *testing.T, _ *MetaStore) {
+	a, _, err := AssignGroupID(ctx, "ns-a/shared", "snap1", 0)
+	assert.NoError(t, err)
+
+	b, _, err := AssignGroupID(ctx, "ns-b/shared", "snap1", 0)
+	assert.NoError(t, err)
+	assert.NotEqual(t, a, b, "different keys must get different ids")
+
+	gotA, err := LookupGroupID(ctx, "ns-a/shared")
+	assert.NoError(t, err)
+	assert.Equal(t, a, gotA)
+
+	gotB, err := LookupGroupID(ctx, "ns-b/shared")
+	assert.NoError(t, err)
+	assert.Equal(t, b, gotB)
+}
+
+func testGroupRelease(ctx context.Context, t *testing.T, _ *MetaStore) {
+	id, _, err := AssignGroupID(ctx, "g", "snap1", 0)
+	assert.NoError(t, err)
+	_, _, err = AssignGroupID(ctx, "g", "snap2", 0)
+	assert.NoError(t, err)
+
+	// Releasing one of two members keeps the group alive.
+	gotID, empty, err := ReleaseGroupID(ctx, "g", "snap1")
+	assert.NoError(t, err)
+	assert.Equal(t, id, gotID)
+	assert.False(t, empty, "group still has a member")
+
+	got, err := LookupGroupID(ctx, "g")
+	assert.NoError(t, err)
+	assert.Equal(t, id, got)
+
+	// Releasing the last member reports the group as empty and drops it.
+	gotID, empty, err = ReleaseGroupID(ctx, "g", "snap2")
+	assert.NoError(t, err)
+	assert.Equal(t, id, gotID)
+	assert.True(t, empty, "group should be empty after the last member")
+
+	got, err = LookupGroupID(ctx, "g")
+	assert.NoError(t, err)
+	assert.Zero(t, got, "released group should no longer have an id")
+
+	// Releasing again, or releasing an unknown group, is not an error.
+	_, empty, err = ReleaseGroupID(ctx, "g", "snap2")
+	assert.NoError(t, err)
+	assert.False(t, empty)
+
+	_, empty, err = ReleaseGroupID(ctx, "never-assigned", "snap1")
+	assert.NoError(t, err)
+	assert.False(t, empty)
+}
+
+// A group id is never reused, so a resource left over from a previous
+// group with the same key cannot be mistaken for the new one.
+func testGroupIDNotReused(ctx context.Context, t *testing.T, _ *MetaStore) {
+	first, _, err := AssignGroupID(ctx, "g", "snap1", 0)
+	assert.NoError(t, err)
+
+	_, empty, err := ReleaseGroupID(ctx, "g", "snap1")
+	assert.NoError(t, err)
+	assert.True(t, empty)
+
+	second, _, err := AssignGroupID(ctx, "g", "snap2", 0)
+	assert.NoError(t, err)
+	assert.NotEqual(t, first, second, "group ids must not be reused")
 }

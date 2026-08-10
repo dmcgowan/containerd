@@ -37,16 +37,22 @@ var (
 	bucketKeyStorageVersion = []byte("v1")
 	bucketKeySnapshot       = []byte("snapshots")
 	bucketKeyParents        = []byte("parents")
+	bucketKeyGroups         = []byte("groups")
 
-	bucketKeyID     = []byte("id")
-	bucketKeyParent = []byte("parent")
-	bucketKeyKind   = []byte("kind")
-	bucketKeyInodes = []byte("inodes")
-	bucketKeySize   = []byte("size")
+	bucketKeyID      = []byte("id")
+	bucketKeyParent  = []byte("parent")
+	bucketKeyKind    = []byte("kind")
+	bucketKeyInodes  = []byte("inodes")
+	bucketKeySize    = []byte("size")
+	bucketKeyMembers = []byte("members")
 
 	// ErrNoTransaction is returned when an operation is attempted with
 	// a context which is not inside of a transaction.
 	ErrNoTransaction = errors.New("no transaction in context")
+
+	// ErrNotWritable is returned when a mutating operation is
+	// attempted inside a read-only transaction.
+	ErrNotWritable = errors.New("transaction is not writable")
 )
 
 // parentKey returns a composite key of the parent and child identifiers. The
@@ -661,4 +667,216 @@ func adaptSnapshot(info snapshots.Info) filters.Adaptor {
 
 		return "", false
 	})
+}
+
+// Group support
+//
+// A group associates a set of snapshots which share a single backing
+// resource, such as one block image holding the writable layer of
+// every container in a pod. Each group is assigned a stable numeric id
+// which the snapshotter uses to name the shared resource, and tracks
+// its members so the resource can be released as soon as the last
+// member is removed.
+//
+// The metadata layer is responsible for scoping group keys across
+// namespaces before passing them in.
+
+// AssignGroupID adds a snapshot to a group, allocating the group and
+// its id on first use, and returns the group id. Group ids are unique
+// within the metastore and are never reused.
+//
+// The size recorded for a group is the size requested by its first
+// member; a group backed by a single fixed size resource cannot honour
+// conflicting requests from later members. The size actually recorded
+// is returned so the caller can report a mismatch.
+//
+// Must be called inside a writable storage transaction.
+func AssignGroupID(ctx context.Context, group, snapshotID string, size int64) (uint64, int64, error) {
+	if group == "" {
+		return 0, 0, fmt.Errorf("group key is empty: %w", errdefs.ErrInvalidArgument)
+	}
+	if snapshotID == "" {
+		return 0, 0, fmt.Errorf("snapshot id is empty: %w", errdefs.ErrInvalidArgument)
+	}
+	tx, ok := ctx.Value(transactionKey{}).(*bolt.Tx)
+	if !ok {
+		return 0, 0, ErrNoTransaction
+	}
+	if !tx.Writable() {
+		return 0, 0, ErrNotWritable
+	}
+	vbkt, err := tx.CreateBucketIfNotExists(bucketKeyStorageVersion)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create version bucket: %w", err)
+	}
+	gsbkt, err := vbkt.CreateBucketIfNotExists(bucketKeyGroups)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create groups bucket: %w", err)
+	}
+
+	gbkt := gsbkt.Bucket([]byte(group))
+	if gbkt == nil {
+		gbkt, err = gsbkt.CreateBucket([]byte(group))
+		if err != nil {
+			return 0, 0, err
+		}
+		id, err := gsbkt.NextSequence()
+		if err != nil {
+			return 0, 0, err
+		}
+		enc, err := encodeID(id)
+		if err != nil {
+			return 0, 0, err
+		}
+		if err := gbkt.Put(bucketKeyID, enc); err != nil {
+			return 0, 0, err
+		}
+		if size > 0 {
+			enc, err := encodeSize(size)
+			if err != nil {
+				return 0, 0, err
+			}
+			if err := gbkt.Put(bucketKeySize, enc); err != nil {
+				return 0, 0, err
+			}
+		}
+	}
+
+	mbkt, err := gbkt.CreateBucketIfNotExists(bucketKeyMembers)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := mbkt.Put([]byte(snapshotID), nil); err != nil {
+		return 0, 0, err
+	}
+
+	id, _ := binary.Uvarint(gbkt.Get(bucketKeyID))
+	return id, decodeSize(gbkt.Get(bucketKeySize)), nil
+}
+
+// LookupGroupID returns the numeric id assigned to the given group
+// key, or 0 if the group does not exist. It must be called inside a
+// storage transaction.
+func LookupGroupID(ctx context.Context, group string) (uint64, error) {
+	gbkt, err := getGroupBucket(ctx, group)
+	if err != nil || gbkt == nil {
+		return 0, err
+	}
+	id, _ := binary.Uvarint(gbkt.Get(bucketKeyID))
+	return id, nil
+}
+
+// LookupGroupSize returns the size recorded for a group, or 0 if the
+// group does not exist or no size was requested by its first member.
+// It must be called inside a storage transaction.
+func LookupGroupSize(ctx context.Context, group string) (int64, error) {
+	gbkt, err := getGroupBucket(ctx, group)
+	if err != nil || gbkt == nil {
+		return 0, err
+	}
+	return decodeSize(gbkt.Get(bucketKeySize)), nil
+}
+
+// ReleaseGroupID removes a snapshot from a group and reports whether
+// the group is now empty, in which case the group and its id are
+// deleted and the backing resource may be reclaimed. The group id is
+// returned so the caller can locate that resource.
+//
+// Must be called inside a writable storage transaction.
+func ReleaseGroupID(ctx context.Context, group, snapshotID string) (uint64, bool, error) {
+	if group == "" || snapshotID == "" {
+		return 0, false, nil
+	}
+	tx, ok := ctx.Value(transactionKey{}).(*bolt.Tx)
+	if !ok {
+		return 0, false, ErrNoTransaction
+	}
+	if !tx.Writable() {
+		return 0, false, ErrNotWritable
+	}
+	vbkt := tx.Bucket(bucketKeyStorageVersion)
+	if vbkt == nil {
+		return 0, false, nil
+	}
+	gsbkt := vbkt.Bucket(bucketKeyGroups)
+	if gsbkt == nil {
+		return 0, false, nil
+	}
+	gbkt := gsbkt.Bucket([]byte(group))
+	if gbkt == nil {
+		return 0, false, nil
+	}
+
+	id, _ := binary.Uvarint(gbkt.Get(bucketKeyID))
+	if mbkt := gbkt.Bucket(bucketKeyMembers); mbkt != nil {
+		if err := mbkt.Delete([]byte(snapshotID)); err != nil {
+			return 0, false, err
+		}
+		if k, _ := mbkt.Cursor().First(); k != nil {
+			return id, false, nil
+		}
+	}
+
+	if err := gsbkt.DeleteBucket([]byte(group)); err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// GroupIDMap returns the ids of every group which still exists,
+// keyed by id in decimal form so callers can match them against the
+// directories they name resources with. It must be called inside a
+// storage transaction.
+func GroupIDMap(ctx context.Context) (map[string]string, error) {
+	m := map[string]string{}
+	tx, ok := ctx.Value(transactionKey{}).(*bolt.Tx)
+	if !ok {
+		return nil, ErrNoTransaction
+	}
+	vbkt := tx.Bucket(bucketKeyStorageVersion)
+	if vbkt == nil {
+		return m, nil
+	}
+	gsbkt := vbkt.Bucket(bucketKeyGroups)
+	if gsbkt == nil {
+		return m, nil
+	}
+	if err := gsbkt.ForEach(func(k, v []byte) error {
+		if v != nil {
+			return nil
+		}
+		id, _ := binary.Uvarint(gsbkt.Bucket(k).Get(bucketKeyID))
+		m[strconv.FormatUint(id, 10)] = string(k)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func getGroupBucket(ctx context.Context, group string) (*bolt.Bucket, error) {
+	if group == "" {
+		return nil, nil
+	}
+	tx, ok := ctx.Value(transactionKey{}).(*bolt.Tx)
+	if !ok {
+		return nil, ErrNoTransaction
+	}
+	vbkt := tx.Bucket(bucketKeyStorageVersion)
+	if vbkt == nil {
+		return nil, nil
+	}
+	gsbkt := vbkt.Bucket(bucketKeyGroups)
+	if gsbkt == nil {
+		return nil, nil
+	}
+	return gsbkt.Bucket([]byte(group)), nil
+}
+
+func decodeSize(b []byte) int64 {
+	if len(b) == 0 {
+		return 0
+	}
+	size, _ := binary.Varint(b)
+	return size
 }

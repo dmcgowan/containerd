@@ -260,6 +260,111 @@ func TestFilterInheritedLabels(t *testing.T) {
 	}
 }
 
+// TestScopeGroupLabel verifies that the metadata snapshotter wrapper
+// rewrites LabelSnapshotGroup with a namespace prefix before passing
+// labels to the backend, but returns the user-provided value
+// unmodified via Stat.
+func TestScopeGroupLabel(t *testing.T) {
+	ctx, db := testDB(t, withSnapshotter("tmp", func(string) (snapshots.Snapshotter, error) {
+		return NewTmpSnapshotter(), nil
+	}))
+	sn := db.Snapshotter("tmp")
+	ctx, _ = snapshotLease(ctx, t, db, "tmp")
+
+	const userGroup = "pod-123"
+	opt := snapshots.WithLabels(map[string]string{
+		snapshots.LabelSnapshotGroup: userGroup,
+	})
+
+	if _, err := sn.Prepare(ctx, "key1", "", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the backend received the namespace-scoped value before
+	// any subsequent Stat call has a chance to merge maps.
+	ns, _ := namespaces.Namespace(ctx)
+	wantBackend := ns + "/" + userGroup
+	tmp := sn.(*snapshotter).Snapshotter.(*tmpSnapshotter)
+	tmp.l.Lock()
+	var backendGroup string
+	for _, info := range tmp.snapshots {
+		if g := info.Labels[snapshots.LabelSnapshotGroup]; g != "" {
+			backendGroup = g
+		}
+	}
+	tmp.l.Unlock()
+	if backendGroup != wantBackend {
+		t.Errorf("backend group label: want %q, got %q", wantBackend, backendGroup)
+	}
+
+	// User-facing Stat returns the original (un-prefixed) group value.
+	info, err := sn.Stat(ctx, "key1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Labels[snapshots.LabelSnapshotGroup]; got != userGroup {
+		t.Errorf("user-facing group label: want %q, got %q", userGroup, got)
+	}
+}
+
+// TestScopeGroupLabelDifferentNamespaces verifies that the same group
+// label in two different namespaces produces distinct values at the
+// backend, while each namespace still sees its original value.
+func TestScopeGroupLabelDifferentNamespaces(t *testing.T) {
+	ctxBase, db := testDB(t, withSnapshotter("tmp", func(string) (snapshots.Snapshotter, error) {
+		return NewTmpSnapshotter(), nil
+	}))
+	sn := db.Snapshotter("tmp")
+
+	ctxA := namespaces.WithNamespace(ctxBase, "ns-a")
+	ctxA, _ = snapshotLease(ctxA, t, db, "tmp")
+	ctxB := namespaces.WithNamespace(ctxBase, "ns-b")
+	ctxB, _ = snapshotLease(ctxB, t, db, "tmp")
+
+	opt := snapshots.WithLabels(map[string]string{
+		snapshots.LabelSnapshotGroup: "shared",
+	})
+
+	if _, err := sn.Prepare(ctxA, "k", "", opt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sn.Prepare(ctxB, "k", "", opt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the backend has two distinct namespace-scoped values
+	// before any Stat merges run.
+	tmp := sn.(*snapshotter).Snapshotter.(*tmpSnapshotter)
+	tmp.l.Lock()
+	seen := map[string]struct{}{}
+	for _, info := range tmp.snapshots {
+		if g := info.Labels[snapshots.LabelSnapshotGroup]; g != "" {
+			seen[g] = struct{}{}
+		}
+	}
+	tmp.l.Unlock()
+	if _, ok := seen["ns-a/shared"]; !ok {
+		t.Errorf("missing namespace-scoped backend value for ns-a")
+	}
+	if _, ok := seen["ns-b/shared"]; !ok {
+		t.Errorf("missing namespace-scoped backend value for ns-b")
+	}
+	if len(seen) != 2 {
+		t.Errorf("expected 2 distinct backend group values, got %d: %v", len(seen), seen)
+	}
+
+	// Each namespace's Stat should return the un-prefixed user value.
+	for _, ctx := range []context.Context{ctxA, ctxB} {
+		info, err := sn.Stat(ctx, "k")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Labels[snapshots.LabelSnapshotGroup]; got != "shared" {
+			t.Errorf("user-facing group: want %q, got %q", "shared", got)
+		}
+	}
+}
+
 type tmpSnapshotter struct {
 	l         sync.Mutex
 	snapshots map[string]snapshots.Info

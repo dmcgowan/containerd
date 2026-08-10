@@ -64,6 +64,16 @@ const (
 	// Commit time (via WithParent). It lets the unpacker prepare and apply layers in
 	// parallel and rebase the chain into place at commit.
 	RebaseCap = "rebase"
+
+	// LabelSnapshotGroup groups active snapshots that should share a
+	// single underlying writable layer. Snapshotters which back a
+	// writable layer with a block image (e.g., erofs in block mode) may
+	// use one image file per group value, with per-snapshot upper/work
+	// directories inside it. The shared resource is retained until
+	// every snapshot carrying the same group value has been removed.
+	// Snapshotters that do not support grouping may ignore this label;
+	// ignoring is not a failure.
+	LabelSnapshotGroup = "containerd.io/snapshot/group"
 )
 
 // Kind identifies the kind of snapshot.

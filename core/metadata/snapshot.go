@@ -62,6 +62,20 @@ func createKey(id uint64, namespace, key string) string {
 	return fmt.Sprintf("%s/%d/%s", namespace, id, key)
 }
 
+// scopeGroupLabel returns a copy of labels with LabelSnapshotGroup
+// rewritten to include the namespace, so backends keyed by group
+// label do not collide across namespaces. The original labels map is
+// not modified.
+func scopeGroupLabel(namespace string, lbls map[string]string) map[string]string {
+	g, ok := lbls[snapshots.LabelSnapshotGroup]
+	if !ok || g == "" {
+		return lbls
+	}
+	scoped := maps.Clone(lbls)
+	scoped[snapshots.LabelSnapshotGroup] = namespace + "/" + g
+	return scoped
+}
+
 func getKey(tx *bolt.Tx, ns, name, key string) string {
 	bkt := getSnapshotterBucket(tx, ns, name)
 	if bkt == nil {
@@ -219,7 +233,7 @@ func (s *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 
 		inner := snapshots.Info{
 			Name:   bkey,
-			Labels: snapshots.FilterInheritedLabels(local.Labels),
+			Labels: scopeGroupLabel(ns, snapshots.FilterInheritedLabels(local.Labels)),
 		}
 
 		// NOTE: Perform this inside the transaction to reduce the
@@ -319,7 +333,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 		bparent string
 		bkey    string
 		bopts   = []snapshots.Opt{
-			snapshots.WithLabels(snapshots.FilterInheritedLabels(base.Labels)),
+			snapshots.WithLabels(scopeGroupLabel(ns, snapshots.FilterInheritedLabels(base.Labels))),
 		}
 		rerr error
 	)
@@ -627,7 +641,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 
 		inheritedOpt := []snapshots.Opt{
-			snapshots.WithLabels(snapshots.FilterInheritedLabels(base.Labels)),
+			snapshots.WithLabels(scopeGroupLabel(ns, snapshots.FilterInheritedLabels(base.Labels))),
 		}
 		if rebase {
 			inheritedOpt = append(inheritedOpt, snapshots.WithParent(bparent))
