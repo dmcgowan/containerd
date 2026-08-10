@@ -254,7 +254,35 @@ func (s *snapshotter) workPath(id string) string {
 	return filepath.Join(s.root, "snapshots", id, "work")
 }
 
-func (s *snapshotter) writablePath(id string) string {
+// snapshotGroup returns the group the snapshot belongs to, or the
+// empty string if it is not part of a group.
+func snapshotGroup(info snapshots.Info) string {
+	if info.Labels == nil {
+		return ""
+	}
+	return info.Labels[snapshots.LabelSnapshotGroup]
+}
+
+// groupDir returns the directory under the snapshotter root that
+// stores the shared block image for the given group id.
+func (s *snapshotter) groupDir(gid uint64) string {
+	return filepath.Join(s.root, "groups", strconv.FormatUint(gid, 10))
+}
+
+// groupImagePath returns the block-image path for a group id.
+func (s *snapshotter) groupImagePath(gid uint64) string {
+	return filepath.Join(s.groupDir(gid), "rwlayer.img")
+}
+
+// writablePath returns the path to the ext4 block image that backs the
+// given snapshot's writable layer. When gid is non-zero the snapshot
+// belongs to a group and the image is shared across the whole group;
+// otherwise each snapshot gets its own image under its snapshot
+// directory.
+func (s *snapshotter) writablePath(gid uint64, id string) string {
+	if gid != 0 {
+		return s.groupImagePath(gid)
+	}
 	return filepath.Join(s.root, "snapshots", id, "rwlayer.img")
 }
 
@@ -414,8 +442,50 @@ func (s *snapshotter) createErofsMount(layerBlob string) (mount.Mount, error) {
 	}, nil
 }
 
-func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
+func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info, gid uint64, groupSize int64) ([]mount.Mount, error) {
 	var options []string
+
+	// Members of a group share a single block image, so each needs its
+	// own upper and work directory inside it.
+	upperName := "upper"
+	workName := "work"
+	if gid != 0 {
+		upperName = "upper-" + snap.ID
+		workName = "work-" + snap.ID
+	}
+
+	// Snapshots in the same group produce an identical block mount.
+	// The mount manager reference counts identical mounts, so the
+	// image is mounted once and stays mounted until the last member
+	// releases it; no extra signalling is needed here.
+	size := s.writableSize(info)
+	if gid != 0 && groupSize > 0 {
+		size = groupSize
+	}
+	mkfsOptions := func(rw string) []string {
+		return []string{
+			"X-containerd.mkfs.fs=ext4",
+			fmt.Sprintf("X-containerd.mkfs.size=%d", size),
+			// TODO: Add UUID
+			rw,
+			"loop",
+		}
+	}
+
+	// A writable snapshot with no parent in a group is the group's
+	// block device itself rather than a layer over an image. It is
+	// handed over unmounted so the consumer, typically a sandbox
+	// attaching it to a VM, can decide how to expose it; members then
+	// appear as directories inside the mounted filesystem.
+	if gid != 0 && s.blockMode && snap.Kind == snapshots.KindActive && len(snap.ParentIDs) == 0 {
+		return []mount.Mount{
+			{
+				Source:  s.groupImagePath(gid),
+				Type:    "mkfs/ext4",
+				Options: mkfsOptions("rw"),
+			},
+		}, nil
+	}
 
 	if len(snap.ParentIDs) == 0 {
 		if layerBlob, err := s.lowerPath(snap.ID); err == nil {
@@ -439,21 +509,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 		if s.blockMode {
 			return []mount.Mount{
 				{
-					Source: s.writablePath(snap.ID),
-					Type:   "mkfs/ext4",
-					Options: []string{
-						"X-containerd.mkfs.fs=ext4",
-						fmt.Sprintf("X-containerd.mkfs.size=%d", s.writableSize(info)),
-						// TODO: Add UUID
-						roFlag,
-						"loop",
-					},
+					Source:  s.writablePath(gid, snap.ID),
+					Type:    "mkfs/ext4",
+					Options: mkfsOptions(roFlag),
 				},
 				{
-					Source: "{{ mount 0 }}/upper",
+					Source: fmt.Sprintf("{{ mount 0 }}/%s", upperName),
 					Type:   "format/mkdir/bind",
 					Options: append(options,
-						"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
+						fmt.Sprintf("X-containerd.mkdir.path={{ mount 0 }}/%s:0755", upperName),
 						roFlag,
 						"rbind",
 					),
@@ -480,21 +544,15 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 	if snap.Kind == snapshots.KindActive {
 		if s.blockMode {
 			mounts = append(mounts, mount.Mount{
-				Source: s.writablePath(snap.ID),
-				Type:   "mkfs/ext4",
-				Options: []string{
-					"X-containerd.mkfs.fs=ext4",
-					fmt.Sprintf("X-containerd.mkfs.size=%d", s.writableSize(info)),
-					// TODO: Add UUID
-					"rw",
-					"loop",
-				},
+				Source:  s.writablePath(gid, snap.ID),
+				Type:    "mkfs/ext4",
+				Options: mkfsOptions("rw"),
 			})
 			options = append(options,
-				"X-containerd.mkdir.path={{ mount 0 }}/upper:0755",
-				"X-containerd.mkdir.path={{ mount 0 }}/work:0755",
-				"workdir={{ mount 0 }}/work",
-				"upperdir={{ mount 0 }}/upper",
+				fmt.Sprintf("X-containerd.mkdir.path={{ mount 0 }}/%s:0755", upperName),
+				fmt.Sprintf("X-containerd.mkdir.path={{ mount 0 }}/%s:0755", workName),
+				fmt.Sprintf("workdir={{ mount 0 }}/%s", workName),
+				fmt.Sprintf("upperdir={{ mount 0 }}/%s", upperName),
 			)
 		} else {
 			options = append(options,
@@ -580,9 +638,11 @@ func (s *snapshotter) mounts(snap storage.Snapshot, info snapshots.Info) ([]moun
 // cache compatible with parallel unpacking.
 func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (_ []mount.Mount, err error) {
 	var (
-		snap     storage.Snapshot
-		td, path string
-		info     snapshots.Info
+		snap      storage.Snapshot
+		td, path  string
+		info      snapshots.Info
+		gid       uint64
+		groupSize int64
 	)
 
 	// Only parentless extractions can be served: s.mounts picks a staged blob up
@@ -629,6 +689,22 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		_, info, _, err = storage.GetInfo(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
+		}
+
+		// Grouping shares one block image between snapshots, so it
+		// only has meaning in block mode.
+		if g := snapshotGroup(info); g != "" && s.blockMode {
+			gid, groupSize, err = storage.AssignGroupID(ctx, g, snap.ID, s.writableSize(info))
+			if err != nil {
+				return fmt.Errorf("failed to assign group id: %w", err)
+			}
+			if want := s.writableSize(info); groupSize > 0 && want != groupSize {
+				log.G(ctx).WithFields(log.Fields{
+					"group":     g,
+					"requested": want,
+					"actual":    groupSize,
+				}).Warn("snapshot joined a group with a different size, using the group size")
+			}
 		}
 
 		// In non-block mode, set the ownership of the upperdir so that
@@ -691,7 +767,15 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
-	return s.mounts(snap, info)
+	// The mkfs transformer opens the block image without creating
+	// parent dirs, so pre-create the group directory.
+	if gid != 0 {
+		if err := os.MkdirAll(s.groupDir(gid), 0700); err != nil {
+			return nil, fmt.Errorf("failed to create group dir: %w", err)
+		}
+	}
+
+	return s.mounts(snap, info, gid, groupSize)
 }
 
 func (s *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -756,7 +840,7 @@ func (s *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 }
 
 func (s *snapshotter) commitBlock(ctx context.Context, layerBlob string, id string) error {
-	layer := s.writablePath(id)
+	layer := s.writablePath(0, id)
 	if _, err := os.Stat(layer); err != nil {
 		if os.IsNotExist(err) {
 			if cerr := convertDirToErofs(ctx, layerBlob, s.upperPath(id)); cerr != nil {
@@ -799,12 +883,25 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	// Apply the overlayfs upperdir (generated by non-EROFS differs) into a EROFS blob
 	// in a read transaction first since conversion could be slow.
 	err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		sid, _, _, err := storage.GetInfo(ctx, key)
+		sid, si, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return err
 		}
 		id = sid
-		return err
+		// The writable layer of a grouped snapshot lives inside a
+		// block image shared with, and still mounted by, the rest of
+		// the group. It cannot be read out into a layer blob without
+		// racing the other members.
+		if g := snapshotGroup(si); g != "" {
+			gid, err := storage.LookupGroupID(ctx, g)
+			if err != nil {
+				return err
+			}
+			if gid != 0 {
+				return fmt.Errorf("snapshot %q belongs to shared group %q and cannot be committed: %w", key, g, errdefs.ErrInvalidArgument)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -855,8 +952,12 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 }
 
 func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
-	var snap storage.Snapshot
-	var info snapshots.Info
+	var (
+		snap      storage.Snapshot
+		info      snapshots.Info
+		gid       uint64
+		groupSize int64
+	)
 	if err := s.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		snap, err = storage.GetSnapshot(ctx, key)
 		if err != nil {
@@ -867,11 +968,21 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 		if err != nil {
 			return fmt.Errorf("failed to get snapshot info: %w", err)
 		}
+		if g := snapshotGroup(info); g != "" {
+			gid, err = storage.LookupGroupID(ctx, g)
+			if err != nil {
+				return fmt.Errorf("failed to look up group id: %w", err)
+			}
+			groupSize, err = storage.LookupGroupSize(ctx, g)
+			if err != nil {
+				return fmt.Errorf("failed to look up group size: %w", err)
+			}
+		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	return s.mounts(snap, info)
+	return s.mounts(snap, info, gid, groupSize)
 }
 
 func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, error) {
@@ -880,30 +991,63 @@ func (s *snapshotter) getCleanupDirectories(ctx context.Context) ([]string, erro
 		return nil, err
 	}
 
-	snapshotDir := filepath.Join(s.root, "snapshots")
-	fd, err := os.Open(snapshotDir)
-	if err != nil {
-		return nil, err
-	}
-	defer fd.Close()
-
-	dirs, err := fd.Readdirnames(0)
-	if err != nil {
-		return nil, err
-	}
-
-	cleanup := []string{}
-	for _, d := range dirs {
+	cleanup, err := orphanDirectories(filepath.Join(s.root, "snapshots"), func(d string) bool {
 		// A new-* directory may belong to a concurrent snapshot creation. It is
 		// renamed to its metadata ID after the writer transaction is acquired, so
 		// Remove must not treat it as an orphan in the meantime.
 		if strings.HasPrefix(d, snapshotTempDirPrefix) {
+			return true
+		}
+		_, ok := ids[d]
+		return ok
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Group directories hold the block image shared by a group. They
+	// outlive individual snapshots, so they are reclaimed separately
+	// once no group claims their id. Ids are never reused, so a
+	// directory left behind by an interrupted removal can never be
+	// mistaken for a live one.
+	groups, err := storage.GroupIDMap(ctx)
+	if err != nil {
+		return nil, err
+	}
+	groupCleanup, err := orphanDirectories(filepath.Join(s.root, "groups"), func(d string) bool {
+		_, ok := groups[d]
+		return ok
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return append(cleanup, groupCleanup...), nil
+}
+
+// orphanDirectories returns the entries of dir which are not claimed
+// by the given predicate. A missing dir yields nothing.
+func orphanDirectories(dir string, claimed func(string) bool) ([]string, error) {
+	fd, err := os.Open(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer fd.Close()
+
+	names, err := fd.Readdirnames(0)
+	if err != nil {
+		return nil, err
+	}
+
+	var cleanup []string
+	for _, d := range names {
+		if claimed(d) {
 			continue
 		}
-		if _, ok := ids[d]; ok {
-			continue
-		}
-		cleanup = append(cleanup, filepath.Join(snapshotDir, d))
+		cleanup = append(cleanup, filepath.Join(dir, d))
 	}
 
 	return cleanup, nil
@@ -966,10 +1110,20 @@ func (s *snapshotter) Remove(ctx context.Context, key string) (err error) {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
 		}
 
-		removals, err = s.getCleanupDirectories(ctx)
+		// Drop out of the group. Once the last member leaves, the
+		// group is gone and its shared block image is picked up as an
+		// unclaimed directory below.
+		if group := snapshotGroup(info); group != "" {
+			if _, _, err := storage.ReleaseGroupID(ctx, group, id); err != nil {
+				return fmt.Errorf("failed to release group membership: %w", err)
+			}
+		}
+
+		cleanup, err := s.getCleanupDirectories(ctx)
 		if err != nil {
 			return fmt.Errorf("unable to get directories for removal: %w", err)
 		}
+		removals = append(removals, cleanup...)
 		return nil
 	})
 }

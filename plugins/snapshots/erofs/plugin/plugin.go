@@ -33,6 +33,10 @@ import (
 const (
 	capaRemapIDs     = "remap-ids"
 	capaOnlyRemapIDs = "only-remap-ids"
+	// capaGroups reports that the snapshotter honours
+	// snapshots.LabelSnapshotGroup by backing every member of a group
+	// with a single shared block image.
+	capaGroups = "groups"
 )
 
 // Config represents configuration for the native plugin.
@@ -106,6 +110,10 @@ func init() {
 					return nil, fmt.Errorf("failed to parse default_size '%v': %w", config.DefaultSize, err)
 				}
 				opts = append(opts, erofs.WithDefaultSize(size))
+				// Grouping shares a block image between snapshots, so
+				// it is only available when writable layers are backed
+				// by block images.
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, capaGroups)
 			}
 
 			if config.DmverityMode != "" {

@@ -23,9 +23,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
@@ -450,6 +452,209 @@ func createTestLayerBlob(t *testing.T, dir string) string {
 	return layerBlob
 }
 
+// TestGroupMountsWithParent validates that when a snapshot belongs to
+// a group, the mount chain targets the shared group image and uses per
+// snapshot upper and work directories inside it. Every member produces
+// an identical block mount, which is what allows the mount manager to
+// mount the image once for the whole group.
+func TestGroupMountsWithParent(t *testing.T) {
+	tmpDir := t.TempDir()
+	s := &snapshotter{
+		root:            tmpDir,
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+
+	parentDir := filepath.Join(tmpDir, "snapshots", "5")
+	require.NoError(t, os.MkdirAll(parentDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(parentDir, "layer.erofs"), []byte{}, 0644))
+
+	const gid uint64 = 3
+	info := snapshots.Info{
+		Labels: map[string]string{
+			snapshots.LabelSnapshotGroup: "pod-123",
+		},
+	}
+	snap := storage.Snapshot{
+		ID:        "7",
+		Kind:      snapshots.KindActive,
+		ParentIDs: []string{"5"},
+	}
+
+	mounts, err := s.mounts(snap, info, gid, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(mounts), 2)
+
+	assert.Equal(t, "mkfs/ext4", mounts[0].Type)
+	assert.Equal(t, s.groupImagePath(gid), mounts[0].Source)
+
+	overlay := mounts[len(mounts)-1]
+	assert.Equal(t, "format/mkdir/overlay", overlay.Type)
+	overlayOpts := strings.Join(overlay.Options, ",")
+	assert.Contains(t, overlayOpts, "upperdir={{ mount 0 }}/upper-7")
+	assert.Contains(t, overlayOpts, "workdir={{ mount 0 }}/work-7")
+	assert.Contains(t, overlayOpts, "X-containerd.mkdir.path={{ mount 0 }}/upper-7:0755")
+	assert.Contains(t, overlayOpts, "X-containerd.mkdir.path={{ mount 0 }}/work-7:0755")
+}
+
+// TestGroupMountsIdenticalBlockMount verifies that two members of the
+// same group produce byte for byte identical block mounts, which is
+// the property the mount manager deduplicates on.
+func TestGroupMountsIdenticalBlockMount(t *testing.T) {
+	tmpDir := t.TempDir()
+	s := &snapshotter{
+		root:            tmpDir,
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+
+	parentDir := filepath.Join(tmpDir, "snapshots", "5")
+	require.NoError(t, os.MkdirAll(parentDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(parentDir, "layer.erofs"), []byte{}, 0644))
+
+	const gid uint64 = 3
+	info := snapshots.Info{
+		Labels: map[string]string{snapshots.LabelSnapshotGroup: "pod-123"},
+	}
+
+	a, err := s.mounts(storage.Snapshot{ID: "7", Kind: snapshots.KindActive, ParentIDs: []string{"5"}}, info, gid, 0)
+	require.NoError(t, err)
+	b, err := s.mounts(storage.Snapshot{ID: "8", Kind: snapshots.KindActive, ParentIDs: []string{"5"}}, info, gid, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, a[0], b[0], "group members must produce an identical block mount")
+	assert.NotEqual(t, a[len(a)-1], b[len(b)-1], "group members must have distinct upper directories")
+}
+
+// TestGroupMountsUsesGroupSize verifies that a member which joins a
+// group with an existing size is formatted with the group's size
+// rather than its own request. The image already exists at the group
+// size, so any other value would be a lie.
+func TestGroupMountsUsesGroupSize(t *testing.T) {
+	tmpDir := t.TempDir()
+	s := &snapshotter{
+		root:            tmpDir,
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+
+	info := snapshots.Info{
+		Labels: map[string]string{
+			snapshots.LabelSnapshotGroup:   "pod-123",
+			snapshots.LabelSnapshotMaxSize: "1048576",
+		},
+	}
+	snap := storage.Snapshot{ID: "9", Kind: snapshots.KindActive}
+
+	mounts, err := s.mounts(snap, info, 11, 8388608)
+	require.NoError(t, err)
+	require.Len(t, mounts, 1)
+	assert.Contains(t, mounts[0].Options, "X-containerd.mkfs.size=8388608")
+
+	// Without a group size the snapshot's own request is used.
+	mounts, err = s.mounts(snap, info, 11, 0)
+	require.NoError(t, err)
+	assert.Contains(t, mounts[0].Options, "X-containerd.mkfs.size=1048576")
+}
+
+// TestGroupScratchMounts covers a writable snapshot with no parent in
+// a group: it represents the group's block device itself and is handed
+// over as a single unmounted block mount, so a sandbox can attach it
+// directly.
+func TestGroupScratchMounts(t *testing.T) {
+	s := &snapshotter{
+		root:            "/var/lib/test",
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+
+	const gid uint64 = 11
+	info := snapshots.Info{
+		Labels: map[string]string{
+			snapshots.LabelSnapshotGroup: "shared-rw",
+		},
+	}
+	snap := storage.Snapshot{
+		ID:        "9",
+		Kind:      snapshots.KindActive,
+		ParentIDs: nil,
+	}
+
+	mounts, err := s.mounts(snap, info, gid, 0)
+	require.NoError(t, err)
+	require.Len(t, mounts, 1, "the group device is handed over on its own")
+
+	assert.Equal(t, "mkfs/ext4", mounts[0].Type)
+	assert.Equal(t, s.groupImagePath(gid), mounts[0].Source)
+	assert.Contains(t, mounts[0].Options, "rw")
+}
+
+// TestUngroupedScratchMountsUnchanged verifies the parentless writable
+// case without a group still produces the bind over the block image.
+func TestUngroupedScratchMountsUnchanged(t *testing.T) {
+	s := &snapshotter{
+		root:            "/var/lib/test",
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+
+	snap := storage.Snapshot{ID: "9", Kind: snapshots.KindActive}
+
+	mounts, err := s.mounts(snap, snapshots.Info{}, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, mounts, 2)
+
+	assert.Equal(t, "mkfs/ext4", mounts[0].Type)
+	assert.Equal(t, s.writablePath(0, "9"), mounts[0].Source)
+	assert.Equal(t, "format/mkdir/bind", mounts[1].Type)
+	assert.Equal(t, "{{ mount 0 }}/upper", mounts[1].Source)
+}
+
+// TestMountsWithoutGroupUnchanged verifies the pre-existing mount
+// chain is not affected by the group plumbing: the upper and work
+// directories keep their original names.
+func TestMountsWithoutGroupUnchanged(t *testing.T) {
+	tmpDir := t.TempDir()
+	s := &snapshotter{
+		root:            tmpDir,
+		defaultWritable: 16 << 20,
+		blockMode:       true,
+	}
+	parentDir := filepath.Join(tmpDir, "snapshots", "5")
+	require.NoError(t, os.MkdirAll(parentDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(parentDir, "layer.erofs"), []byte{}, 0644))
+
+	info := snapshots.Info{}
+	snap := storage.Snapshot{
+		ID:        "7",
+		Kind:      snapshots.KindActive,
+		ParentIDs: []string{"5"},
+	}
+
+	mounts, err := s.mounts(snap, info, 0, 0)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(mounts), 2)
+
+	overlay := mounts[len(mounts)-1]
+	overlayOpts := strings.Join(overlay.Options, ",")
+	assert.Contains(t, overlayOpts, "upperdir={{ mount 0 }}/upper,")
+	assert.Contains(t, overlayOpts, "workdir={{ mount 0 }}/work")
+	assert.NotContains(t, overlayOpts, "upper-7")
+	assert.NotContains(t, overlayOpts, "work-7")
+}
+
+// TestGroupWritablePath asserts that snapshots that share a group id
+// resolve to the same block-image file while a snapshot without a
+// group still gets its own private file.
+func TestGroupWritablePath(t *testing.T) {
+	s := &snapshotter{root: "/var/lib/test", blockMode: true}
+
+	assert.Equal(t, s.writablePath(7, "1"), s.writablePath(7, "2"),
+		"same group id should share writable path")
+	assert.NotEqual(t, s.writablePath(7, "1"), s.writablePath(0, "3"),
+		"no group should give per-snapshot path")
+}
+
 // TestCreateErofsMount tests mount creation without dm-verity
 func TestCreateErofsMount(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -868,7 +1073,7 @@ func TestMountsWithMergedFsMeta(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, 0, 0)
 	require.NoError(t, err)
 
 	// Expect: [erofs(p0), erofs(p1), erofs(fsmeta p2, device=p3,p2), overlay]
@@ -913,7 +1118,7 @@ func TestMountsWithMergedFsMetaOnTopParent(t *testing.T) {
 	snap := storage.Snapshot{Kind: snapshots.KindView, ParentIDs: parents}
 	info := snapshots.Info{}
 
-	mounts, err := s.mounts(snap, info)
+	mounts, err := s.mounts(snap, info, 0, 0)
 	require.NoError(t, err)
 
 	require.Len(t, mounts, 2)
@@ -1305,5 +1510,111 @@ func TestCacheDirMustBeAbsolute(t *testing.T) {
 			_, err := NewSnapshotter(t.TempDir(), WithLayerContentCaches(dir))
 			assert.ErrorContains(t, err, "must be an absolute path")
 		})
+	}
+}
+
+// TestGroupLifecycle exercises a group end to end through the
+// snapshotter: members share one block image, the image survives
+// while any member remains, and it is reclaimed once the last member
+// is removed.
+func TestGroupLifecycle(t *testing.T) {
+	testutil.RequiresRoot(t)
+	requireMkfsErofs(t)
+
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(root, WithDefaultSize(16<<20))
+	require.NoError(t, err)
+	defer sn.Close()
+
+	group := snapshots.WithLabels(map[string]string{
+		snapshots.LabelSnapshotGroup: "pod-1",
+	})
+
+	// The pod's scratch layer is the group's block device itself.
+	scratch, err := sn.Prepare(ctx, "scratch", "", group)
+	require.NoError(t, err)
+	require.Len(t, scratch, 1, "a parentless grouped snapshot is the group device")
+	image := scratch[0].Source
+	assert.Contains(t, image, filepath.Join(root, "groups"))
+
+	// Containers in the pod resolve to the same image.
+	a, err := sn.Prepare(ctx, "a", "", group)
+	require.NoError(t, err)
+	b, err := sn.Prepare(ctx, "b", "", group)
+	require.NoError(t, err)
+	assert.Equal(t, image, a[0].Source, "group members share one block image")
+	assert.Equal(t, image, b[0].Source, "group members share one block image")
+	assert.Equal(t, a[0], b[0], "the block mount must be identical so it is mounted once")
+
+	// A snapshot outside the group gets its own image.
+	other, err := sn.Prepare(ctx, "other", "")
+	require.NoError(t, err)
+	assert.NotEqual(t, image, other[0].Source, "ungrouped snapshots are not shared")
+
+	groupDir := filepath.Dir(image)
+
+	require.NoError(t, sn.Remove(ctx, "a"))
+	_, err = os.Stat(groupDir)
+	assert.NoError(t, err, "group image must survive while members remain")
+
+	require.NoError(t, sn.Remove(ctx, "b"))
+	_, err = os.Stat(groupDir)
+	assert.NoError(t, err, "group image must survive while the scratch layer remains")
+
+	require.NoError(t, sn.Remove(ctx, "scratch"))
+	_, err = os.Stat(groupDir)
+	assert.True(t, os.IsNotExist(err), "group image must be reclaimed with the last member")
+}
+
+// TestGroupCommitRejected verifies that a grouped snapshot cannot be
+// committed: its writable layer lives inside an image shared with, and
+// still mounted by, the rest of the group.
+func TestGroupCommitRejected(t *testing.T) {
+	testutil.RequiresRoot(t)
+	requireMkfsErofs(t)
+
+	ctx := context.Background()
+	sn, err := NewSnapshotter(t.TempDir(), WithDefaultSize(16<<20))
+	require.NoError(t, err)
+	defer sn.Close()
+
+	_, err = sn.Prepare(ctx, "a", "", snapshots.WithLabels(map[string]string{
+		snapshots.LabelSnapshotGroup: "pod-1",
+	}))
+	require.NoError(t, err)
+
+	err = sn.Commit(ctx, "committed", "a")
+	assert.ErrorIs(t, err, errdefs.ErrInvalidArgument)
+}
+
+// TestGroupOrphanDirectoryReclaimed verifies that a group directory
+// left behind by an interrupted removal is reclaimed. Group ids are
+// never reused, so an unclaimed directory can always be removed.
+func TestGroupOrphanDirectoryReclaimed(t *testing.T) {
+	testutil.RequiresRoot(t)
+	requireMkfsErofs(t)
+
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(root, WithDefaultSize(16<<20))
+	require.NoError(t, err)
+	defer sn.Close()
+
+	orphan := filepath.Join(root, "groups", "9999")
+	require.NoError(t, os.MkdirAll(orphan, 0700))
+
+	_, err = sn.Prepare(ctx, "a", "")
+	require.NoError(t, err)
+	require.NoError(t, sn.Remove(ctx, "a"))
+
+	_, err = os.Stat(orphan)
+	assert.True(t, os.IsNotExist(err), "unclaimed group directory should be reclaimed")
+}
+
+func requireMkfsErofs(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not found")
 	}
 }
