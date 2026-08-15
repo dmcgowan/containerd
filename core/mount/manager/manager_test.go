@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -94,7 +95,7 @@ func TestManager(t *testing.T) {
 		assert.Equal(t, len(ainfo.System), 0)
 		assert.Equal(t, ainfo.Active[0].Source, sourcedir)
 		assert.Equal(t, ainfo.Active[0].Type, "bind")
-		assert.Equal(t, ainfo.Active[0].MountPoint, filepath.Join(targetdir, "1", "1"))
+		assert.Equal(t, ainfo.Active[0].MountPoint, filepath.Join(targetdir, backingDir, "2", mountPointName))
 	})
 
 	// try mounting
@@ -371,20 +372,23 @@ func TestActivateAlreadyExists(t *testing.T) {
 	assert.NoError(t, m.Deactivate(ctx, "task1"))
 }
 
+// TestActivateStaleIncomplete verifies that an activation which was
+// interrupted before completing is replaced, and that the mounts it
+// had already claimed are released.
 func TestActivateStaleIncomplete(t *testing.T) {
-	td := t.TempDir()
-	metadb := filepath.Join(td, "mounts.db")
-	targetdir := filepath.Join(td, "m")
-	db, err := bolt.Open(metadb, 0600, nil)
-	require.NoError(t, err)
 	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("noop", &noopHandler{mounts: mountC}))
+	mm := m.(*mountManager)
 
-	// Simulate a stale incomplete activation by directly writing a bucket
-	// without the "active" sub-bucket (as if the process crashed mid-activation).
-	// Use mount ID 42 so we can verify the stale target directory gets cleaned up.
-	var staleMID uint64 = 42
-	err = db.Update(func(tx *bolt.Tx) error {
-		v1bkt, err := tx.CreateBucketIfNotExists([]byte("v1"))
+	stale := mount.Mount{Type: "noop", Source: "/dev/zero"}
+
+	// Reproduce the crash window: the mount bucket exists and the
+	// mount was claimed and performed, but the activation never
+	// recorded its completion marker.
+	var staleMP string
+	require.NoError(t, mm.db.Update(func(tx *bolt.Tx) error {
+		v1bkt, err := tx.CreateBucketIfNotExists(bucketKeyVersion)
 		if err != nil {
 			return err
 		}
@@ -396,43 +400,69 @@ func TestActivateStaleIncomplete(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		// Create the mount bucket but don't add the "active" sub-bucket
-		bkt, err := mbkt.CreateBucket([]byte("task1"))
+		if _, err := mbkt.CreateBucket([]byte("task1")); err != nil {
+			return err
+		}
+		backing, err := claimBackingMount(tx, "test", "task1", 0, stale)
 		if err != nil {
 			return err
 		}
-		idb, err := encodeID(staleMID)
+		staleMP, err = mm.prepareBackingDir(backing.id, stale.Type, true)
 		if err != nil {
 			return err
 		}
-		return bkt.Put(bucketKeyID, idb)
-	})
-	require.NoError(t, err)
+		mountC.Add(1)
+		return completeBackingMount(tx, "test", backing.id, staleMP, time.Now())
+	}))
 
-	// Create the stale target directory as if the process crashed after
-	// mkdir but before the second transaction.
-	staleTarget := filepath.Join(targetdir, fmt.Sprintf("%d", staleMID))
-	require.NoError(t, os.MkdirAll(staleTarget, 0700))
-
-	mountC := new(atomic.Int32)
-	m, err := NewManager(db, targetdir, WithMountHandler("noop", &noopHandler{mounts: mountC}))
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, m.(io.Closer).Close()) })
-
-	mounts := []mount.Mount{{Type: "noop"}}
-
-	// Activation should succeed by cleaning up the stale entry
-	ainfo, err := m.Activate(ctx, "task1", mounts)
+	// Activating the same name must clean up the stale record.
+	ainfo, err := m.Activate(ctx, "task1", []mount.Mount{{Type: "noop", Source: "/dev/null"}})
 	require.NoError(t, err)
 	assert.Equal(t, "task1", ainfo.Name)
-	assert.Equal(t, 1, len(ainfo.Active))
+	require.Equal(t, 1, len(ainfo.Active))
 
-	// The stale target directory should have been cleaned up
-	_, err = os.Stat(staleTarget)
-	assert.True(t, os.IsNotExist(err), "stale target directory should be removed, but still exists")
+	assert.Equal(t, int32(1), mountC.Load(), "stale mount should be unmounted, new mount made")
+	_, err = os.Stat(filepath.Dir(staleMP))
+	assert.True(t, os.IsNotExist(err), "stale backing mount directory should be removed")
 
-	// Cleanup
 	assert.NoError(t, m.Deactivate(ctx, "task1"))
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestActivateStaleKeepsReferencedBackingMount verifies that replacing a stale
+// activation does not tear down a mount another activation is using.
+func TestActivateStaleKeepsReferencedBackingMount(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("noop", &noopHandler{mounts: mountC}))
+	mm := m.(*mountManager)
+
+	shared := mount.Mount{Type: "noop", Source: "/dev/null"}
+
+	keep, err := m.Activate(ctx, "keep", []mount.Mount{shared})
+	require.NoError(t, err)
+	mp := keep.Active[0].MountPoint
+	assert.Equal(t, int32(1), mountC.Load())
+
+	// A stale activation which referenced the same mount.
+	require.NoError(t, mm.db.Update(func(tx *bolt.Tx) error {
+		mbkt := getBucket(tx, bucketKeyVersion, []byte("test"), bucketKeyMounts)
+		if _, err := mbkt.CreateBucket([]byte("task1")); err != nil {
+			return err
+		}
+		_, err := claimBackingMount(tx, "test", "task1", 0, shared)
+		return err
+	}))
+
+	_, err = m.Activate(ctx, "task1", []mount.Mount{shared})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), mountC.Load(), "backing mount must not be remounted")
+	_, err = os.Stat(filepath.Dir(mp))
+	assert.NoError(t, err, "backing mount must survive stale cleanup")
+
+	require.NoError(t, m.Deactivate(ctx, "keep"))
+	require.NoError(t, m.Deactivate(ctx, "task1"))
+	assert.Equal(t, int32(0), mountC.Load())
 }
 
 func TestInfo(t *testing.T) {
@@ -618,6 +648,430 @@ func TestClose(t *testing.T) {
 	assert.ErrorIs(t, err, bolterr.ErrDatabaseNotOpen)
 }
 
+// mkTestManager builds a manager with the given handlers over a fresh
+// bolt database.
+func mkTestManager(t *testing.T, opts ...Opt) (mount.Manager, string) {
+	t.Helper()
+	td := t.TempDir()
+	db, err := bolt.Open(filepath.Join(td, "mounts.db"), 0600, nil)
+	require.NoError(t, err)
+	targetdir := filepath.Join(td, "m")
+	m, err := NewManager(db, targetdir, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { m.(io.Closer).Close() })
+	return m, targetdir
+}
+
+// TestBackingMount verifies that activations which describe the
+// same mount resolve to a single mount, and that the mount survives
+// until the last activation referencing it is deactivated.
+func TestBackingMount(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("vol", &noopHandler{mounts: mountC}))
+
+	vol := func() []mount.Mount {
+		return []mount.Mount{{
+			Type:    "vol",
+			Source:  "/dev/null",
+			Options: []string{"rw"},
+		}}
+	}
+
+	aInfo, err := m.Activate(ctx, "a", vol())
+	require.NoError(t, err)
+	require.Len(t, aInfo.Active, 1)
+	mp := aInfo.Active[0].MountPoint
+	require.NotEmpty(t, mp)
+	assert.Equal(t, int32(1), mountC.Load(), "first activation mounts once")
+
+	bInfo, err := m.Activate(ctx, "b", vol())
+	require.NoError(t, err)
+	require.Len(t, bInfo.Active, 1)
+	assert.Equal(t, mp, bInfo.Active[0].MountPoint, "identical mount should be reused")
+	assert.Equal(t, int32(1), mountC.Load(), "identical mount should not be mounted twice")
+
+	// Info reports the same mount for both activations.
+	for _, name := range []string{"a", "b"} {
+		info, err := m.Info(ctx, name)
+		require.NoError(t, err)
+		require.Len(t, info.Active, 1)
+		assert.Equal(t, mp, info.Active[0].MountPoint)
+		assert.Equal(t, "vol", info.Active[0].Type)
+		assert.Equal(t, "/dev/null", info.Active[0].Source)
+		assert.Equal(t, []string{"rw"}, info.Active[0].Options)
+	}
+
+	// Deactivating one activation must not disturb the other.
+	require.NoError(t, m.Deactivate(ctx, "a"))
+	assert.Equal(t, int32(1), mountC.Load(), "mount stays while b references it")
+	_, err = os.Stat(filepath.Dir(mp))
+	assert.NoError(t, err, "mount point must remain while referenced")
+
+	require.NoError(t, m.Deactivate(ctx, "b"))
+	assert.Equal(t, int32(0), mountC.Load(), "mount released after last reference")
+	_, err = os.Stat(filepath.Dir(mp))
+	assert.True(t, os.IsNotExist(err), "mount point should be removed with the last reference")
+}
+
+// TestBackingMountDistinctParameters verifies that mounts which
+// differ in any parameter are not collapsed together.
+func TestBackingMountDistinctParameters(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		b    mount.Mount
+	}{
+		{
+			name: "Source",
+			b:    mount.Mount{Type: "vol", Source: "/dev/zero", Options: []string{"rw"}},
+		},
+		{
+			name: "Options",
+			b:    mount.Mount{Type: "vol", Source: "/dev/null", Options: []string{"ro"}},
+		},
+		{
+			name: "OptionOrder",
+			b:    mount.Mount{Type: "vol", Source: "/dev/null", Options: []string{"nodev", "rw"}},
+		},
+		{
+			name: "Target",
+			b:    mount.Mount{Type: "vol", Source: "/dev/null", Target: "/t", Options: []string{"rw", "nodev"}},
+		},
+		{
+			name: "Type",
+			b:    mount.Mount{Type: "vol2", Source: "/dev/null", Options: []string{"rw", "nodev"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := namespaces.WithNamespace(context.Background(), "test")
+			mountC := new(atomic.Int32)
+			m, _ := mkTestManager(t,
+				WithMountHandler("vol", &noopHandler{mounts: mountC}),
+				WithMountHandler("vol2", &noopHandler{mounts: mountC}))
+
+			a := mount.Mount{Type: "vol", Source: "/dev/null", Options: []string{"rw", "nodev"}}
+
+			aInfo, err := m.Activate(ctx, "a", []mount.Mount{a})
+			require.NoError(t, err)
+			bInfo, err := m.Activate(ctx, "b", []mount.Mount{tc.b})
+			require.NoError(t, err)
+
+			assert.NotEqual(t, aInfo.Active[0].MountPoint, bInfo.Active[0].MountPoint)
+			assert.Equal(t, int32(2), mountC.Load(), "differing mounts must not be shared")
+
+			require.NoError(t, m.Deactivate(ctx, "a"))
+			require.NoError(t, m.Deactivate(ctx, "b"))
+			assert.Equal(t, int32(0), mountC.Load())
+		})
+	}
+}
+
+// TestBackingMountSyntheticSource verifies that filesystems
+// which synthesize their own contents are never shared. Two tmpfs
+// mounts with identical parameters are still two distinct
+// filesystems.
+func TestBackingMountSyntheticSource(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("tmpfs", &noopHandler{mounts: mountC}))
+
+	tmpfs := func() []mount.Mount {
+		return []mount.Mount{{
+			Type:    "tmpfs",
+			Source:  "tmpfs",
+			Options: []string{"size=1m"},
+		}}
+	}
+
+	aInfo, err := m.Activate(ctx, "a", tmpfs())
+	require.NoError(t, err)
+	bInfo, err := m.Activate(ctx, "b", tmpfs())
+	require.NoError(t, err)
+
+	assert.NotEqual(t, aInfo.Active[0].MountPoint, bInfo.Active[0].MountPoint)
+	assert.Equal(t, int32(2), mountC.Load(), "synthetic filesystems must not be shared")
+
+	require.NoError(t, m.Deactivate(ctx, "a"))
+	assert.Equal(t, int32(1), mountC.Load())
+	require.NoError(t, m.Deactivate(ctx, "b"))
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestBackingMountNamespaces verifies that identical mounts in
+// different namespaces are not shared.
+func TestBackingMountNamespaces(t *testing.T) {
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("vol", &noopHandler{mounts: mountC}))
+
+	vol := []mount.Mount{{Type: "vol", Source: "/dev/null", Options: []string{"rw"}}}
+
+	ctxA := namespaces.WithNamespace(context.Background(), "ns-a")
+	ctxB := namespaces.WithNamespace(context.Background(), "ns-b")
+
+	aInfo, err := m.Activate(ctxA, "a", vol)
+	require.NoError(t, err)
+	bInfo, err := m.Activate(ctxB, "a", vol)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, aInfo.Active[0].MountPoint, bInfo.Active[0].MountPoint)
+	assert.Equal(t, int32(2), mountC.Load(), "mounts must not be shared across namespaces")
+
+	require.NoError(t, m.Deactivate(ctxA, "a"))
+	assert.Equal(t, int32(1), mountC.Load())
+	require.NoError(t, m.Deactivate(ctxB, "a"))
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestBackingMountTransformed verifies that the mount identity
+// is computed from the mount as it is finally handed to the kernel,
+// after any transforms have run, and that later mounts in a chain
+// resolve their templates against the backing mount point.
+//
+// This is the shape produced by a block backed snapshotter: a backing
+// image mount at the bottom of the chain with a per snapshot directory
+// inside it.
+func TestBackingMountTransformed(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t,
+		WithMountHandler("blk", &noopHandler{mounts: mountC}),
+		WithMountHandler("upper", &noopHandler{mounts: mountC}))
+
+	chain := func(id string) []mount.Mount {
+		return []mount.Mount{
+			{
+				Type:    "format/blk",
+				Source:  "/images/shared.img",
+				Options: []string{"rw", "loop"},
+			},
+			{
+				Type:    "format/upper",
+				Source:  "{{ mount 0 }}/upper-" + id,
+				Options: []string{"rbind"},
+			},
+		}
+	}
+
+	aInfo, err := m.Activate(ctx, "a", chain("a"))
+	require.NoError(t, err)
+	require.Len(t, aInfo.Active, 2)
+	blkMP := aInfo.Active[0].MountPoint
+	assert.Equal(t, "blk", aInfo.Active[0].Type, "transform prefix must be peeled before mounting")
+	assert.Equal(t, blkMP+"/upper-a", aInfo.Active[1].Source)
+	assert.Equal(t, int32(2), mountC.Load())
+
+	bInfo, err := m.Activate(ctx, "b", chain("b"))
+	require.NoError(t, err)
+	require.Len(t, bInfo.Active, 2)
+
+	assert.Equal(t, blkMP, bInfo.Active[0].MountPoint,
+		"identical transformed mount must be reused")
+	assert.Equal(t, blkMP+"/upper-b", bInfo.Active[1].Source,
+		"dependent mount must resolve against the backing mount point")
+	assert.NotEqual(t, aInfo.Active[1].MountPoint, bInfo.Active[1].MountPoint,
+		"differing upper mounts must not be shared")
+	assert.Equal(t, int32(3), mountC.Load(), "only the upper mount is added")
+
+	// The backing image stays mounted while either chain uses it.
+	require.NoError(t, m.Deactivate(ctx, "a"))
+	assert.Equal(t, int32(2), mountC.Load())
+	_, err = os.Stat(filepath.Dir(blkMP))
+	assert.NoError(t, err, "backing mount must survive while another chain uses it")
+
+	require.NoError(t, m.Deactivate(ctx, "b"))
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestActivateRollbackReleasesBackingReferences verifies that a failed
+// activation releases the references it took, without disturbing a
+// mount another activation is still using.
+func TestActivateRollbackReleasesBackingReferences(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t,
+		WithMountHandler("vol", &noopHandler{mounts: mountC}),
+		WithMountHandler("bad", &failHandler{}))
+
+	vol := mount.Mount{Type: "vol", Source: "/dev/null", Options: []string{"rw"}}
+
+	okInfo, err := m.Activate(ctx, "ok", []mount.Mount{vol})
+	require.NoError(t, err)
+	mp := okInfo.Active[0].MountPoint
+	assert.Equal(t, int32(1), mountC.Load())
+
+	// A chain which reuses the same mount but then fails must leave
+	// the backing mount alone.
+	_, err = m.Activate(ctx, "fail", []mount.Mount{
+		vol,
+		{Type: "bad", Source: "/dev/zero"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, int32(1), mountC.Load(), "backing mount must survive the rollback")
+	_, err = os.Stat(filepath.Dir(mp))
+	assert.NoError(t, err)
+
+	// The failed activation must not be left behind.
+	_, err = m.Info(ctx, "fail")
+	assert.True(t, errdefs.IsNotFound(err), "expected ErrNotFound, got %v", err)
+
+	// Retrying the same name works, so the previous references were
+	// fully released.
+	_, err = m.Activate(ctx, "fail", []mount.Mount{vol})
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), mountC.Load())
+
+	require.NoError(t, m.Deactivate(ctx, "ok"))
+	require.NoError(t, m.Deactivate(ctx, "fail"))
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestActivateRollbackUnmountsUnreferencedBacking verifies that a failed
+// activation unmounts the mounts it alone created.
+func TestActivateRollbackUnmountsUnreferencedBacking(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t,
+		WithMountHandler("vol", &noopHandler{mounts: mountC}),
+		WithMountHandler("bad", &failHandler{}))
+
+	_, err := m.Activate(ctx, "fail", []mount.Mount{
+		{Type: "vol", Source: "/dev/null", Options: []string{"rw"}},
+		{Type: "bad", Source: "/dev/zero"},
+	})
+	require.Error(t, err)
+	assert.Equal(t, int32(0), mountC.Load(), "mounts made by the failed activation must be undone")
+}
+
+// failHandler returns an error on every mount, used to force an
+// Activate failure in rollback tests.
+type failHandler struct{}
+
+func (failHandler) Mount(context.Context, mount.Mount, string, []mount.ActiveMount) (mount.ActiveMount, error) {
+	return mount.ActiveMount{}, fmt.Errorf("forced failure")
+}
+func (failHandler) Unmount(context.Context, string) error { return nil }
+
+// TestBackingMountGCRelease verifies that garbage collecting the
+// activations which reference a backing mount releases it exactly once.
+func TestBackingMountGCRelease(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("vol", &noopHandler{mounts: mountC}))
+
+	vol := []mount.Mount{{Type: "vol", Source: "/dev/null", Options: []string{"rw"}}}
+
+	_, err := m.Activate(ctx, "a", vol)
+	require.NoError(t, err)
+	_, err = m.Activate(ctx, "b", vol)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), mountC.Load())
+
+	collect := func(names ...string) {
+		t.Helper()
+		cc, err := m.(interface {
+			StartCollection(context.Context) (metadata.CollectionContext, error)
+		}).StartCollection(ctx)
+		require.NoError(t, err)
+		for _, n := range names {
+			cc.Remove(gc.Node{Type: metadata.ResourceMount, Namespace: "test", Key: n})
+		}
+		require.NoError(t, cc.Finish())
+	}
+
+	// Removing one activation leaves the mount in place for the other.
+	collect("a")
+	assert.Equal(t, int32(1), mountC.Load(), "mount stays while b references it")
+
+	collect("b")
+	assert.Equal(t, int32(0), mountC.Load(), "mount released with the last reference")
+}
+
+// TestGCOrphanedBackingMount verifies that a mount directory left behind
+// without a database record, as happens when the process dies between
+// mounting and recording the mount, is unmounted by the collector.
+func TestGCOrphanedBackingMount(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	m, targetdir := mkTestManager(t, WithMountHandler("vol", &noopHandler{mounts: mountC}))
+
+	// Simulate the crash: a backing mount directory with a type file and
+	// a mount point, but no record in the database.
+	orphan := filepath.Join(targetdir, backingDir, "99")
+	require.NoError(t, os.MkdirAll(filepath.Join(orphan, mountPointName), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(orphan, typeFileName), []byte("vol"), 0600))
+	mountC.Add(1)
+
+	cc, err := m.(interface {
+		StartCollection(context.Context) (metadata.CollectionContext, error)
+	}).StartCollection(ctx)
+	require.NoError(t, err)
+	require.NoError(t, cc.Finish())
+
+	assert.Equal(t, int32(0), mountC.Load(), "orphaned mount should be unmounted with its handler")
+	_, err = os.Stat(orphan)
+	assert.True(t, os.IsNotExist(err), "orphaned backing mount directory should be removed")
+}
+
+// TestActivateConcurrentIdenticalMounts verifies that concurrent
+// activations which resolve to the same mount perform the underlying
+// mount exactly once.
+func TestActivateConcurrentIdenticalMounts(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	mountC := new(atomic.Int32)
+	total := new(atomic.Int32)
+	m, _ := mkTestManager(t, WithMountHandler("vol", &countingHandler{active: mountC, total: total}))
+
+	vol := []mount.Mount{{Type: "vol", Source: "/dev/null", Options: []string{"rw"}}}
+
+	const n = 8
+	var wg sync.WaitGroup
+	mps := make([]string, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			info, err := m.Activate(ctx, fmt.Sprintf("task%d", i), vol)
+			errs[i] = err
+			if err == nil && len(info.Active) == 1 {
+				mps[i] = info.Active[0].MountPoint
+			}
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i])
+		assert.Equal(t, mps[0], mps[i], "all activations should share one mount point")
+	}
+	assert.Equal(t, int32(1), total.Load(), "identical mount should be mounted exactly once")
+	assert.Equal(t, int32(1), mountC.Load())
+
+	for i := 0; i < n; i++ {
+		require.NoError(t, m.Deactivate(ctx, fmt.Sprintf("task%d", i)))
+	}
+	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// countingHandler tracks both currently active mounts and the total
+// number of mount calls ever made.
+type countingHandler struct {
+	active *atomic.Int32
+	total  *atomic.Int32
+}
+
+func (h *countingHandler) Mount(_ context.Context, m mount.Mount, mp string, _ []mount.ActiveMount) (mount.ActiveMount, error) {
+	now := time.Now()
+	h.active.Add(1)
+	h.total.Add(1)
+	return mount.ActiveMount{Mount: m, MountedAt: &now, MountPoint: mp}, nil
+}
+
+func (h *countingHandler) Unmount(context.Context, string) error {
+	h.active.Add(-1)
+	return nil
+}
+
 // TestActivateAllMountsHandled covers a transformed chain in which every
 // mount is handled by the manager, leaving no system mount to convert.
 func TestActivateAllMountsHandled(t *testing.T) {
@@ -647,4 +1101,23 @@ func TestActivateAllMountsHandled(t *testing.T) {
 
 	require.NoError(t, m.Deactivate(ctx, "a"))
 	assert.Equal(t, int32(0), mountC.Load())
+}
+
+// TestSchemaNotTouchedBeforeFirstWrite verifies that opening the
+// manager does not by itself touch a "v1" bucket left behind by an
+// older binary: migration only happens inside the first write
+// transaction this package performs, so a process which never gets
+// that far, for example because it fails to start for an unrelated
+// reason, leaves "v1" untouched and a rollback to the older binary
+// still works.
+func TestSchemaNotTouchedBeforeFirstWrite(t *testing.T) {
+	m, _ := mkTestManager(t, WithMountHandler("noop", &noopHandler{mounts: new(atomic.Int32)}))
+	mm := m.(*mountManager)
+
+	seedLegacyV1(t, mm.db, "test", legacyActivation{
+		name:   "a",
+		active: []legacyActive{{typ: "noop", mp: "/dev/null", at: time.Now()}},
+	})
+
+	assertV1Present(t, mm.db, true)
 }
