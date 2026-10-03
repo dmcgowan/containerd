@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package v2
+package manager
 
 import (
 	"context"
@@ -27,8 +27,6 @@ import (
 	"sync"
 
 	"github.com/containerd/log"
-	"github.com/containerd/plugin"
-	"github.com/containerd/plugin/registry"
 	"github.com/containerd/typeurl/v2"
 
 	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
@@ -36,8 +34,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	shimbinary "github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/pkg/timeout"
-	"github.com/containerd/containerd/v2/plugins"
-	"github.com/containerd/containerd/v2/version"
 )
 
 // ShimConfig for the shim
@@ -53,70 +49,14 @@ type ShimConfig struct {
 	SocketDir string `toml:"socket_dir"`
 }
 
-func init() {
-	// ShimManager is not only for TaskManager,
-	// the "shim" sandbox controller also use it to manage shims,
-	// so we make it an independent plugin
-	registry.Register(&plugin.Registration{
-		Type:   plugins.ShimPlugin,
-		ID:     "manager",
-		Config: &ShimConfig{},
-		InitFn: func(ic *plugin.InitContext) (any, error) {
-			config := ic.Config.(*ShimConfig)
+// MaxSocketDirLen is the maximum length of the socket directory path for the
+// current platform.
+const MaxSocketDirLen = maxSocketDirLen
 
-			// Allow configurable directory
-			if config.SocketDir != "" {
-				if !filepath.IsAbs(config.SocketDir) {
-					return nil, fmt.Errorf("socket_dir must be an absolute path: %q", config.SocketDir)
-				}
-				config.SocketDir = filepath.Clean(config.SocketDir)
-				if len(config.SocketDir) > maxSocketDirLen {
-					return nil, fmt.Errorf("socket_dir length must be no longer than %d characters", maxSocketDirLen)
-				}
-			} else {
-				config.SocketDir = defaultSocketDir()
-				if config.SocketDir == "" {
-					return nil, errors.New("failed to find a suitable socket directory for shim, please configure one")
-				}
-			}
-
-			return NewShimManager(&ManagerConfig{
-				Address:      ic.Properties[plugins.PropertyGRPCAddress],
-				TTRPCAddress: ic.Properties[plugins.PropertyTTRPCAddress],
-				SocketDir:    config.SocketDir,
-				ShimEnv:      config.Env,
-			})
-		},
-		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {
-			// Migrate configurations from io.containerd.runtime.v2.task
-			// if the configVersion >= 3 please make sure the config is under io.containerd.shim.v1.manager.
-			if configVersion >= version.ConfigVersion {
-				return nil
-			}
-			const originalPluginName = string(plugins.RuntimePluginV2) + ".task"
-			original, ok := pluginConfigs[originalPluginName]
-			if !ok {
-				return nil
-			}
-			src := original.(map[string]any)
-			dest := map[string]any{}
-
-			if v, ok := src["sched_core"]; ok {
-				if schedCore, ok := v.(bool); schedCore {
-					dest["env"] = []string{"SCHED_CORE=1"}
-				} else if !ok {
-					log.G(ctx).Warnf("skipping migration for non-boolean 'sched_core' value %v", v)
-				}
-
-				delete(src, "sched_core")
-			}
-
-			const newPluginName = string(plugins.ShimPlugin) + ".manager"
-			pluginConfigs[originalPluginName] = src
-			pluginConfigs[newPluginName] = dest
-			return nil
-		},
-	})
+// DefaultSocketDir returns the default directory used for shim unix sockets, or
+// an empty string if none could be determined.
+func DefaultSocketDir() string {
+	return defaultSocketDir()
 }
 
 type ManagerConfig struct {
@@ -203,9 +143,10 @@ type LoadConfig struct {
 	Reap func(ctx context.Context, shim ShimInstance) (keep bool, err error)
 }
 
-// ID of the shim manager
+// ID of the shim manager. This matches the io.containerd.shim.v1.manager plugin
+// ID under which the manager is registered (see plugins/shim).
 func (m *ShimManager) ID() string {
-	return plugins.ShimPlugin.String() + ".manager"
+	return "io.containerd.shim.v1.manager"
 }
 
 // Env returns the environment configured for the shim manager.
@@ -454,4 +395,51 @@ func (m *ShimManager) Delete(ctx context.Context, id string) error {
 	m.shims.Delete(ctx, id)
 
 	return err
+}
+
+// CleanupTimeout returns the configured per-call budget for cleaning up a dead
+// shim. Callers that drive their own cleanup use it to bound those calls.
+func CleanupTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return timeout.WithContext(ctx, cleanupTimeout)
+}
+
+// ShutdownTimeout returns the configured budget for shutting a shim down.
+func ShutdownTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return timeout.WithContext(ctx, shutdownTimeout)
+}
+
+// RestoreBootstrapParams reads a bundle's bootstrap.json (migrating an old
+// address file if needed) to recover how to connect to its shim.
+func RestoreBootstrapParams(bundlePath string) (*bootapi.BootstrapResult, error) {
+	return restoreBootstrapParams(bundlePath)
+}
+
+// DeleteBundle invokes the shim binary's delete action for a dead shim's bundle,
+// cleaning up its on-disk state and returning the exit it reports. It is used by
+// callers reacting to a shim disconnect, where the in-memory client is already
+// gone and only the bundle remains. runtime may be empty, in which case it is
+// read from the bundle's shim-binary-path file.
+func (m *ShimManager) DeleteBundle(ctx context.Context, bundle *Bundle, runtimeName string) (*runtime.Exit, error) {
+	if runtimeName == "" {
+		if data, err := os.ReadFile(filepath.Join(bundle.Path, "shim-binary-path")); err == nil {
+			runtimeName = string(data)
+		} else if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	if runtimeName == "" {
+		return nil, fmt.Errorf("no runtime for bundle %q: unable to read shim-binary-path", bundle.ID)
+	}
+	runtimePath, err := m.resolveRuntimePath(runtimeName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
+	}
+	b := shimBinary(bundle, shimBinaryConfig{
+		runtime:      runtimePath,
+		address:      m.containerdAddress,
+		ttrpcAddress: m.containerdTTRPCAddress,
+		socketDir:    m.socketDir,
+		env:          m.env,
+	})
+	return b.Delete(ctx)
 }

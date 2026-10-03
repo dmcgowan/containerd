@@ -14,12 +14,10 @@
    limitations under the License.
 */
 
-package v2
+package manager
 
-// maxSocketDirLen is the maximum length of the socket directory path.
-// Windows uses the same limit as Linux: 108 characters minus a null
-// terminator gives 107 usable characters. The socket path passed to
-// the kernel is directory + "/" (1) + sha256 hash (64); the "unix://"
-// scheme is stripped before net.Listen and does not count.
-// So the directory can be at most 107 - 1 - 64 = 42.
-const maxSocketDirLen = 42
+import "syscall"
+
+func getSysProcAttr() *syscall.SysProcAttr {
+	return nil
+}

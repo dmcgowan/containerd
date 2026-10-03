@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
    Copyright The containerd Authors.
 
@@ -14,25 +16,12 @@
    limitations under the License.
 */
 
-package v2
+package manager
 
-import (
-	"errors"
-	"os"
-	"testing"
-)
+import "syscall"
 
-func TestCheckCopyShimLogError(t *testing.T) {
-	ctx := t.Context()
-	testError := errors.New("test error")
-
-	if err := checkCopyShimLogError(ctx, nil); err != nil {
-		t.Fatalf("should return the actual error except ErrNotExist, but %v", err)
-	}
-	if err := checkCopyShimLogError(ctx, testError); err != testError {
-		t.Fatalf("should return the actual error except ErrNotExist, but %v", err)
-	}
-	if err := checkCopyShimLogError(ctx, os.ErrNotExist); err != nil {
-		t.Fatalf("should return nil for ErrNotExist, but %v", err)
+func getSysProcAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		Setpgid: true,
 	}
 }

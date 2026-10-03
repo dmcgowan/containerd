@@ -53,6 +53,7 @@ import (
 	_ "github.com/containerd/containerd/v2/plugins/services/transfer"
 	_ "github.com/containerd/containerd/v2/plugins/services/version"
 	_ "github.com/containerd/containerd/v2/plugins/services/warning"
+	_ "github.com/containerd/containerd/v2/plugins/shim"
 	_ "github.com/containerd/containerd/v2/plugins/streaming"
 	_ "github.com/containerd/containerd/v2/plugins/transfer"
 )

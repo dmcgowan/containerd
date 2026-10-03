@@ -46,9 +46,9 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/core/sandbox"
+	shimmanager "github.com/containerd/containerd/v2/core/shim/manager"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/protobuf/proto"
-	"github.com/containerd/containerd/v2/pkg/timeout"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/plugins/services/warning"
 )
@@ -210,19 +210,7 @@ func (m *TaskManager) onTaskShimClose(ctx context.Context, id string) {
 		log.G(ctx).WithField("id", id).WithError(err).Error("failed to resolve runtime to clean up dead task shim")
 		return
 	}
-	runtimePath, err := m.manager.resolveRuntimePath(runtimeName)
-	if err != nil {
-		log.G(ctx).WithField("id", id).WithError(err).Error("failed to resolve runtime path to clean up dead task shim")
-		return
-	}
-	binaryCall := shimBinary(bundle, shimBinaryConfig{
-		runtime:      runtimePath,
-		address:      m.manager.containerdAddress,
-		ttrpcAddress: m.manager.containerdTTRPCAddress,
-		socketDir:    m.manager.socketDir,
-		env:          m.manager.env,
-	})
-	cleanupAfterDeadShim(ctx, id, m.manager.shims, m.events, binaryCall)
+	cleanupAfterDeadShim(ctx, id, m.manager, m.events, bundle, runtimeName)
 }
 
 // bundleRuntime resolves a shim's runtime name from its bundle, falling back to
@@ -317,7 +305,7 @@ func probeTaskShim(ctx context.Context, shim ShimInstance) (*shimTask, error) {
 			return s, err
 		}
 
-		downgrader, ok := shim.(clientVersionDowngrader)
+		downgrader, ok := shim.(shimmanager.ClientVersionDowngrader)
 		if ok {
 			if derr := downgrader.Downgrade(); derr == nil {
 				log.G(ctx).WithError(err).WithField("id", shim.ID()).
@@ -373,7 +361,7 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 	var activation mountActivation
 	defer func() {
 		if retErr != nil && activation.owned {
-			dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
+			dctx, cancel := shimmanager.CleanupTimeout(context.WithoutCancel(ctx))
 			defer cancel()
 			if err := m.taskMounts.Deactivate(dctx, taskID); err != nil {
 				log.G(ctx).WithError(err).WithField("task", taskID).Errorf("failed to deactivate mounts")
@@ -417,7 +405,7 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 	}()
 
 	var bootstrap *bootapi.BootstrapResult
-	if sc, ok := shim.(shimCapabilities); ok {
+	if sc, ok := shim.(shimmanager.ShimCapabilities); ok {
 		bootstrap = sc.BootstrapResult()
 	}
 	activation, err = m.taskMounts.Activate(ctx, taskID, opts.Runtime, bootstrap, opts.Rootfs)
@@ -445,7 +433,7 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 			return t, err
 		}
 
-		downgrader, ok := shim.(clientVersionDowngrader)
+		downgrader, ok := shim.(shimmanager.ClientVersionDowngrader)
 		if ok {
 			if derr := downgrader.Downgrade(); derr == nil {
 				log.G(ctx).WithError(err).WithField("id", taskID).
@@ -528,7 +516,7 @@ func (m *TaskManager) resolveSandboxJoin(ctx context.Context, id string, opts ru
 			return nil, "", fmt.Errorf("can't find shim for sandbox %s: %w", opts.SandboxID, err)
 		}
 
-		p, err := restoreBootstrapParams(process.Bundle())
+		p, err := shimmanager.RestoreBootstrapParams(process.Bundle())
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to get bootstrap params of sandbox %s: %w", opts.SandboxID, err)
 		}
@@ -549,7 +537,7 @@ func (m *TaskManager) resolveSandboxJoin(ctx context.Context, id string, opts ru
 // effort: a container joining a sandbox whose shim instance cannot be asked
 // degrades to no extensions rather than failing to start.
 func sandboxShimExtensions(process ShimInstance) []*bootapi.Extension {
-	sc, ok := process.(shimCapabilities)
+	sc, ok := process.(shimmanager.ShimCapabilities)
 	if !ok {
 		return nil
 	}

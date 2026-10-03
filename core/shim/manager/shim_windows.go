@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package v2
+package manager
 
 import (
 	"context"

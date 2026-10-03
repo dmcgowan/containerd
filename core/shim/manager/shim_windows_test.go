@@ -1,5 +1,3 @@
-//go:build !linux
-
 /*
    Copyright The containerd Authors.
 
@@ -16,8 +14,25 @@
    limitations under the License.
 */
 
-package v2
+package manager
 
-// prepareBundleDirectoryPermissions prepares the permissions of the bundle
-// directory according to the needs of the current platform.
-func prepareBundleDirectoryPermissions(path string, spec []byte) error { return nil }
+import (
+	"errors"
+	"os"
+	"testing"
+)
+
+func TestCheckCopyShimLogError(t *testing.T) {
+	ctx := t.Context()
+	testError := errors.New("test error")
+
+	if err := checkCopyShimLogError(ctx, nil); err != nil {
+		t.Fatalf("should return the actual error except ErrNotExist, but %v", err)
+	}
+	if err := checkCopyShimLogError(ctx, testError); err != testError {
+		t.Fatalf("should return the actual error except ErrNotExist, but %v", err)
+	}
+	if err := checkCopyShimLogError(ctx, os.ErrNotExist); err != nil {
+		t.Fatalf("should return nil for ErrNotExist, but %v", err)
+	}
+}
