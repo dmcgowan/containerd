@@ -24,12 +24,16 @@ import (
 	"slices"
 	"testing"
 
+	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
+	"github.com/containerd/containerd/api/types"
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const testPath = "/tmp/path/for/testing"
@@ -172,6 +176,59 @@ func TestMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestApplyPluginMeta(t *testing.T) {
+	info := &types.PluginInfo{
+		Exports:      map[string]string{"root": "/shim/root", "shared": "from-shim"},
+		Capabilities: []string{"shim-cap"},
+		Platforms: []*types.Platform{
+			{OS: "linux", Architecture: "arm64"},
+		},
+	}
+	boot := &bootapi.BootstrapResult{Protocol: "grpc", Address: "/run/example.sock"}
+	require.NoError(t, boot.AddExtension(info))
+
+	ic := &plugin.InitContext{Context: context.Background(), Meta: &plugin.Meta{}}
+	applyPluginMeta(ic, boot,
+		map[string]string{"shared": "from-config"},
+		[]string{"config-cap"},
+		v1.Platform{OS: "linux", Architecture: "amd64"},
+	)
+
+	// Shim-reported export present, config overrides the shared key, address set.
+	assert.Equal(t, "/shim/root", ic.Meta.Exports["root"])
+	assert.Equal(t, "from-config", ic.Meta.Exports["shared"])
+	assert.Equal(t, "/run/example.sock", ic.Meta.Exports["address"])
+
+	// Config capability first, then shim-reported.
+	assert.Equal(t, []string{"config-cap", "shim-cap"}, ic.Meta.Capabilities)
+
+	// Config platform plus shim-reported platform.
+	require.Len(t, ic.Meta.Platforms, 2)
+	assert.Equal(t, "amd64", ic.Meta.Platforms[0].Architecture)
+	assert.Equal(t, "arm64", ic.Meta.Platforms[1].Architecture)
+}
+
+func TestApplyPluginMetaAddressNotOverridable(t *testing.T) {
+	boot := &bootapi.BootstrapResult{Protocol: "grpc", Address: "/run/real.sock"}
+	ic := &plugin.InitContext{Context: context.Background(), Meta: &plugin.Meta{}}
+	// Even if config tries to set address, the shim's real address wins.
+	applyPluginMeta(ic, boot, map[string]string{"address": "/run/fake.sock"}, nil, v1.Platform{})
+	assert.Equal(t, "/run/real.sock", ic.Meta.Exports["address"])
+}
+
+func TestLoadPluginsManagedProxyRejectsShimAndAddress(t *testing.T) {
+	_, err := LoadPlugins(context.Background(), &srvconfig.Config{
+		ProxyPlugins: map[string]srvconfig.ProxyPlugin{
+			"bad": {
+				Type:    "snapshot",
+				Shim:    "io.containerd.snapshotter.example.v1",
+				Address: "/run/example.sock",
+			},
+		},
+	})
+	assert.ErrorContains(t, err, "mutually exclusive")
 }
 
 func TestSetTempDirEnv(t *testing.T) {

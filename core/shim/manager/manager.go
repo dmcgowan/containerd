@@ -64,6 +64,12 @@ type ManagerConfig struct {
 	TTRPCAddress string
 	SocketDir    string
 	ShimEnv      []string
+	// State and Root are the shim manager's own transient and persistent
+	// directories. They are used for shims the manager owns directly, such as
+	// managed proxy plugin shims (see plugin.go). Task and sandbox shims live
+	// under their own plugins' directories and do not use these.
+	State string
+	Root  string
 }
 
 // NewShimManager creates a manager for v2 shims
@@ -74,6 +80,8 @@ func NewShimManager(config *ManagerConfig) (*ShimManager, error) {
 		socketDir:              config.SocketDir,
 		shims:                  runtime.NewNSMap[ShimInstance](),
 		env:                    config.ShimEnv,
+		state:                  config.State,
+		root:                   config.Root,
 	}
 
 	return m, nil
@@ -95,6 +103,8 @@ type ShimManager struct {
 	env                    []string
 	shims                  *runtime.NSMap[ShimInstance]
 	socketDir              string
+	state                  string
+	root                   string
 	// runtimePaths is a cache of `runtime names` -> `resolved fs path`
 	runtimePaths sync.Map
 }
@@ -107,6 +117,9 @@ type StartConfig struct {
 	// Options is the runtime/task options passed to the shim binary as a
 	// bootstrap extension. May be nil.
 	Options typeurl.Any
+	// Env is additional environment passed to the shim process, appended to the
+	// manager's own configured environment. May be nil.
+	Env []string
 	// OnClose is invoked when the shim's connection is severed. It must not be
 	// nil. The manager removes the shim from its own map before invoking it, so
 	// OnClose is free to perform caller-specific cleanup (publishing task
@@ -227,12 +240,16 @@ func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string, 
 		return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
 	}
 
+	env := m.env
+	if len(cfg.Env) > 0 {
+		env = append(append([]string{}, m.env...), cfg.Env...)
+	}
 	b := shimBinary(bundle, shimBinaryConfig{
 		runtime:      runtimePath,
 		address:      m.containerdAddress,
 		ttrpcAddress: m.containerdTTRPCAddress,
 		socketDir:    m.socketDir,
-		env:          m.env,
+		env:          env,
 	})
 	shim, err := b.Start(ctx, typeurl.MarshalProto(cfg.Options), onClose)
 	if err != nil {

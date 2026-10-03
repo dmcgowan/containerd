@@ -60,4 +60,28 @@ does not attach this extension is still checked for that annotation as a
 migration path, except for `io.containerd.runc.v2` and
 `io.containerd.runhcs.v1`, which are known to never set it.
 
+### `containerd.types.PluginInfo`
+
+A [managed proxy plugin](PLUGINS.md#managed-proxy-plugins) shim describes the
+plugin it serves, so containerd can register it with the right introspection
+metadata without that metadata being set in configuration.
+
+```proto
+message PluginInfo {
+  map<string, string> exports = 1;      // introspection Meta.Exports
+  repeated string capabilities = 2;     // introspection Meta.Capabilities
+  repeated Platform platforms = 3;      // introspection Meta.Platforms
+}
+```
+
+containerd merges these into the plugin's introspection metadata. Any `exports`
+or `capabilities` set in the `[proxy_plugins.<name>]` configuration take
+precedence over the shim-reported values, and the configured `platform` is
+included alongside any the shim reports. The `address` export is always set by
+containerd to the shim's listening address and cannot be overridden.
+
+Only consulted for managed proxy plugin shims (those started via a
+`[proxy_plugins]` entry with a `shim` field). It has no effect on task or
+sandbox shims.
+
 [activateopts]: mounts.md#relationship-with-runtimes

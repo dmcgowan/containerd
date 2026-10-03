@@ -170,6 +170,57 @@ $ tree -L 3 /tmp/snapshots
 18 directories, 1 file
 ```
 
+#### Managed proxy plugins
+
+Instead of pointing a proxy plugin at an `address` of a process you start and
+supervise yourself, you can let containerd start and manage the plugin process
+for you. Set `shim` instead of `address`:
+
+```toml
+version = 3
+
+[proxy_plugins]
+  [proxy_plugins.customsnapshot]
+    type = "snapshot"
+    shim = "io.containerd.snapshotter.example.v1"   # runtime-style name or absolute path
+    env  = ["EXAMPLE_OPTION=1"]                      # optional, passed to the shim process
+```
+
+`shim` and `address` are mutually exclusive; setting both is a configuration
+error that surfaces as a plugin load error.
+
+containerd starts the named binary through the [runtime v2 shim bootstrap
+protocol](../core/runtime/v2/README.md): it runs the binary's `start` action,
+reads the `BootstrapResult` the binary writes to stdout, and connects to the
+gRPC address it reports. A managed proxy plugin shim **must** serve gRPC; a shim
+that reports any other protocol is rejected.
+
+Managed plugin shims are long-lived and independent of containerd's own
+lifecycle:
+
+- They keep running when containerd stops. On the next start, containerd
+  reconnects to (adopts) the running shim rather than starting a new one, using
+  the `bootstrap.json` recorded in the shim's bundle. This keeps any mounts the
+  plugin serves (for example a FUSE snapshotter) alive across a containerd
+  restart.
+- If the shim process dies, containerd starts a fresh one the next time the
+  plugin is used; the plugin's gRPC connection follows the shim transparently.
+- When a plugin entry is removed from configuration, its shim bundle is cleaned
+  up (the binary's `delete` action is invoked) on the next containerd start.
+
+Managed plugin shim bundles live under the shim manager's own state directory in
+a reserved `plugins` namespace, so they never collide with task or sandbox
+bundles.
+
+A shim may report metadata about itself — exports, capabilities and supported
+platforms — by attaching a `containerd.types.PluginInfo` extension to its
+`BootstrapResult`. containerd merges this into the plugin's introspection
+metadata, with any values set in configuration taking precedence. See
+[shim capabilities](shim-capabilities.md) for the extension format.
+
+A complete example plugin shim (a gRPC snapshotter) lives in
+[`core/shim/manager/example/plugin`](../core/shim/manager/example/plugin).
+
 ## Built-in Plugins
 
 containerd uses plugins internally to ensure that internal implementations are

@@ -17,7 +17,7 @@
 // Package shim registers the generic shim manager plugin. The manager itself
 // lives in core/shim/manager; this package wires it into the containerd plugin
 // graph. It is deliberately independent of the task manager: the shim manager is
-// also used by the sandbox controller.
+// also used by the sandbox controller and by managed proxy plugins.
 package shim
 
 import (
@@ -37,7 +37,7 @@ import (
 
 func init() {
 	// The shim manager is not only for the task manager; the "shim" sandbox
-	// controller also uses it to manage shims, so it is
+	// controller and managed proxy plugins also use it to manage shims, so it is
 	// registered as an independent plugin.
 	registry.Register(&plugin.Registration{
 		Type:   plugins.ShimPlugin,
@@ -67,6 +67,8 @@ func init() {
 				TTRPCAddress: ic.Properties[plugins.PropertyTTRPCAddress],
 				SocketDir:    config.SocketDir,
 				ShimEnv:      config.Env,
+				State:        ic.Properties[plugins.PropertyStateDir],
+				Root:         ic.Properties[plugins.PropertyRootDir],
 			})
 		},
 		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {

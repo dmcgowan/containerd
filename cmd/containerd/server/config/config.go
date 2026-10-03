@@ -404,6 +404,15 @@ type ProxyPlugin struct {
 	Platform     string            `toml:"platform"`
 	Exports      map[string]string `toml:"exports"`
 	Capabilities []string          `toml:"capabilities"`
+
+	// Shim, when set, names a shim binary (a runtime-style name such as
+	// "io.containerd.snapshotter.example.v1", or an absolute path) that
+	// containerd starts and manages as the backing process for this proxy
+	// plugin. The address to connect to is then taken from the shim's bootstrap
+	// result rather than from Address, so Shim and Address are mutually
+	// exclusive. Env is passed to the shim process.
+	Shim string   `toml:"shim"`
+	Env  []string `toml:"env"`
 }
 
 // Decode unmarshals a plugin specific configuration by plugin id

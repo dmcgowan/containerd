@@ -23,6 +23,15 @@ This document is split into the following sections:
 * [usage](#usage) - how to invoke specific runtimes, and how to configure them
 * [authoring](#shim-authoring) - how to author a v2 runtime
 
+> **Note:** The shim manager that launches and supervises shim processes is
+> generic and lives in [`core/shim/manager`](../core/shim/manager). It is not
+> specific to tasks: the task manager (`io.containerd.runtime.v2.task`), the
+> sandbox controller, and [managed proxy plugins](PLUGINS.md#managed-proxy-plugins)
+> all drive it to run shims. A shim is therefore not limited to serving the task
+> API over ttRPC; a managed proxy plugin shim, for example, serves an arbitrary
+> gRPC service and reports its address and capabilities through the bootstrap
+> protocol.
+
 ## Architecture
 
 ### containerd-runtime communication

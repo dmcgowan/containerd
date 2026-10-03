@@ -36,9 +36,11 @@ import (
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 
+	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
 	sbapi "github.com/containerd/containerd/api/services/sandbox/v1"
 	ssapi "github.com/containerd/containerd/api/services/snapshots/v1"
+	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/platforms"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -48,6 +50,7 @@ import (
 	"github.com/containerd/containerd/v2/core/diff"
 	diffproxy "github.com/containerd/containerd/v2/core/diff/proxy"
 	sbproxy "github.com/containerd/containerd/v2/core/sandbox/proxy"
+	shimmanager "github.com/containerd/containerd/v2/core/shim/manager"
 	ssproxy "github.com/containerd/containerd/v2/core/snapshots/proxy"
 	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/pkg/dialer"
@@ -230,7 +233,34 @@ func New(ctx context.Context, config *srvconfig.Config) (*Server, error) {
 	}
 
 	recordConfigDeprecations(ctx, config, initialized)
+	cleanupRemovedManagedPlugins(ctx, config, initialized)
 	return s, nil
+}
+
+// cleanupRemovedManagedPlugins reaps managed proxy plugin shims whose plugin
+// entry has been removed from configuration since the last run.
+func cleanupRemovedManagedPlugins(ctx context.Context, config *srvconfig.Config, set *plugin.Set) {
+	p := set.Get(plugins.ShimPlugin, "manager")
+	if p == nil {
+		return
+	}
+	instance, err := p.Instance()
+	if err != nil {
+		return
+	}
+	sm, ok := instance.(*shimmanager.ShimManager)
+	if !ok {
+		return
+	}
+	var keep []string
+	for name, pp := range config.ProxyPlugins {
+		if pp.Shim != "" {
+			keep = append(keep, name)
+		}
+	}
+	if err := sm.CleanupPlugins(ctx, keep); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to clean up removed managed proxy plugins")
+	}
 }
 
 // recordConfigDeprecations attempts to record use of any deprecated config field.  Failures are logged and ignored.
@@ -362,6 +392,58 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 		if exports == nil {
 			exports = map[string]string{}
 		}
+
+		if pp.Shim != "" {
+			// A managed proxy plugin: containerd starts the shim and takes its
+			// address from the bootstrap result. Shim and Address are mutually
+			// exclusive.
+			if pp.Address != "" {
+				return nil, fmt.Errorf("proxy plugin %q sets both 'shim' and 'address'; they are mutually exclusive", name)
+			}
+			pp := pp
+			name := name
+			t := t
+			f := f
+			p := p
+			exports := exports
+			registry.Register(&plugin.Registration{
+				Type:     t,
+				ID:       name,
+				Requires: []plugin.Type{plugins.ShimPlugin},
+				InitFn: func(ic *plugin.InitContext) (any, error) {
+					if f == nil {
+						return nil, fmt.Errorf("proxy plugin %q has unsupported type %q", name, pp.Type)
+					}
+					smi, err := ic.GetSingle(plugins.ShimPlugin)
+					if err != nil {
+						return nil, err
+					}
+					sm := smi.(*shimmanager.ShimManager)
+
+					ps, err := sm.StartPlugin(ic.Context, name, pp.Shim, pp.Env)
+					if err != nil {
+						return nil, fmt.Errorf("failed to start managed proxy plugin %q: %w", name, err)
+					}
+
+					applyPluginMeta(ic, ps.Result(), exports, pp.Capabilities, p)
+
+					conn, err := grpc.NewClient("passthrough:///"+name,
+						grpc.WithTransportCredentials(insecure.NewCredentials()),
+						grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+						grpc.WithContextDialer(ps.Dial),
+						grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+						grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+					)
+					if err != nil {
+						ps.Close()
+						return nil, fmt.Errorf("failed to create client for managed proxy plugin %q: %w", name, err)
+					}
+					return f(conn), nil
+				},
+			})
+			continue
+		}
+
 		exports["address"] = address
 
 		registry.Register(&plugin.Registration{
@@ -384,6 +466,48 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 	filter := srvconfig.V2DisabledFilter
 	// return the ordered graph for plugins
 	return registry.Graph(filter(config.DisabledPlugins)), nil
+}
+
+// applyPluginMeta merges a managed plugin shim's reported PluginInfo into the
+// plugin introspection metadata, with configuration taking precedence. The
+// shim's listening address is always exported under the "address" key.
+func applyPluginMeta(ic *plugin.InitContext, boot *bootapi.BootstrapResult, exports map[string]string, capabilities []string, p v1.Platform) {
+	meta := map[string]string{}
+
+	var info types.PluginInfo
+	if boot != nil {
+		if ok, err := boot.FindExtension(&info); err != nil {
+			log.G(ic.Context).WithError(err).Warn("failed to read managed plugin info extension")
+		} else if ok {
+			for k, v := range info.GetExports() {
+				meta[k] = v
+			}
+		}
+	}
+	// Configuration overrides shim-reported exports.
+	for k, v := range exports {
+		meta[k] = v
+	}
+	if boot != nil {
+		meta["address"] = boot.Address
+	}
+	ic.Meta.Exports = meta
+
+	// Platforms: configuration platform plus any the shim reported.
+	ic.Meta.Platforms = append(ic.Meta.Platforms, p)
+	for _, pf := range info.GetPlatforms() {
+		ic.Meta.Platforms = append(ic.Meta.Platforms, v1.Platform{
+			OS:           pf.GetOS(),
+			Architecture: pf.GetArchitecture(),
+			Variant:      pf.GetVariant(),
+			OSVersion:    pf.GetOsVersion(),
+		})
+	}
+
+	// Capabilities: configuration plus any the shim reported.
+	caps := append([]string{}, capabilities...)
+	caps = append(caps, info.GetCapabilities()...)
+	ic.Meta.Capabilities = caps
 }
 
 type proxyClients struct {
