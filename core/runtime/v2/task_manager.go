@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	goruntime "runtime"
 	"slices"
 	"strings"
@@ -39,8 +40,13 @@ import (
 	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
 	apitypes "github.com/containerd/containerd/api/types"
 
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/events/exchange"
+	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/containerd/v2/core/sandbox"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/protobuf/proto"
 	"github.com/containerd/containerd/v2/pkg/timeout"
 	"github.com/containerd/containerd/v2/plugins"
@@ -61,6 +67,8 @@ func init() {
 			plugins.ShimPlugin,
 			plugins.MountManagerPlugin,
 			plugins.WarningPlugin,
+			plugins.EventPlugin,
+			plugins.MetadataPlugin,
 		},
 		Config: &TaskConfig{
 			Platforms: defaultPlatforms(),
@@ -84,6 +92,18 @@ func init() {
 			}
 			shimManager := shimManagerI.(*ShimManager)
 
+			md, err := ic.GetSingle(plugins.MetadataPlugin)
+			if err != nil {
+				return nil, err
+			}
+			ep, err := ic.GetByID(plugins.EventPlugin, "exchange")
+			if err != nil {
+				return nil, err
+			}
+			events := ep.(*exchange.Exchange)
+			containerStore := metadata.NewContainerStore(md.(*metadata.DB))
+			sandboxStore := metadata.NewSandboxStore(md.(*metadata.DB))
+
 			var mounts mount.Manager
 			if mountsI, err := ic.GetSingle(plugins.MountManagerPlugin); err == nil {
 				mounts = mountsI.(mount.Manager)
@@ -99,7 +119,20 @@ func init() {
 				}
 			}
 
-			if err := shimManager.LoadExistingShims(ic.Context, state, root); err != nil {
+			m := &TaskManager{
+				root:         root,
+				state:        state,
+				manager:      shimManager,
+				events:       events,
+				containers:   containerStore,
+				sandboxStore: sandboxStore,
+				taskMounts: &taskMountController{
+					manager: mounts,
+					legacy:  newDeprecatedMountCapabilities(shimManager),
+				},
+			}
+
+			if err := m.loadExistingTasks(ic.Context, state, root); err != nil {
 				return nil, fmt.Errorf("failed to load existing shims for task manager: %w", err)
 			}
 
@@ -110,44 +143,207 @@ func init() {
 			warnings := warningsI.(warning.Service)
 			emitPlatformWarnings(ic.Context, warnings)
 
-			return &TaskManager{
-				root:    root,
-				state:   state,
-				manager: shimManager,
-				taskMounts: &taskMountController{
-					manager: mounts,
-					legacy:  newDeprecatedMountCapabilities(shimManager),
-				},
-			}, nil
+			return m, nil
 		},
 	})
 }
 
 // TaskManager wraps task service client on top of shim manager.
 type TaskManager struct {
-	root       string
-	state      string
-	manager    *ShimManager
-	taskMounts *taskMountController
+	root         string
+	state        string
+	manager      *ShimManager
+	events       *exchange.Exchange
+	containers   containers.Store
+	sandboxStore sandbox.Store
+	taskMounts   *taskMountController
 }
 
 // NewTaskManager creates a new task manager instance.
 // root is the rootDir of TaskManager plugin to store persistent data
 // state is the stateDir of TaskManager plugin to store transient data
 // shims is  ShimManager for TaskManager to create/delete shims
-func NewTaskManager(ctx context.Context, root, state string, shims *ShimManager) (*TaskManager, error) {
-	if err := shims.LoadExistingShims(ctx, state, root); err != nil {
-		return nil, fmt.Errorf("failed to load existing shims for task manager: %w", err)
-	}
+func NewTaskManager(ctx context.Context, root, state string, shims *ShimManager, events *exchange.Exchange, containerStore containers.Store, sandboxStore sandbox.Store) (*TaskManager, error) {
 	m := &TaskManager{
-		root:    root,
-		state:   state,
-		manager: shims,
+		root:         root,
+		state:        state,
+		manager:      shims,
+		events:       events,
+		containers:   containerStore,
+		sandboxStore: sandboxStore,
 		taskMounts: &taskMountController{
 			legacy: newDeprecatedMountCapabilities(shims),
 		},
 	}
+	if err := m.loadExistingTasks(ctx, state, root); err != nil {
+		return nil, fmt.Errorf("failed to load existing shims for task manager: %w", err)
+	}
 	return m, nil
+}
+
+// loadExistingTasks reloads task and sandbox shims from disk, applying the task
+// reap policy to each. It is the task-side wrapper around
+// [ShimManager.LoadExistingShims].
+func (m *TaskManager) loadExistingTasks(ctx context.Context, state, root string) error {
+	return m.manager.LoadExistingShims(ctx, state, root, LoadConfig{
+		// Runtime is read per-shim from the bundle's shim-binary-path file, or
+		// for very old bundles from the container record.
+		RuntimeResolver: m.resolveTaskRuntime,
+		OnClose:         func(id string) { m.onTaskShimClose(ctx, id) },
+		Reap:            m.reapTaskShim,
+	})
+}
+
+// onTaskShimClose handles a task shim disconnect: it reaps the dead shim and
+// publishes the task exit/delete events the shim could no longer deliver. The
+// binary is reconstructed from the bundle on disk, since the shim has already
+// been removed from the manager's map.
+func (m *TaskManager) onTaskShimClose(ctx context.Context, id string) {
+	ctx = context.WithoutCancel(ctx)
+	bundle, err := LoadBundle(ctx, m.state, id)
+	if err != nil {
+		log.G(ctx).WithField("id", id).WithError(err).Error("failed to load bundle to clean up dead task shim")
+		return
+	}
+	runtimeName, err := m.bundleRuntime(ctx, bundle)
+	if err != nil {
+		log.G(ctx).WithField("id", id).WithError(err).Error("failed to resolve runtime to clean up dead task shim")
+		return
+	}
+	runtimePath, err := m.manager.resolveRuntimePath(runtimeName)
+	if err != nil {
+		log.G(ctx).WithField("id", id).WithError(err).Error("failed to resolve runtime path to clean up dead task shim")
+		return
+	}
+	binaryCall := shimBinary(bundle, shimBinaryConfig{
+		runtime:      runtimePath,
+		address:      m.manager.containerdAddress,
+		ttrpcAddress: m.manager.containerdTTRPCAddress,
+		socketDir:    m.manager.socketDir,
+		env:          m.manager.env,
+	})
+	cleanupAfterDeadShim(ctx, id, m.manager.shims, m.events, binaryCall)
+}
+
+// bundleRuntime resolves a shim's runtime name from its bundle, falling back to
+// the container record for very old bundles.
+func (m *TaskManager) bundleRuntime(ctx context.Context, bundle *Bundle) (string, error) {
+	if data, err := os.ReadFile(filepath.Join(bundle.Path, "shim-binary-path")); err == nil {
+		return string(data), nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	return m.resolveTaskRuntime(ctx, bundle.ID)
+}
+
+// resolveTaskRuntime reads a shim's runtime name from the container record, for
+// very old bundles that predate the shim-binary-path file. On failure it also
+// unmounts the bundle rootfs so a broken bundle does not leak a mount.
+func (m *TaskManager) resolveTaskRuntime(ctx context.Context, id string) (string, error) {
+	container, err := m.containers.Get(ctx, id)
+	if err != nil {
+		log.G(ctx).WithError(err).Errorf("loading container %s", id)
+		bundlePath := filepath.Join(m.state, id)
+		if ns, ok := namespaces.Namespace(ctx); ok {
+			bundlePath = filepath.Join(m.state, ns, id)
+		}
+		if uerr := mount.UnmountRecursive(filepath.Join(bundlePath, "rootfs"), 0); uerr != nil {
+			log.G(ctx).WithError(uerr).Errorf("failed to unmount of rootfs %s", id)
+		}
+		return "", err
+	}
+	return container.Runtime.Name, nil
+}
+
+// reapTaskShim is the task-manager reap policy applied when loading a shim from
+// disk. It decides whether a loaded shim should be kept (it is still running a
+// task or sandbox) or reaped (a leaked shim from a crash). It returns keep=true
+// when the shim should remain registered.
+//
+// There are 3 possibilities for the loaded shim here:
+//  1. It could be a shim that is running a task.
+//  2. It could be a sandbox shim.
+//  3. Or it could be a shim that was created for running a task but something
+//     happened (probably a containerd crash) and the task was never created.
+//     This shim process should be cleaned up here. See
+//     containerd/containerd#6860 for further details.
+func (m *TaskManager) reapTaskShim(ctx context.Context, shim ShimInstance) (bool, error) {
+	id := shim.ID()
+
+	// Check connectivity. TaskService is the only required service, so create a
+	// temp one to check the connection, downgrading the client if the shim only
+	// speaks an older task API.
+	s, pidErr := probeTaskShim(ctx, shim)
+	var pInfo []runtime.ProcessInfo
+	if pidErr == nil {
+		pInfo, pidErr = s.Pids(ctx)
+	}
+
+	_, sgetErr := m.sandboxStore.Get(ctx, id)
+	if shouldCleanupShim(sgetErr, pidErr, pInfo) {
+		logEntry := log.G(ctx).WithField("id", id)
+		if pidErr != nil {
+			logEntry = logEntry.WithError(pidErr)
+		}
+		logEntry.Info("cleaning leaked shim process")
+		if s == nil {
+			// Could not even create a task client; fall back to closing it and
+			// letting the bundle be removed by the loader.
+			shim.Close()
+			return false, fmt.Errorf("failed to create task client for leaked shim %q", id)
+		}
+		if err := cleanupShimTask(ctx, s); err != nil && !errdefs.IsNotFound(err) {
+			return false, fmt.Errorf("failed to clean up leaked shim %q: %w", id, err)
+		}
+		return false, nil
+	}
+
+	if pidErr != nil {
+		log.G(ctx).WithField("id", id).WithError(pidErr).Warn("failed to query shim pids, keeping shim registered")
+	}
+	return true, nil
+}
+
+// probeTaskShim wraps shim in a shimTask and verifies connectivity by calling
+// PID, downgrading the task client version if the shim only speaks an older API.
+func probeTaskShim(ctx context.Context, shim ShimInstance) (*shimTask, error) {
+	s, err := newShimTask(shim)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := s.PID(ctx); err != nil {
+		if !errdefs.IsNotImplemented(err) {
+			return s, err
+		}
+
+		downgrader, ok := shim.(clientVersionDowngrader)
+		if ok {
+			if derr := downgrader.Downgrade(); derr == nil {
+				log.G(ctx).WithError(err).WithField("id", shim.ID()).
+					Warning("failed to call task.PID, downgrading client API version to try again")
+
+				s, err = newShimTask(shim)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create shim task after downgrading: %w", err)
+				}
+				_, err = s.PID(ctx)
+			}
+		}
+		if err != nil {
+			return s, err
+		}
+	}
+	return s, nil
+}
+
+// shouldCleanupShim determines whether or not a shim is in such a state that
+// we should reap it. To be reapable we confirm that it is not a sandbox shim
+// and it has no pids running
+func shouldCleanupShim(sgetErr, pidErr error, pInfo []runtime.ProcessInfo) bool {
+	return errors.Is(sgetErr, errdefs.ErrNotFound) &&
+		(errors.Is(pidErr, errdefs.ErrNotFound) ||
+			(pidErr == nil && len(pInfo) == 0))
 }
 
 // ID of the task manager
@@ -185,11 +381,32 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 		}
 	}()
 
+	topts := opts.TaskOptions
+	if topts == nil || topts.GetValue() == nil {
+		topts = opts.RuntimeOptions
+	}
+
+	startCfg := StartConfig{
+		Runtime: opts.Runtime,
+		Options: topts,
+		OnClose: func() { m.onTaskShimClose(ctx, taskID) },
+	}
+
+	// Resolve whether this task should join an existing sandbox shim rather than
+	// invoke the shim binary. This is task-specific knowledge, so it lives here
+	// rather than in the generic shim manager.
+	bootstrapParams, sandboxID, err := m.resolveSandboxJoin(ctx, taskID, opts)
+	if err != nil {
+		return nil, err
+	}
+	startCfg.Bootstrap = bootstrapParams
+	startCfg.SandboxID = sandboxID
+
 	// The shim is started before its mounts are activated so that it can report
 	// which mount types and transforms it performs itself, which decides what
 	// the mount manager must do on its behalf. Starting the shim does not
 	// require the rootfs; only the task.Create call below consumes opts.Rootfs.
-	shim, err := m.manager.Start(ctx, taskID, bundle, opts)
+	shim, err := m.manager.Start(ctx, taskID, bundle, startCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shim: %w", err)
 	}
@@ -252,13 +469,100 @@ func (m *TaskManager) Create(ctx context.Context, taskID string, opts runtime.Cr
 	return t, nil
 }
 
+// resolveSandboxJoin decides whether a task should join an already-running
+// sandbox shim instead of invoking the shim binary. It returns non-nil
+// bootstrap params (and the sandbox id) when the task should join; nil bootstrap
+// means the shim binary should be invoked.
+//
+// Even though one shim can group multiple containers, that does not mean it
+// supports the sandbox API. The old shim implementation still requires
+// containerd to invoke `shim delete` to clean up each container's resource when
+// it exits. So if the shim version is not higher than 3, we fall back to
+// invoking the shim binary. The shim version also indicates streaming I/O
+// support, rolled out together with the sandbox API.
+func (m *TaskManager) resolveSandboxJoin(ctx context.Context, id string, opts runtime.CreateOpts) (*bootapi.BootstrapResult, string, error) {
+	if opts.SandboxID == "" {
+		return nil, "", nil
+	}
+
+	const supportSandboxAPIVersion = 3
+
+	_, sbErr := m.sandboxStore.Get(ctx, opts.SandboxID)
+	if sbErr != nil {
+		if !errors.Is(sbErr, errdefs.ErrNotFound) {
+			return nil, "", sbErr
+		}
+		// NOTE: If a sandbox container, like pause, is created by v1.6.x or
+		// v1.7.x, the shim may not be able to group multiple containers. We
+		// should invoke the shim binary and establish a new connection based on
+		// the returned address.
+		log.G(ctx).WithField("id", id).Warningf("sandbox (id=%s) not found, maybe created from v1.x", opts.SandboxID)
+		return nil, opts.SandboxID, nil
+	}
+
+	var params *bootapi.BootstrapResult
+	if opts.Address != "" {
+		// The address returned from the sandbox controller should be in the form
+		// like ttrpc+unix://<uds-path> or grpc+vsock://<cid>:<port>; split off
+		// the protocol first.
+		protocol, address, ok := strings.Cut(opts.Address, "+")
+		if !ok {
+			return nil, "", errors.New("the scheme of sandbox address should be in the form of <protocol>+<unix|vsock|tcp>, i.e. ttrpc+unix or grpc+vsock")
+		}
+		params = &bootapi.BootstrapResult{
+			Version:  int32(opts.Version),
+			Protocol: protocol,
+			Address:  address,
+		}
+
+		// The sandbox controller only returns connection details, not what its
+		// shim advertised at startup. Recover that from the shim instance
+		// containerd already has in memory for this sandbox, so a container
+		// joining it is not treated as if the shim advertised nothing.
+		if process, err := m.manager.Get(ctx, opts.SandboxID); err == nil {
+			params.Extensions = sandboxShimExtensions(process)
+		}
+	} else {
+		process, err := m.manager.Get(ctx, opts.SandboxID)
+		if err != nil {
+			return nil, "", fmt.Errorf("can't find shim for sandbox %s: %w", opts.SandboxID, err)
+		}
+
+		p, err := restoreBootstrapParams(process.Bundle())
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get bootstrap params of sandbox %s: %w", opts.SandboxID, err)
+		}
+		params = p
+	}
+
+	if params.Version < supportSandboxAPIVersion {
+		// Fall back to invoking the shim binary.
+		return nil, opts.SandboxID, nil
+	}
+
+	return params, opts.SandboxID, nil
+}
+
+// sandboxShimExtensions returns the extensions process's shim advertised when
+// it started, or nil if process does not retain that (for example, an external
+// sandboxer's shim instance that predates capability extensions). This is best
+// effort: a container joining a sandbox whose shim instance cannot be asked
+// degrades to no extensions rather than failing to start.
+func sandboxShimExtensions(process ShimInstance) []*bootapi.Extension {
+	sc, ok := process.(shimCapabilities)
+	if !ok {
+		return nil
+	}
+	return sc.BootstrapResult().GetExtensions()
+}
+
 // cleanupStartedShim tears down a shim that was started for a task which then
 // failed to be created. It may be called before a *shimTask exists for shim,
 // since it also covers the window between a successful shim start and
 // taskMounts.Activate/newShimTask succeeding.
 func (m *TaskManager) cleanupStartedShim(ctx context.Context, taskID string, shim ShimInstance) {
 	// NOTE: ctx contains required namespace information.
-	m.manager.shims.Delete(ctx, taskID)
+	m.manager.Remove(ctx, taskID)
 
 	shimTask, err := newShimTask(shim)
 	if err != nil {
@@ -275,7 +579,7 @@ func (m *TaskManager) cleanupStartedShim(ctx context.Context, taskID string, shi
 
 // Get a specific task
 func (m *TaskManager) Get(ctx context.Context, id string) (runtime.Task, error) {
-	shim, err := m.manager.shims.Get(ctx, id)
+	shim, err := m.manager.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +588,7 @@ func (m *TaskManager) Get(ctx context.Context, id string) (runtime.Task, error) 
 
 // Tasks lists all tasks
 func (m *TaskManager) Tasks(ctx context.Context, all bool) ([]runtime.Task, error) {
-	shims, err := m.manager.shims.GetAll(ctx, all)
+	shims, err := m.manager.GetAll(ctx, all)
 	if err != nil {
 		return nil, err
 	}
@@ -301,12 +605,12 @@ func (m *TaskManager) Tasks(ctx context.Context, all bool) ([]runtime.Task, erro
 
 // Delete deletes the task and shim instance
 func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit, error) {
-	shim, err := m.manager.shims.Get(ctx, taskID)
+	shim, err := m.manager.Get(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = m.manager.containers.Get(ctx, taskID)
+	_, err = m.containers.Get(ctx, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +621,7 @@ func (m *TaskManager) Delete(ctx context.Context, taskID string) (*runtime.Exit,
 	}
 
 	exit, err := shimTask.delete(ctx, func(ctx context.Context, id string) {
-		m.manager.shims.Delete(ctx, id)
+		m.manager.Remove(ctx, id)
 	})
 
 	// An ErrNotFound here means the shim has no record of the task and there
@@ -352,7 +656,7 @@ func supportedLogURISchemes() []string {
 }
 
 func getRuntimeInfo(ctx context.Context, shims *ShimManager, req *apitypes.RuntimeRequest) (*apitypes.RuntimeInfo, error) {
-	runtimePath, err := shims.resolveRuntimePath(req.RuntimePath)
+	runtimePath, err := shims.ResolveRuntimePath(req.RuntimePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
 	}

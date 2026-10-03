@@ -36,7 +36,6 @@ import (
 	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/core/events/exchange"
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/core/runtime"
 	v2 "github.com/containerd/containerd/v2/core/runtime/v2"
 	"github.com/containerd/containerd/v2/core/sandbox"
 	"github.com/containerd/containerd/v2/plugins"
@@ -77,16 +76,25 @@ func init() {
 				}
 			}
 
-			if err := shims.LoadExistingShims(ic.Context, state, root); err != nil {
-				return nil, fmt.Errorf("failed to load existing shim sandboxes, %v", err)
-			}
-
 			c := &controllerLocal{
 				root:      root,
 				state:     state,
 				shims:     shims,
 				publisher: publisher,
 			}
+
+			if err := shims.LoadExistingShims(ic.Context, state, root, v2.LoadConfig{
+				OnClose: c.onShimClose,
+				// A sandbox shim is kept as long as it is reachable; it is never
+				// reaped on load the way a leaked task shim is. Load already
+				// drops a shim it cannot connect to.
+				Reap: func(ctx context.Context, shim v2.ShimInstance) (bool, error) {
+					return true, nil
+				},
+			}); err != nil {
+				return nil, fmt.Errorf("failed to load existing shim sandboxes, %v", err)
+			}
+
 			return c, nil
 		},
 	})
@@ -100,6 +108,13 @@ type controllerLocal struct {
 }
 
 var _ sandbox.Controller = (*controllerLocal)(nil)
+
+// onShimClose handles a sandbox shim disconnect. The shim manager has already
+// removed the instance from its map by the time this runs; there is no task
+// bookkeeping to unwind for a sandbox, so this only records the event.
+func (c *controllerLocal) onShimClose(sandboxID string) {
+	log.L.WithField("sandboxID", sandboxID).Info("sandbox shim disconnected")
+}
 
 func (c *controllerLocal) cleanupShim(ctx context.Context, sandboxID string, svc runtimeAPI.TTRPCSandboxService) {
 	// Let the shim exit, then we can clean up the bundle after.
@@ -141,11 +156,11 @@ func (c *controllerLocal) Create(ctx context.Context, info sandbox.Sandbox, opts
 		}
 	}()
 
-	shim, err := c.shims.Start(ctx, sandboxID, bundle, runtime.CreateOpts{
-		Spec:           info.Spec,
-		RuntimeOptions: info.Runtime.Options,
-		Runtime:        info.Runtime.Name,
-		TaskOptions:    nil,
+	options := info.Runtime.Options
+	shim, err := c.shims.Start(ctx, sandboxID, bundle, v2.StartConfig{
+		Runtime: info.Runtime.Name,
+		Options: options,
+		OnClose: func() { c.onShimClose(sandboxID) },
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start new shim for sandbox %s: %w", sandboxID, err)

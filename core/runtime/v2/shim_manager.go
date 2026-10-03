@@ -26,18 +26,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
 	"github.com/containerd/typeurl/v2"
 
 	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
-	"github.com/containerd/containerd/v2/core/containers"
-	"github.com/containerd/containerd/v2/core/events/exchange"
-	"github.com/containerd/containerd/v2/core/metadata"
 	"github.com/containerd/containerd/v2/core/runtime"
-	"github.com/containerd/containerd/v2/core/sandbox"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	shimbinary "github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/pkg/timeout"
@@ -63,27 +58,11 @@ func init() {
 	// the "shim" sandbox controller also use it to manage shims,
 	// so we make it an independent plugin
 	registry.Register(&plugin.Registration{
-		Type: plugins.ShimPlugin,
-		ID:   "manager",
-		Requires: []plugin.Type{
-			plugins.EventPlugin,
-			plugins.MetadataPlugin,
-		},
+		Type:   plugins.ShimPlugin,
+		ID:     "manager",
 		Config: &ShimConfig{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
 			config := ic.Config.(*ShimConfig)
-
-			m, err := ic.GetSingle(plugins.MetadataPlugin)
-			if err != nil {
-				return nil, err
-			}
-			ep, err := ic.GetByID(plugins.EventPlugin, "exchange")
-			if err != nil {
-				return nil, err
-			}
-			events := ep.(*exchange.Exchange)
-			cs := metadata.NewContainerStore(m.(*metadata.DB))
-			ss := metadata.NewSandboxStore(m.(*metadata.DB))
 
 			// Allow configurable directory
 			if config.SocketDir != "" {
@@ -105,10 +84,7 @@ func init() {
 				Address:      ic.Properties[plugins.PropertyGRPCAddress],
 				TTRPCAddress: ic.Properties[plugins.PropertyTTRPCAddress],
 				SocketDir:    config.SocketDir,
-				Events:       events,
-				Store:        cs,
 				ShimEnv:      config.Env,
-				SandboxStore: ss,
 			})
 		},
 		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {
@@ -144,12 +120,9 @@ func init() {
 }
 
 type ManagerConfig struct {
-	Store        containers.Store
-	Events       *exchange.Exchange
 	Address      string
 	TTRPCAddress string
 	SocketDir    string
-	SandboxStore sandbox.Store
 	ShimEnv      []string
 }
 
@@ -160,10 +133,7 @@ func NewShimManager(config *ManagerConfig) (*ShimManager, error) {
 		containerdTTRPCAddress: config.TTRPCAddress,
 		socketDir:              config.SocketDir,
 		shims:                  runtime.NewNSMap[ShimInstance](),
-		events:                 config.Events,
-		containers:             config.Store,
 		env:                    config.ShimEnv,
-		sandboxStore:           config.SandboxStore,
 	}
 
 	return m, nil
@@ -173,17 +143,64 @@ func NewShimManager(config *ManagerConfig) (*ShimManager, error) {
 // It is mainly responsible for launching new shims and for proper shutdown and cleanup of existing instances.
 // The manager is unaware of the underlying services shim provides and lets higher level services consume them,
 // but don't care about lifecycle management.
+//
+// The manager is intentionally generic: it does not know whether a shim runs a
+// task, a sandbox, or a long-running plugin service. Callers supply all
+// knowledge of that through [StartConfig] and [LoadConfig], including how to
+// react when a shim disconnects (OnClose) and, for loads, whether a given shim
+// should be kept or reaped (Reap).
 type ShimManager struct {
 	containerdAddress      string
 	containerdTTRPCAddress string
 	env                    []string
 	shims                  *runtime.NSMap[ShimInstance]
-	events                 *exchange.Exchange
-	containers             containers.Store
 	socketDir              string
 	// runtimePaths is a cache of `runtime names` -> `resolved fs path`
 	runtimePaths sync.Map
-	sandboxStore sandbox.Store
+}
+
+// StartConfig configures a shim start. It carries everything the manager needs
+// to launch (or join) a shim without knowing what service the shim provides.
+type StartConfig struct {
+	// Runtime is the runtime name or absolute path to the shim binary.
+	Runtime string
+	// Options is the runtime/task options passed to the shim binary as a
+	// bootstrap extension. May be nil.
+	Options typeurl.Any
+	// OnClose is invoked when the shim's connection is severed. It must not be
+	// nil. The manager removes the shim from its own map before invoking it, so
+	// OnClose is free to perform caller-specific cleanup (publishing task
+	// events, restarting a plugin, and so on).
+	OnClose func()
+	// Bootstrap, when set, makes the manager join an already-running shim at the
+	// given address instead of invoking the shim binary. It is used to attach a
+	// container to an existing sandbox shim. The caller is responsible for
+	// resolving these connection details.
+	Bootstrap *bootapi.BootstrapResult
+	// SandboxID is written into the bundle so the shim knows which sandbox a
+	// joining container belongs to. Only consulted when Bootstrap is set.
+	SandboxID string
+}
+
+// LoadConfig configures reloading a shim from an existing bundle.
+type LoadConfig struct {
+	// Runtime is the runtime name or absolute path to the shim binary. When
+	// empty, the manager reads it from the bundle's shim-binary-path file, then
+	// falls back to RuntimeResolver.
+	Runtime string
+	// RuntimeResolver resolves the runtime name for a shim id when neither
+	// Runtime nor the bundle's shim-binary-path file supplies one. It supports
+	// very old bundles that predate the shim-binary-path file. May be nil.
+	RuntimeResolver func(ctx context.Context, id string) (string, error)
+	// OnClose is invoked when the shim's connection is severed. It receives the
+	// shim's id and must not be nil. The manager removes the shim from its map
+	// before invoking it.
+	OnClose func(id string)
+	// Reap is an optional policy hook that decides whether a freshly loaded shim
+	// should be kept (registered in the manager) or reaped. It is given the
+	// loaded instance and must return true to keep it. When nil, the shim is
+	// always kept. A Reap that returns false has already cleaned up the shim.
+	Reap func(ctx context.Context, shim ShimInstance) (keep bool, err error)
 }
 
 // ID of the shim manager
@@ -201,110 +218,36 @@ func (m *ShimManager) Env() []string {
 	return cp
 }
 
-// Start launches a new shim instance
-func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, opts runtime.CreateOpts) (_ ShimInstance, retErr error) {
-	shouldInvokeShimBinary := false
-
-	var params = &bootapi.BootstrapResult{}
-	if opts.SandboxID != "" {
-		_, sbErr := m.sandboxStore.Get(ctx, opts.SandboxID)
-		if sbErr != nil {
-			if !errors.Is(sbErr, errdefs.ErrNotFound) {
-				return nil, sbErr
-			}
-
-			log.G(ctx).WithField("id", id).Warningf("sandbox (id=%s) not found, maybe created from v1.x", opts.SandboxID)
-			// NOTE: If sandbox container, like pause, is created by
-			// v1.6.x or v1.7.x, the shim may be not able to group
-			// multiple containers. We should invoke shim binary and
-			// establish new connection based on returned address.
-			shouldInvokeShimBinary = true
-		} else {
-			if opts.Address != "" {
-				// The address returned from sandbox controller should
-				// be in the form like ttrpc+unix://<uds-path> or grpc+vsock://<cid>:<port>,
-				// we should get the protocol from the url first.
-				protocol, address, ok := strings.Cut(opts.Address, "+")
-				if !ok {
-					return nil, errors.New("the scheme of sandbox address should be in the form of <protocol>+<unix|vsock|tcp>, i.e. ttrpc+unix or grpc+vsock")
-				}
-				params = &bootapi.BootstrapResult{
-					Version:  int32(opts.Version),
-					Protocol: protocol,
-					Address:  address,
-				}
-
-				// The sandbox controller only returns connection details, not
-				// what its shim advertised at startup. Recover that from the
-				// shim instance containerd already has in memory for this
-				// sandbox, so a container joining it is not treated as if the
-				// shim advertised nothing.
-				if process, err := m.Get(ctx, opts.SandboxID); err == nil {
-					params.Extensions = sandboxShimExtensions(process)
-				}
-			} else {
-				process, err := m.Get(ctx, opts.SandboxID)
-				if err != nil {
-					return nil, fmt.Errorf("can't find shim for sandbox %s: %w", opts.SandboxID, err)
-				}
-
-				p, err := restoreBootstrapParams(process.Bundle())
-				if err != nil {
-					return nil, fmt.Errorf("failed to get bootstrap "+
-						"params of sandbox %s: %w", opts.SandboxID, err)
-				}
-				params = p
-			}
-		}
-	}
-	// Even though one shim can be able to group multiple containers,
-	// it doesn't mean it supports sandbox API. The old shim implementation
-	// still requires containerd to invoke `shim delete` to cleanup
-	// container's resource when each container exits. So, if the
-	// shim version is not higher than 3, we should fallback to invoke
-	// shim binary.
-	//
-	// NOTE: The shim version indicates that the shim supports streaming I/O.
-	// It's rolled out together with the sandbox API and can be used
-	// to determine whether we should invoke the shim binary.
-	const supportSandboxAPIVersion = 3
-	if params.Version < supportSandboxAPIVersion {
-		shouldInvokeShimBinary = true
+// Start launches a new shim instance, or joins an already-running one when
+// cfg.Bootstrap is set. It is generic: the caller decides, through cfg, what
+// the shim is for and how to react when it disconnects.
+func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, cfg StartConfig) (_ ShimInstance, retErr error) {
+	if cfg.OnClose == nil {
+		return nil, errors.New("StartConfig.OnClose must not be nil")
 	}
 
-	if !shouldInvokeShimBinary {
+	onClose := func() {
+		log.G(ctx).WithField("id", id).Info("shim disconnected")
+		// Remove self from the shim list first: the caller's OnClose may
+		// publish events or otherwise assume the shim is already gone.
+		m.shims.Delete(ctx, id)
+		cfg.OnClose()
+	}
+
+	// Join an already-running shim rather than invoking the shim binary.
+	if cfg.Bootstrap != nil {
 		// Write sandbox ID this task belongs to.
-		if err := os.WriteFile(filepath.Join(bundle.Path, "sandbox"), []byte(opts.SandboxID), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(bundle.Path, "sandbox"), []byte(cfg.SandboxID), 0600); err != nil {
 			return nil, err
 		}
 
-		if err := writeBootstrapParams(filepath.Join(bundle.Path, "bootstrap.json"), params); err != nil {
+		if err := writeBootstrapParams(filepath.Join(bundle.Path, "bootstrap.json"), cfg.Bootstrap); err != nil {
 			return nil, fmt.Errorf("failed to write bootstrap.json for bundle %s: %w", bundle.Path, err)
 		}
 
-		runtimePath, err := m.resolveRuntimePath(opts.Runtime)
+		shim, err := loadShim(ctx, bundle, onClose)
 		if err != nil {
-			return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
-		}
-		b := shimBinary(bundle, shimBinaryConfig{
-			runtime:      runtimePath,
-			address:      m.containerdAddress,
-			ttrpcAddress: m.containerdTTRPCAddress,
-			socketDir:    m.socketDir,
-			env:          m.env,
-		})
-		shim, err := loadShim(ctx, bundle, func() {
-			log.G(ctx).WithField("id", id).Info("shim disconnected")
-
-			cleanupAfterDeadShim(context.WithoutCancel(ctx), id, m.shims, m.events, b)
-			// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
-			// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
-			// disconnect and there is no chance to remove this dead task from runtime task lists.
-			// Thus it's better to delete it here.
-			m.shims.Delete(ctx, id)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to load sandbox task %q: %w", opts.SandboxID, err)
+			return nil, fmt.Errorf("failed to join shim for sandbox %q: %w", cfg.SandboxID, err)
 		}
 
 		if err := m.shims.Add(ctx, shim); err != nil {
@@ -314,7 +257,7 @@ func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, opts
 		return shim, nil
 	}
 
-	shim, err := m.startShim(ctx, bundle, id, opts)
+	shim, err := m.startShim(ctx, bundle, id, cfg, onClose)
 	if err != nil {
 		return nil, err
 	}
@@ -325,38 +268,20 @@ func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, opts
 	}()
 
 	if err := m.shims.Add(ctx, shim); err != nil {
-		return nil, fmt.Errorf("failed to add task: %w", err)
+		return nil, fmt.Errorf("failed to add shim: %w", err)
 	}
 
 	return shim, nil
 }
 
-// sandboxShimExtensions returns the extensions process's shim advertised when
-// it started, or nil if process does not retain that (for example, an
-// external sandboxer's shim instance that predates capability extensions).
-// This is best effort: a container joining a sandbox whose shim instance
-// cannot be asked degrades to no extensions rather than failing to start.
-func sandboxShimExtensions(process ShimInstance) []*bootapi.Extension {
-	sc, ok := process.(shimCapabilities)
-	if !ok {
-		return nil
-	}
-	return sc.BootstrapResult().GetExtensions()
-}
-
-func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string, opts runtime.CreateOpts) (*shim, error) {
+func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string, cfg StartConfig, onClose func()) (*shim, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
 	}
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("namespace", ns))
 
-	topts := opts.TaskOptions
-	if topts == nil || topts.GetValue() == nil {
-		topts = opts.RuntimeOptions
-	}
-
-	runtimePath, err := m.resolveRuntimePath(opts.Runtime)
+	runtimePath, err := m.resolveRuntimePath(cfg.Runtime)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve runtime path: %w", err)
 	}
@@ -368,16 +293,7 @@ func (m *ShimManager) startShim(ctx context.Context, bundle *Bundle, id string, 
 		socketDir:    m.socketDir,
 		env:          m.env,
 	})
-	shim, err := b.Start(ctx, typeurl.MarshalProto(topts), func() {
-		log.G(ctx).WithField("id", id).Info("shim disconnected")
-
-		cleanupAfterDeadShim(context.WithoutCancel(ctx), id, m.shims, m.events, b)
-		// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
-		// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
-		// disconnect and there is no chance to remove this dead task from runtime task lists.
-		// Thus it's better to delete it here.
-		m.shims.Delete(ctx, id)
-	})
+	shim, err := b.Start(ctx, typeurl.MarshalProto(cfg.Options), onClose)
 	if err != nil {
 		return nil, fmt.Errorf("start failed: %w", err)
 	}
@@ -509,7 +425,25 @@ func (m *ShimManager) Get(ctx context.Context, id string) (ShimInstance, error) 
 	return m.shims.Get(ctx, id)
 }
 
-// Delete a runtime task
+// GetAll returns all shims registered with the manager. When all is false, only
+// shims in the caller's namespace are returned.
+func (m *ShimManager) GetAll(ctx context.Context, all bool) ([]ShimInstance, error) {
+	return m.shims.GetAll(ctx, all)
+}
+
+// Remove drops a shim from the manager's map without deleting the shim itself.
+// It is used by callers that perform their own shim teardown and only need the
+// manager to forget the instance.
+func (m *ShimManager) Remove(ctx context.Context, id string) {
+	m.shims.Delete(ctx, id)
+}
+
+// ResolveRuntimePath resolves a runtime name or path to the shim binary path.
+func (m *ShimManager) ResolveRuntimePath(runtime string) (string, error) {
+	return m.resolveRuntimePath(runtime)
+}
+
+// Delete closes a shim's connection and removes its bundle from disk.
 func (m *ShimManager) Delete(ctx context.Context, id string) error {
 	shim, err := m.shims.Get(ctx, id)
 	if err != nil {
