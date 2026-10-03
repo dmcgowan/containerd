@@ -67863,6 +67863,270 @@ file: {
   }
 }
 file: {
+  name: "types/plugin_info.proto"
+  package: "containerd.types"
+  dependency: "types/platform.proto"
+  message_type: {
+    name: "PluginInfo"
+    field: {
+      name: "exports"
+      number: 1
+      label: LABEL_REPEATED
+      type: TYPE_MESSAGE
+      type_name: ".containerd.types.PluginInfo.ExportsEntry"
+      json_name: "exports"
+    }
+    field: {
+      name: "capabilities"
+      number: 2
+      label: LABEL_REPEATED
+      type: TYPE_STRING
+      json_name: "capabilities"
+    }
+    field: {
+      name: "platforms"
+      number: 3
+      label: LABEL_REPEATED
+      type: TYPE_MESSAGE
+      type_name: ".containerd.types.Platform"
+      json_name: "platforms"
+    }
+    nested_type: {
+      name: "ExportsEntry"
+      field: {
+        name: "key"
+        number: 1
+        label: LABEL_OPTIONAL
+        type: TYPE_STRING
+        json_name: "key"
+      }
+      field: {
+        name: "value"
+        number: 2
+        label: LABEL_OPTIONAL
+        type: TYPE_STRING
+        json_name: "value"
+      }
+      options: {
+        map_entry: true
+      }
+    }
+  }
+  options: {
+    go_package: "github.com/containerd/containerd/api/types;types"
+  }
+  source_code_info: {
+    location: {
+      span: 16
+      span: 0
+      span: 45
+      span: 1
+    }
+    location: {
+      path: 12
+      span: 16
+      span: 0
+      span: 18
+      leading_detached_comments: "\nCopyright The containerd Authors.\n\nLicensed under the Apache License, Version 2.0 (the \"License\");\nyou may not use this file except in compliance with the License.\nYou may obtain a copy of the License at\n\nhttp://www.apache.org/licenses/LICENSE-2.0\n\nUnless required by applicable law or agreed to in writing, software\ndistributed under the License is distributed on an \"AS IS\" BASIS,\nWITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\nSee the License for the specific language governing permissions and\nlimitations under the License.\n"
+    }
+    location: {
+      path: 2
+      span: 18
+      span: 0
+      span: 25
+    }
+    location: {
+      path: 3
+      path: 0
+      span: 20
+      span: 0
+      span: 30
+    }
+    location: {
+      path: 8
+      span: 22
+      span: 0
+      span: 71
+    }
+    location: {
+      path: 8
+      path: 11
+      span: 22
+      span: 0
+      span: 71
+    }
+    location: {
+      path: 4
+      path: 0
+      span: 32
+      span: 0
+      span: 45
+      span: 1
+      leading_comments: " PluginInfo describes a plugin served by a shim. A managed proxy plugin shim\n attaches it to the BootstrapResult it returns at startup, so containerd can\n register the plugin with the exports, capabilities and platforms the shim\n reports rather than requiring them all to be set in configuration.\n\n containerd ignores a bootstrap extension whose type it does not recognize, so\n a shim may attach this unconditionally; an older daemon keeps its previous\n behavior.\n"
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 1
+      span: 32
+      span: 8
+      span: 18
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 0
+      span: 36
+      span: 2
+      span: 34
+      leading_comments: " Exports are arbitrary key/value metadata surfaced through the plugin's\n introspection Meta.Exports. The reserved key \"address\" is set by containerd\n to the shim's listening address and must not be overridden here.\n"
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 0
+      path: 6
+      span: 36
+      span: 2
+      span: 21
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 0
+      path: 1
+      span: 36
+      span: 22
+      span: 29
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 0
+      path: 3
+      span: 36
+      span: 32
+      span: 33
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 1
+      span: 40
+      span: 2
+      span: 35
+      leading_comments: " Capabilities are the plugin capability strings surfaced through the\n plugin's introspection Meta.Capabilities.\n"
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 1
+      path: 4
+      span: 40
+      span: 2
+      span: 10
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 1
+      path: 5
+      span: 40
+      span: 11
+      span: 17
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 1
+      path: 1
+      span: 40
+      span: 18
+      span: 30
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 1
+      path: 3
+      span: 40
+      span: 33
+      span: 34
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 2
+      span: 44
+      span: 2
+      span: 34
+      leading_comments: " Platforms are the platforms the plugin supports, surfaced through the\n plugin's introspection Meta.Platforms.\n"
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 2
+      path: 4
+      span: 44
+      span: 2
+      span: 10
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 2
+      path: 6
+      span: 44
+      span: 11
+      span: 19
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 2
+      path: 1
+      span: 44
+      span: 20
+      span: 29
+    }
+    location: {
+      path: 4
+      path: 0
+      path: 2
+      path: 2
+      path: 3
+      span: 44
+      span: 32
+      span: 33
+    }
+  }
+  syntax: "proto3"
+  buf_extension: {
+    is_import: false
+    module_info: {
+      name: {
+        remote: "buf.build"
+        owner: "containerd"
+        repository: "api-dev"
+      }
+    }
+    is_syntax_unspecified: false
+  }
+}
+file: {
   name: "types/runc/options/oci.proto"
   package: "containerd.runc.v1"
   message_type: {
